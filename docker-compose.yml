@@ -1,0 +1,44 @@
+# Claude API debug proxy (puppetllm) — スタンドアローン。
+#
+# Anthropic Messages API / Bedrock 互換の fake server を localhost に立てて、ANTHROPIC_BASE_URL
+# (or AnthropicBedrock base_url) を向ければ SDK を 1 行も変えずに human-in-the-loop デバッグできる。
+# コスト目安 / 擬似プロンプトキャッシュ観測も付属。詳細: README.md
+#
+# 起動:   docker compose up -d
+# 制御:   curl localhost:8765/_control/health ; curl localhost:8765/_control/pending | jq
+# テスト: docker compose --profile test run --rm proxy-test
+
+name: puppetllm
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: puppetllm:latest
+    container_name: puppetllm
+    ports:
+      - "127.0.0.1:8765:8765"   # localhost-only (control plane を外部に晒さない)
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/_control/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: "no"
+
+  # ユニットテスト実行用 (opt-in)。
+  proxy-test:
+    image: puppetllm:latest
+    container_name: puppetllm-test
+    profiles: ["test"]
+    depends_on:
+      - proxy   # build 共有
+    working_dir: /app
+    environment:
+      # HTTP テストは小さい prefix を使うため最小キャッシュ閾値を無効化 (floor は専用 unit で検証)。
+      PUPPETLLM_CACHE_MIN_TOKENS: "0"
+    command: ["python3", "-m", "unittest",
+              "puppetllm.tests.test_fake_server",
+              "puppetllm.tests.test_proxy_extensions", "-v"]
+    restart: "no"
