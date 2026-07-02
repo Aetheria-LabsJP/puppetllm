@@ -1,12 +1,16 @@
-"""puppetllm のプロバイダ・アダプタ群。
+"""Provider adapters for puppetllm.
 
-canonical core (fake_server.py) はプロバイダ非依存の正規化 snapshot + /_control/* を持ち、
-各プロバイダはここで「ワイヤ形式の入出力」だけを担当する:
+The canonical core (fake_server.py) holds the provider-independent normalized
+snapshot + /_control/*, and each provider here is responsible only for the
+"wire-format input/output":
 
-- anthropic: `/v1/messages` (SSE / 単一 JSON)  — 現状は fake_server.py 内に実装
+- anthropic: `/v1/messages` (SSE / single JSON)  — currently implemented inside fake_server.py
 - bedrock  : `/model/{id}/invoke[-with-response-stream]` (AWS eventstream / JSON)
+- openai   : `/v1/chat/completions` (SSE chunks / single JSON)
 
-新プロバイダ (例: Vertex) を足す場合はこのパッケージに `<name>.py` を追加し、
-`build_router()` で FastAPI router を返して fake_server から include する。
-content blocks / 制御 API は共通なので、各アダプタは request decode と response encode のみ書く。
+To add a new provider (e.g. Vertex), add a `<name>.py` to this package and have
+`build_router()` return a FastAPI router that fake_server includes (see openai.py /
+bedrock.py as worked examples).
+Content blocks / control API are shared, so each adapter only needs to write
+request decode and response encode.
 """

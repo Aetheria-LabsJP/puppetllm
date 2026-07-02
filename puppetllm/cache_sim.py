@@ -1,43 +1,54 @@
-"""擬似プロンプトキャッシュ (debug 用)。
+"""Pseudo prompt cache (for debugging).
 
-正式仕様: README.md
+Formal spec: README.md
 
-目的: 「アプリが prompt caching を効かせられる構造で投げているか」をハッシュで観測する。
-実キャッシュは持たない (応答は常に control 経由)。
+Purpose: observe via hashing "whether the app is sending requests structured so that prompt
+caching can take effect". It holds no real cache (responses always go through control).
 
-**Anthropic 実機の挙動を再現** (初版の単一 breakpoint・exact-hash モデルを是正):
-- 1 リクエストに **複数 breakpoint** (`cache_control: {type:"ephemeral"}`、最大 4) を置ける。
-  各 breakpoint は「そこまでの prefix」を 1 キャッシュエントリとして **write** する。
-- **read は前方一致 (prefix match)**: 過去に write された最長の prefix が現リクエストの
-  先頭に一致すれば、その分を read (0.1x)。現リクエストが breakpoint を宣言していない位置でも、
-  過去に write 済みなら read できる (例: BP2 を毎 turn 末尾に前進させても、前 turn の prefix が
-  今 turn の前方一致になり incremental に hit する)。
-- **cache_control マーカーはキャッシュキーに含めない**: 実機はキー = content tokens で、
-  cache_control は指示メタデータとして無視する。よって prefix の hash/token は
-  **cache_control を除去**して計算する (マーカー位置が turn 毎に動いても content 一致で hit)。
+**Reproduces the behavior of real Anthropic** (correcting the first version's single-breakpoint,
+exact-hash model):
+- A single request can place **multiple breakpoints** (`cache_control: {type:"ephemeral"}`,
+  up to 4). Each breakpoint **writes** "the prefix up to that point" as one cache entry.
+- **read is prefix match**: if the longest previously written prefix matches the start of the
+  current request, that portion is read (0.1x). Even at a position where the current request
+  does not declare a breakpoint, it can be read if it was previously written (e.g. even if BP2
+  is advanced to the end of each turn, the previous turn's prefix becomes a prefix match in the
+  current turn and hits incrementally).
+- **cache_control markers are not part of the cache key**: real behavior uses key = content
+  tokens and ignores cache_control as directive metadata. Therefore the prefix hash/token are
+  computed with **cache_control removed** (so even if the marker position moves each turn, it
+  hits on content match).
 
-render 順序 = tools → system → messages (prefix-match の評価順)。TTL は 5 分 (read で延長)。
+render order = tools → system → messages (the evaluation order for prefix-match). TTL is 5
+minutes (extended on read).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import pricing
 
 DEFAULT_TTL_SECONDS = 300.0  # Anthropic 5min ephemeral cache
 
-# 実機 fidelity 用の定数:
-_LOOKBACK_BLOCKS = 20  # breakpoint は ≤20 content block しか遡って prior entry を探さない
-_MAX_BREAKPOINTS = 4   # 1 リクエストの cache_control は最大 4 (実機は超過で 400)
-# モデル別の最小キャッシュ prefix (tokens)。実機はこれ未満の prefix を無言で非キャッシュ
-# (cache_creation=0)。NOTE: 当 sim の token は approx (≈4 chars/token、日本語過小) なので、
-# 閾値近傍の判定は不正確 (日本語 prefix は実トークンが大きく実機はキャッシュするが approx だと
-# 閾値割れで非キャッシュと出ることがある)。明らかに小さい prefix の過大計上を防ぐのが主目的。
-_MIN_CACHEABLE = {"opus": 4096, "sonnet": 1024, "haiku": 2048}
+# Constants for real-behavior fidelity:
+_LOOKBACK_BLOCKS = 20  # a breakpoint looks back at most 20 content blocks for a prior entry
+_MAX_BREAKPOINTS = 4   # cache_control per request is at most 4 (real API returns 400 if exceeded)
+# Minimum cacheable prefix per model family (tokens). Real behavior silently does not cache a
+# prefix below this (cache_creation=0). Verified against Anthropic's prompt-caching docs
+# (2026-07). NOTE 1: the real minimum varies BY GENERATION within a family and resolve_family
+# cannot tell generations apart, so these are representative recent values:
+#   Opus:   4.5/4.6 = 4096, 4.7 = 2048, 4.8 = 1024   -> 4096 (conservative)
+#   Sonnet: 4.5 / 4.6 / 5 all = 1024                 -> 1024
+#   Haiku:  4.5 = 4096  (the retired 3.5 was 2048)   -> 4096
+# (Fable 5 / Mythos 5 are 512 but aren't matched by these family keys; they fall to the
+# default below.) NOTE 2: this sim's tokens are approximate (≈4 chars/token, underestimating
+# Japanese), so decisions near the threshold are inaccurate. The main goal is to prevent
+# over-counting clearly small prefixes.
+_MIN_CACHEABLE = {"opus": 4096, "sonnet": 1024, "haiku": 4096}
 _DEFAULT_MIN_CACHEABLE = 1024
 
 
@@ -50,9 +61,10 @@ def _has_cache_control(block: Any) -> bool:
 
 
 def _segments(system: Any, tools: Any, messages: Any) -> list[dict[str, Any]]:
-    """tools → system → messages の順にブロックを 1 列に並べる (prefix 評価順)。
+    """Lay out blocks in a single sequence in the order tools → system → messages
+    (the prefix evaluation order).
 
-    system は str / list、message.content は str / list の両方を吸収する。
+    Handles system as either str / list, and message.content as either str / list.
     """
     segs: list[dict[str, Any]] = []
 
@@ -77,10 +89,11 @@ def _segments(system: Any, tools: Any, messages: Any) -> list[dict[str, Any]]:
 
 
 def _strip_cc(seg: dict[str, Any]) -> dict[str, Any]:
-    """セグメントから cache_control を除いた content-only ビューを返す (hash/token 用)。
+    """Return a content-only view of the segment with cache_control removed (for hash/token).
 
-    実機がキャッシュキーに cache_control を含めないのに合わせる。これにより BP の位置が
-    turn 毎に動いても、同一 content の prefix は同一バイト列 = 同一 hash になり前方一致する。
+    Matches real behavior, which does not include cache_control in the cache key. This way, even
+    if the BP position moves each turn, a prefix of the same content becomes the same byte
+    sequence = the same hash and prefix-matches.
     """
     b = seg.get("block")
     if isinstance(b, dict) and b.get("cache_control") is not None:
@@ -101,26 +114,39 @@ def _tokens_prefix(segs: list[dict[str, Any]], n: int) -> int:
 
 @dataclass
 class RequestCache:
-    """1 リクエストのキャッシュ解析結果 (segments + breakpoint 位置 + 総トークン)。"""
+    """Cache analysis result for one request (segments + breakpoint positions + total tokens).
+
+    prefix_hash / prefix_tokens are memoized per seg_count — observe() calls them for each
+    candidate seg_count, so naively JSON-serializing every time would spend O(candidates ×
+    payload) of synchronous CPU inside state.lock on a long conversation with a grown index.
+    """
     segs: list[dict[str, Any]]
-    breakpoints: list[int]   # cache_control を持つ segment index (昇順)。各 +1 が prefix seg_count。
+    breakpoints: list[int]   # segment indices that have cache_control (ascending). Each +1 is the prefix seg_count.
     total_tokens: int
+    _hash_memo: dict[int, str] = field(default_factory=dict, repr=False)
+    _tokens_memo: dict[int, int] = field(default_factory=dict, repr=False)
 
     def prefix_hash(self, seg_count: int) -> str:
-        return _hash_prefix(self.segs, seg_count)
+        h = self._hash_memo.get(seg_count)
+        if h is None:
+            h = self._hash_memo[seg_count] = _hash_prefix(self.segs, seg_count)
+        return h
 
     def prefix_tokens(self, seg_count: int) -> int:
-        return _tokens_prefix(self.segs, seg_count)
+        t = self._tokens_memo.get(seg_count)
+        if t is None:
+            t = self._tokens_memo[seg_count] = _tokens_prefix(self.segs, seg_count)
+        return t
 
 
 def analyze_request(system: Any = None, tools: Any = None, messages: Any = None) -> RequestCache:
-    """1 回の segments 分解で RequestCache を返す (multi-breakpoint 対応)。"""
+    """Return a RequestCache from a single segments decomposition (multi-breakpoint aware)."""
     segs = _segments(system, tools, messages)
     bps = [i for i, s in enumerate(segs) if _has_cache_control(s["block"])]
     return RequestCache(segs=segs, breakpoints=bps, total_tokens=_tokens_prefix(segs, len(segs)))
 
 
-# ── 後方互換: 単一 prefix が欲しい旧 caller / 単体テスト向け ──────────────
+# ── Backward compatibility: for legacy callers / unit tests that want a single prefix ──────────────
 
 
 @dataclass
@@ -134,7 +160,7 @@ class CachePrefix:
 def extract_cache_prefix(
     system: Any = None, tools: Any = None, messages: Any = None
 ) -> CachePrefix | None:
-    """cacheable prefix を抽出 (最深 breakpoint まで)。cache_control が無ければ None。"""
+    """Extract the cacheable prefix (up to the deepest breakpoint). None if there is no cache_control."""
     rc = analyze_request(system, tools, messages)
     if not rc.breakpoints:
         return None
@@ -146,16 +172,16 @@ def extract_cache_prefix(
 
 
 class CacheSimulator:
-    """prefix hash → エントリの index を持ち、multi-breakpoint + 前方一致で hit/miss を判定。
+    """Holds an index of prefix hash → entry, and decides hit/miss via multi-breakpoint + prefix match.
 
-    時刻は呼び出し側から `now` を渡す (テスト容易性)。
+    The current time is passed in from the caller as `now` (for testability).
     """
 
     def __init__(self, ttl_seconds: float = DEFAULT_TTL_SECONDS, honor_ttl: bool = True,
                  min_cacheable_tokens: int | None = None):
         self.ttl_seconds = ttl_seconds
         self.honor_ttl = honor_ttl
-        # None = モデル別 (_min_cacheable_for)。明示値を渡すと全モデルでそれを使う (テスト用に 0 等)。
+        # None = per-model (_min_cacheable_for). Passing an explicit value uses it for all models (e.g. 0 for tests).
         self.min_cacheable_tokens = min_cacheable_tokens
         # hash -> {seg_count, tokens, created_at, last_seen, hits, misses, model}
         self.index: dict[str, dict[str, Any]] = {}
@@ -165,15 +191,16 @@ class CacheSimulator:
 
     @staticmethod
     def _key(model: str | None, content_hash: str) -> str:
-        # 実機のキャッシュは model 単位 (model 切替で無効化)。キーに model を畳み込み、
-        # 同一 content でも別 model なら別エントリ = 別 model からの誤 hit / model 上書きを防ぐ。
+        # The real cache is per-model (switching models invalidates it). Folding model into the
+        # key means the same content under a different model is a different entry = prevents a
+        # false hit from another model / a model overwrite.
         return f"{model}\x00{content_hash}"
 
     def _min_tokens(self, model: str | None) -> int:
         return self.min_cacheable_tokens if self.min_cacheable_tokens is not None else _min_cacheable_for(model)
 
     def _prune(self, now: float) -> None:
-        """TTL の 2 倍を超えた dead entry を遅延 GC (read 不能・無制限増加防止)。"""
+        """Lazily GC dead entries older than 2x the TTL (unreadable; prevents unbounded growth)."""
         if not self.honor_ttl:
             return
         cutoff = 2 * self.ttl_seconds
@@ -181,23 +208,25 @@ class CacheSimulator:
             del self.index[h]
 
     def observe(self, rc: RequestCache, model: str | None, now: float) -> dict[str, Any]:
-        """1 リクエストを観測し cache 判定を返す (multi-breakpoint + 前方一致 + 最小閾値 + 20-block lookback)。
+        """Observe one request and return the cache decision (multi-breakpoint + prefix match +
+        minimum threshold + 20-block lookback).
 
-        返り値: {status, cache_read_tokens, cache_creation_tokens, prefix_hash, read_seg_count, breakpoints}
-        status: "hit" | "miss" | "none" (cache_control 無し or 全 breakpoint が最小閾値未満)。
+        Returns: {status, cache_read_tokens, cache_creation_tokens, prefix_hash, read_seg_count, breakpoints}
+        status: "hit" | "miss" | "none" (no cache_control, or all breakpoints below the minimum threshold).
         """
         self._prune(now)
         min_tok = self._min_tokens(model)
-        # 有効 breakpoint = prefix が最小閾値以上のもの。最大 4 (実機制限、超過分は deepest 側を採用)。
+        # Valid breakpoints = those whose prefix is at or above the minimum threshold. At most 4
+        # (real-API limit; on overflow the deepest ones are kept).
         eff_bps = [bp for bp in rc.breakpoints if rc.prefix_tokens(bp + 1) >= min_tok][-_MAX_BREAKPOINTS:]
         if not eff_bps:
-            # cache_control はあるが全て閾値未満 → 実機は非キャッシュ (over-report 防止)。
+            # cache_control is present but all are below threshold → real behavior is non-cached (prevents over-report).
             return {"status": "none", "cache_read_tokens": 0, "cache_creation_tokens": 0,
                     "prefix_hash": None, "read_seg_count": 0, "breakpoints": len(rc.breakpoints)}
 
         n = len(rc.segs)
-        # READ: 既存エントリ seg_count を降順。(a) 20-block 以内に有効 breakpoint がある
-        # (lookback) (b) hash 前方一致 (c) alive、の最長を採用。
+        # READ: existing entry seg_counts in descending order. Adopt the longest one satisfying
+        # (a) a valid breakpoint within 20 blocks (lookback) (b) hash prefix match (c) alive.
         read_tokens = 0
         read_hash: str | None = None
         read_entry: dict[str, Any] | None = None
@@ -208,25 +237,25 @@ class CacheSimulator:
         )
         for sc in seg_counts:
             if not any(0 <= (bp + 1) - sc <= _LOOKBACK_BLOCKS for bp in eff_bps):
-                continue  # どの breakpoint からも 20-block 以内に届かない → 実機は見つけられない
+                continue  # not reachable within 20 blocks from any breakpoint → real behavior cannot find it
             h = self._key(model, rc.prefix_hash(sc))
             e = self.index.get(h)
             if e is not None and e["seg_count"] == sc and self._alive(e, now):
                 read_tokens, read_hash, read_entry, read_seg = rc.prefix_tokens(sc), h, e, sc
-                break  # 降順なので最初の一致が最長
+                break  # descending order, so the first match is the longest
 
-        # WRITE 先 = 最深 有効 breakpoint。creation = (最深 - read)。
+        # WRITE target = deepest valid breakpoint. creation = (deepest - read).
         deepest_sc = eff_bps[-1] + 1
         deepest_tokens = rc.prefix_tokens(deepest_sc)
         creation_tokens = max(0, deepest_tokens - read_tokens)
 
-        if read_entry is not None:  # read で TTL 延長 + hit カウント
+        if read_entry is not None:  # on read, extend TTL + increment hit count
             read_entry["created_at"] = now
             read_entry["last_seen"] = now
             read_entry["hits"] += 1
             read_entry["model"] = model
 
-        # WRITE: 有効 breakpoint prefix を index に登録/更新 (TTL 延長、model 単位キー)。
+        # WRITE: register/update valid breakpoint prefixes in the index (extend TTL, per-model key).
         for bp in eff_bps:
             sc = bp + 1
             h = self._key(model, rc.prefix_hash(sc))

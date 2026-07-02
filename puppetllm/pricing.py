@@ -1,14 +1,21 @@
-"""コスト目安の算出 (debug 用、approx)。
+"""Cost estimation (for debugging, approximate).
 
-正式仕様: README.md
+Formal spec: README.md
 
-fake_server は実 token 数を計算しない (実 SDK 経路が必要)。本モジュールは
-**ヒューリスティック概算** (≈4 chars/token) と **公開料金表** から「大体のコスト目安」を出す。
-精度より「桁・傾向が分かる」ことを優先する。実課金とは一致しないので注意。
+fake_server does not compute real token counts (that would require a real SDK path).
+This module produces a "rough cost estimate" from a **heuristic approximation**
+(≈4 chars/token) and a **published pricing table**. It favors "getting the order of
+magnitude and the trend right" over precision. Note that it does not match actual billing.
 
-料金は USD / 100万トークン (per Mtok)。Anthropic 公開価格 (2025 時点) を手で写経。
-価格改定時は本テーブルだけ直せばよい。cache_write は input の 1.25x、cache_read は
-input の 0.1x という Anthropic の 5 分 cache 規則に沿った値 (覚え書きとして明示)。
+Prices are in USD per 1M tokens (per Mtok). Anthropic / OpenAI public prices are
+transcribed by hand. On a price change, only this table needs updating.
+
+- Anthropic: cache_write is 1.25x input, cache_read is 0.1x input — values following
+  the 5-minute cache rule (stated here as a memo).
+- OpenAI: prompt caching is automatic (no cache_control needed) with no write surcharge →
+  cache_write = input. cache_read uses the official "cached input" price.
+  Note: the proxy's OpenAI path does not perform pseudo-cache observation (always
+  status "none"), so the cache columns are effectively unused, but we keep accurate values.
 """
 
 from __future__ import annotations
@@ -21,47 +28,97 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ModelPrice:
-    """per Mtok (USD)。"""
+    """per Mtok (USD)."""
     input: float
     output: float
-    cache_write: float  # 5min cache 書き込み (= input * 1.25)
-    cache_read: float   # cache 読み出し     (= input * 0.10)
+    cache_write: float  # cache write (Anthropic: input * 1.25 / OpenAI: no surcharge = input)
+    cache_read: float   # cache read (Anthropic: input * 0.10 / OpenAI: official cached input price)
 
 
-# モデルファミリ別料金。キーは model id の部分一致 (opus/sonnet/haiku) で引く。
-# Anthropic / Bedrock どちらの model id でもファミリ名が含まれるので共通で使える。
+# Per-model-family pricing. Keys are matched against the model id by substring.
+# The family name appears in Anthropic / Bedrock / OpenAI model ids alike, so this works commonly.
 _FAMILY_PRICES: dict[str, ModelPrice] = {
-    # Claude Opus (4.x = 4.6/4.7/4.8)。$5/$25 (旧 Claude 3 Opus / Opus 4.0-4.1 は
-    # $15/$75 だったので注意。model id では世代判別しないため最新 4.x 価格を採用)。
+    # ── Anthropic (Claude) ──────────────────────────────────────────
+    # Claude Opus (4.x = 4.6/4.7/4.8). $5/$25 (note: old Claude 3 Opus / Opus 4.0-4.1 were
+    # $15/$75. Since the model id does not distinguish generations, we use the latest 4.x price).
     "opus":   ModelPrice(input=5.0,  output=25.0, cache_write=6.25,  cache_read=0.50),
     # Claude Sonnet (4.x)
     "sonnet": ModelPrice(input=3.0,  output=15.0, cache_write=3.75,  cache_read=0.30),
-    # Claude Haiku (4.5)。3.5 世代は $0.80/$4 と安かった点に注意 (model id では世代を
-    # 判別しないため最新 4.5 価格を採用)。
+    # Claude Haiku (4.5). Note the 3.5 generation was cheaper at $0.80/$4 (since the model id
+    # does not distinguish generations, we use the latest 4.5 price).
     "haiku":  ModelPrice(input=1.0,  output=5.0,  cache_write=1.25,  cache_read=0.10),
+
+    # ── OpenAI: current (official pricing page as of 2026-07) ──────────────────
+    # pro models have no cached-input discount (official notation "—") → cache_read = input.
+    "gpt-5.5-pro":  ModelPrice(input=30.0, output=180.0, cache_write=30.0, cache_read=30.0),
+    "gpt-5.4-pro":  ModelPrice(input=30.0, output=180.0, cache_write=30.0, cache_read=30.0),
+    "gpt-5.5":      ModelPrice(input=5.0,  output=30.0,  cache_write=5.0,  cache_read=0.50),
+    "gpt-5.4-mini": ModelPrice(input=0.75, output=4.50,  cache_write=0.75, cache_read=0.075),
+    "gpt-5.4-nano": ModelPrice(input=0.20, output=1.25,  cache_write=0.20, cache_read=0.02),
+    "gpt-5.4":      ModelPrice(input=2.50, output=15.0,  cache_write=2.50, cache_read=0.25),
+    # codex models (gpt-5.3-codex etc.). Matched across generations by the "codex" substring.
+    "codex":        ModelPrice(input=1.75, output=14.0,  cache_write=1.75, cache_read=0.175),
+
+    # ── OpenAI: legacy (removed from the official page; former published values) ─────────
+    # gpt-5 lumps the plain / 5.1 / 5.2 generations together and estimates at the old $1.25/$10.
+    "gpt-5-mini":   ModelPrice(input=0.25, output=2.0,   cache_write=0.25, cache_read=0.025),
+    "gpt-5-nano":   ModelPrice(input=0.05, output=0.40,  cache_write=0.05, cache_read=0.005),
+    "gpt-5":        ModelPrice(input=1.25, output=10.0,  cache_write=1.25, cache_read=0.125),
+    "gpt-4.1-mini": ModelPrice(input=0.40, output=1.60,  cache_write=0.40, cache_read=0.10),
+    "gpt-4.1-nano": ModelPrice(input=0.10, output=0.40,  cache_write=0.10, cache_read=0.025),
+    "gpt-4.1":      ModelPrice(input=2.0,  output=8.0,   cache_write=2.0,  cache_read=0.50),
+    "gpt-4o-mini":  ModelPrice(input=0.15, output=0.60,  cache_write=0.15, cache_read=0.075),
+    "gpt-4o":       ModelPrice(input=2.50, output=10.0,  cache_write=2.50, cache_read=1.25),
+    "o4-mini":      ModelPrice(input=1.10, output=4.40,  cache_write=1.10, cache_read=0.275),
+    "o3-mini":      ModelPrice(input=1.10, output=4.40,  cache_write=1.10, cache_read=0.55),
+    "o3":           ModelPrice(input=2.0,  output=8.0,   cache_write=2.0,  cache_read=0.50),
 }
 
-# 未知 model 時のフォールバック (sonnet 相当)。is_estimate フラグで「不明」を伝える。
+# Fallback for unknown models (equivalent to sonnet). The is_estimate flag conveys "unknown".
+# Even if unknown, a model containing "gpt" falls back to the current mid-tier gpt-5.4
+# (sonnet-equivalent) (see resolve_family).
 _DEFAULT_FAMILY = "sonnet"
+_DEFAULT_GPT_FAMILY = "gpt-5.4"
 
-# ヒューリスティック: 1 token ≈ 4 文字。日本語は 1 文字 ≈ 1-2 token なので過小評価寄り
-# だが「目安」用途では許容する (docstring 参照)。
+# Heuristic: 1 token ≈ 4 characters. Japanese is ≈ 1-2 tokens per character, so this leans
+# toward underestimation, but that is acceptable for "ballpark" use (see docstring).
 _CHARS_PER_TOKEN = 4.0
 
 
-# ファミリ判定の優先順位 (明示)。dict 反復順への暗黙依存を避けるため固定タプルで持つ。
-# substring 一致を使う (startswith ではない): Anthropic は `claude-opus-4-...`、Bedrock は
-# `anthropic.claude-opus-...`、cross-region は `us.anthropic.claude-opus-...` のように
-# ファミリ名が先頭に来ず接頭辞が付くため、startswith だと取りこぼす。
-_FAMILY_ORDER: tuple[str, ...] = ("opus", "sonnet", "haiku")
+# Family resolution priority (explicit). Held as a fixed tuple to avoid implicit dependence
+# on dict iteration order. Uses substring matching (not startswith): Anthropic uses
+# `claude-opus-4-...`, Bedrock uses `anthropic.claude-opus-...`, cross-region uses
+# `us.anthropic.claude-opus-...`, so the family name is not at the start but carries a prefix,
+# which startswith would miss.
+# On the OpenAI side, "more specific keys come first" (e.g. gpt-5.4-mini contains gpt-5.4 /
+# gpt-5 too by substring, so order is mini/nano/pro → generation → plain). "codex" comes
+# before the generation keys (gpt-5.4-codex etc. also resolve to codex-series pricing =
+# cross-generation). "o3"/"o4-mini" are short keys prone to false matches, so they go last.
+_FAMILY_ORDER: tuple[str, ...] = (
+    "opus", "sonnet", "haiku",
+    "codex",
+    "gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano",
+    "gpt-5.5", "gpt-5.4",
+    "gpt-5-mini", "gpt-5-nano", "gpt-5",
+    "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1",
+    "gpt-4o-mini", "gpt-4o",
+    "o4-mini", "o3-mini", "o3",
+)
 
 
-def resolve_family(model: str | None) -> str:
-    """model id からファミリ名 (opus/sonnet/haiku) を解決。不明なら default。"""
-    m = (model or "").lower()
+def resolve_family(model: Any) -> str:
+    """Resolve the family name from a model id. Falls back to the default if unknown
+    (gpt-5.4 if it contains gpt).
+
+    model is assumed to be a str, but callers (register/usage computation) may pass through
+    values from a malformed request, so non-str inputs are coerced with str() to avoid crashing.
+    """
+    m = str(model or "").lower()
     for fam in _FAMILY_ORDER:
         if fam in m:
             return fam
+    if "gpt" in m:
+        return _DEFAULT_GPT_FAMILY
     return _DEFAULT_FAMILY
 
 
@@ -70,10 +127,10 @@ def price_for(model: str | None) -> ModelPrice:
 
 
 def approx_tokens(value: Any) -> int:
-    """任意の JSON 的構造のトークン数を概算する。
+    """Approximate the token count of any JSON-like structure.
 
-    文字列化した総長 / 4 で概算 (≈4 chars/token)。dict/list は JSON 直列化。
-    None/空は 0。実 tokenizer ではないので「目安」。
+    Estimated as total stringified length / 4 (≈4 chars/token). dict/list are JSON-serialized.
+    None/empty is 0. Not a real tokenizer, so this is a "ballpark".
     """
     if value is None:
         return 0
@@ -90,7 +147,7 @@ def approx_tokens(value: Any) -> int:
 
 
 def estimate_output_tokens(content_blocks: Any) -> int:
-    """レスポンス content blocks の概算トークン。"""
+    """Approximate token count of response content blocks."""
     return approx_tokens(content_blocks)
 
 
@@ -102,10 +159,10 @@ def compute_cost(
     cache_write_tokens: int = 0,
     cache_read_tokens: int = 0,
 ) -> dict[str, Any]:
-    """概算コストを USD で返す。各内訳 + 合計 + 使用ファミリ + is_estimate。
+    """Return the estimated cost in USD. Each breakdown + total + resolved family + is_estimate.
 
-    input_tokens は **cache に乗らなかった分** (非キャッシュ入力) を渡す前提。
-    cache_write/read はそれぞれ別単価で課金される (Anthropic の usage 意味論に合わせる)。
+    input_tokens is expected to be **the portion that did not hit the cache** (non-cached input).
+    cache_write/read are each billed at their own rate (matching Anthropic's usage semantics).
     """
     fam = resolve_family(model)
     p = _FAMILY_PRICES[fam]
@@ -117,7 +174,7 @@ def compute_cost(
     total = input_cost + output_cost + cache_write_cost + cache_read_cost
     return {
         "model_family": fam,
-        "is_estimate": True,  # 常に概算 (実 tokenizer ではない)
+        "is_estimate": True,  # always an estimate (not a real tokenizer)
         "currency": "USD",
         "input_usd": round(input_cost, 6),
         "output_usd": round(output_cost, 6),
@@ -128,10 +185,11 @@ def compute_cost(
 
 
 def cache_savings_usd(model: str | None, cache_read_tokens: int) -> float:
-    """cache read で浮いた額の概算 (= 同トークンを通常 input で払った場合との差)。
+    """Approximate the amount saved by a cache read (= the difference vs. paying for the same
+    tokens as normal input).
 
-    write 時の割増 (1.25x) は別途発生するが、ここでは read 1 回あたりの粗い節約額のみ。
-    stats で hit の read トークンを積算して「だいたいこれだけ得した」を示す用途。
+    The write-time surcharge (1.25x) is incurred separately, but here we only compute the rough
+    savings per read. Used by stats to accumulate hit read tokens and show "roughly this much saved".
     """
     p = price_for(model)
     return round(cache_read_tokens * (p.input - p.cache_read) / 1_000_000.0, 6)

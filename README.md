@@ -1,8 +1,8 @@
-<!-- Language: **English** | [日本語](README.ja.md) -->
+**English** | [日本語](README.ja.md)
 
-# puppetllm — Claude API debug proxy (fake Anthropic / Bedrock server)
+# puppetllm — LLM API debug proxy (fake Anthropic / Bedrock / OpenAI server)
 
-A **fake server** compatible with the Anthropic Messages API / Bedrock. Just point `ANTHROPIC_BASE_URL` (or the `AnthropicBedrock` `base_url`) at this server and it intercepts LLM calls **without changing a single line of your app / SDK code**, letting a human or another agent supply the responses (human-in-the-loop / AI-in-the-loop).
+A **fake server** compatible with the Anthropic Messages API / Bedrock / OpenAI Chat Completions. Just point `ANTHROPIC_BASE_URL` (or the `AnthropicBedrock` / `OpenAI` `base_url`) at this server and it intercepts LLM calls **without changing a single line of your app / SDK code**, letting a human or another agent supply the responses (human-in-the-loop / AI-in-the-loop).
 
 Use cases:
 
@@ -21,10 +21,11 @@ A provider-agnostic canonical core + adapters:
 
 - `puppetllm/fake_server.py` — canonical core (normalized snapshot management + `/_control/*` + cost/cache computation). The Anthropic route `POST /v1/messages` is built in.
 - `puppetllm/providers/bedrock.py` — Bedrock route `POST /model/{id}/invoke[-with-response-stream]` (AWS event stream framing lives in `providers/eventstream.py`).
+- `puppetllm/providers/openai.py` — OpenAI route `POST /v1/chat/completions` (requests are normalized to the canonical Anthropic-style form; responses are converted back to `chat.completion` JSON / SSE chunks).
 - `puppetllm/cache_sim.py` — pseudo prompt cache (multi-breakpoint + prefix match + per-model minimum threshold + 20-block lookback).
-- `puppetllm/pricing.py` — approximate tokens + price table.
+- `puppetllm/pricing.py` — approximate tokens + price table (Claude and GPT families).
 
-Response content blocks / control API are common across providers (injection is always the same `/_control/respond`).
+Providers are auto-selected by URL path — no mode switch or configuration. Response content blocks / control API are common across providers (injection is always the same `/_control/respond`).
 
 ---
 
@@ -55,6 +56,7 @@ python3 -m puppetllm --host 127.0.0.1 --port 8765
 #   [puppetllm] starting on http://127.0.0.1:8765
 #   [puppetllm] Anthropic: set ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 #   [puppetllm] Bedrock:   point AnthropicBedrock base_url to http://127.0.0.1:8765
+#   [puppetllm] OpenAI:    set OPENAI_BASE_URL=http://127.0.0.1:8765/v1  (note the /v1)
 
 # C) uvicorn directly (when you want options like --reload)
 python3 -m uvicorn puppetllm.fake_server:app --host 127.0.0.1 --port 8765
@@ -74,7 +76,7 @@ client = anthropic.Anthropic(base_url="http://localhost:8765", api_key="sk-mock-
 
 # blocks until a response is injected
 msg = client.messages.create(
-    model="claude-opus-4-20250514", max_tokens=1024,
+    model="claude-sonnet-4-5", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 print(msg.content)          # → the injected content blocks
@@ -87,14 +89,28 @@ The API key can be a dummy (the proxy does not validate it). Instead of `base_ur
 
 ```python
 from anthropic import AnthropicBedrock
-client = AnthropicBedrock(base_url="http://localhost:8765", aws_region="us-east-1")
+client = AnthropicBedrock(base_url="http://localhost:8765", aws_region="us-east-1",
+                          aws_access_key="dummy", aws_secret_key="dummy")
 msg = client.messages.create(
     model="anthropic.claude-3-5-sonnet-20241022-v2:0", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
 
-The model goes into the URL path (`/model/{id}/invoke`) and streaming comes back as an AWS event stream — the server absorbs both. **Injecting responses is exactly the same as the Anthropic route** (use the same `/_control/respond` below).
+Requires the bedrock extra for SigV4 signing: `pip install 'anthropic[bedrock]'`. The AWS credentials can be any dummy values (the proxy doesn't validate the signature), but the SDK needs *something* to sign with. The model goes into the URL path (`/model/{id}/invoke`) and streaming comes back as an AWS event stream — the server absorbs both. **Injecting responses is exactly the same as the Anthropic route** (use the same `/_control/respond` below).
+
+**OpenAI SDK (`openai`):**
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-mock-anything")
+msg = client.chat.completions.create(
+    model="gpt-5.4", max_tokens=1024,
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+Note the base_url **includes `/v1`** (the SDK appends `/chat/completions`); the env var `OPENAI_BASE_URL=http://localhost:8765/v1` works identically. Streaming (`stream=True`) and tool calls work as-is. OpenAI-format requests are **normalized to the canonical Anthropic-style form** (system / messages / tools, tool results as `tool_result` blocks) before being held, so the responder reads the same shape regardless of provider — and injects the same canonical blocks; the server converts them back to the `chat.completion` format. The pseudo prompt-cache is **not** simulated on this route (OpenAI's caching is automatic, not `cache_control`-based): cache status is always `"none"`.
 
 ### 3. Supply the response (responder)
 
@@ -143,7 +159,7 @@ Having an **AI agent "play the LLM" and respond faithfully** — rather than a h
 
 ### 4. Inject error responses to test handling
 
-For branch testing, you can make a pending request return any HTTP error (converted to each format on both the Anthropic / Bedrock routes):
+For branch testing, you can make a pending request return any HTTP error (converted to the provider's native error format on all three routes — Anthropic / Bedrock / OpenAI). Optional `code` / `param` fields are passed through on the OpenAI route (e.g. `"code": "rate_limit_exceeded"`):
 
 ```bash
 # 429 → the SDK retries automatically
@@ -165,8 +181,8 @@ curl -s localhost:8765/_control/stats | jq
 # → {"is_estimate":true,"completed_requests":3,"error_requests":0,
 #     "totals":{"input_tokens":..,"output_tokens":..,
 #               "cache_read_input_tokens":..,"total_usd":..,"cache_savings_usd":..},
-#     "cache":{"hits":2,"misses":1,"hit_rate":0.67,"index_size":2},
-#     "by_model":{"claude-opus-4-20250514":{"requests":3,"total_usd":..}}}
+#     "cache":{"hits":2,"misses":1,"hit_rate":0.6667,"index_size":2},
+#     "by_model":{"claude-sonnet-4-5":{"requests":3,"total_usd":..}}}
 
 # Pseudo prompt-cache index (hit/miss per prefix hash)
 curl -s localhost:8765/_control/cache | jq
@@ -178,7 +194,7 @@ curl -s localhost:8765/_control/history | jq '.history[-1]'
 curl -s -X POST localhost:8765/_control/clear
 ```
 
-`cache_savings_usd` is "the approximate amount you would have saved for real thanks to cache hits." Use it to verify your app structures `cache_control` correctly.
+`cache_savings_usd` is "the approximate amount you would have saved for real thanks to cache hits." Use it to verify your app structures `cache_control` correctly. (Anthropic / Bedrock routes only — the OpenAI route always reports cache status `"none"` and never touches the hit/miss counters.)
 
 ---
 
@@ -189,9 +205,9 @@ curl -s -X POST localhost:8765/_control/clear
 | GET  | `/_control/health` | Health check (`{"ok","turn_count"}`) |
 | GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`) |
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
-| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?}`) into a pending request |
+| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?}`) into a pending request. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route) |
 | POST | `/_control/auto` | Simple auto-response (`{"text":"...", "pending_id"?}`, text only) |
-| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "pending_id"?}`) |
+| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "pending_id"?}`) |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) history |
 | GET  | `/_control/stats` | Cumulative summary of cost estimates, tokens, cache |
 | GET  | `/_control/cache` | Pseudo prompt-cache index |
@@ -202,7 +218,7 @@ curl -s -X POST localhost:8765/_control/clear
 The server can hold multiple concurrent requests. Each pending has a unique `pending_id`; inject into each individually by specifying `pending_id` on `/_control/respond` (also `auto` / `error`).
 
 - Omitting `pending_id` is allowed only when there is **exactly one** pending. Zero → `400`; multiple → `400` (the response includes `pending_ids` so you can pick one).
-- Injecting into an already-resolved pending (e.g. after `clear`) returns `409`.
+- Injecting into a pending that no longer exists (already resolved, or wiped by `clear`) returns `400` (`no pending request`); only a near-simultaneous double-injection race returns `409` (`already resolved`).
 
 How to build injection payloads (especially avoiding escape accidents with non-ASCII + nested JSON) is covered in detail in [`responder/CLAUDE.md`](responder/CLAUDE.md) / [`responder/AGENTS.md`](responder/AGENTS.md).
 
@@ -224,7 +240,7 @@ How to build injection payloads (especially avoiding escape accidents with non-A
 |---|---|---|
 | `PUPPETLLM_CACHE_TTL` | `300` | Pseudo-cache TTL (seconds) |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` ignores the TTL (entries live forever) |
-| `PUPPETLLM_CACHE_MIN_TOKENS` | (per-model) | Override the minimum cache threshold. `0` disables it (cache every prefix). Unset = Opus 4096 / Sonnet 1024 / Haiku 2048 |
+| `PUPPETLLM_CACHE_MIN_TOKENS` | (per-model) | Override the minimum cache threshold. `0` disables it (cache every prefix). Unset = Opus 4096 / Sonnet 1024 / Haiku 4096 |
 
 ---
 
@@ -251,7 +267,7 @@ puppetllm/
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/*
 │   ├── cache_sim.py        # pseudo prompt cache
 │   ├── pricing.py          # approximate tokens + pricing
-│   ├── providers/          # Bedrock adapter + AWS event stream
+│   ├── providers/          # Bedrock / OpenAI adapters + AWS event stream
 │   └── tests/              # unit tests
 ├── responder/              # instruction docs for the responder (the agent that "plays the LLM")
 │   ├── CLAUDE.md           #   for Claude Code

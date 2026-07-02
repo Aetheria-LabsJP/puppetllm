@@ -5,7 +5,7 @@
 
 ## Role of this session
 
-For **Anthropic Messages API requests that arrive at the puppetllm fake server, you (this responder agent) play the LLM and respond**. This is puppetllm's "human-in-the-loop / AI-in-the-loop" responder.
+For **API requests that arrive at the puppetllm fake server (Anthropic / Bedrock / OpenAI — all normalized to the same canonical shape), you (this responder agent) play the LLM and respond**. This is puppetllm's "human-in-the-loop / AI-in-the-loop" responder.
 
 > **Core principle**: **faithfully reproduce the response the real Anthropic API would return.**
 > Read the request's system prompt and conversation, and generate the LLM response expected from that context.
@@ -110,7 +110,8 @@ Even when joining mid-stream, the context can be reconstructed by reading `messa
 ### 4. Stay faithful to the real API protocol
 
 - Mixing text blocks and tool_use blocks in a single response is fine (the real API does this routinely)
-- `stop_reason` is auto-determined server-side from whether a `tool_use` block is present (the responder need not worry about it)
+- `stop_reason` is auto-determined server-side from whether a `tool_use` block is present. To simulate truncation etc., you can override it by adding `"stop_reason": "max_tokens"` to the `/_control/respond` body (mapped to `finish_reason: "length"` on the OpenAI route)
+- the pending snapshot also carries `params` (`tool_choice`, `response_format`, `temperature`, `stop_sequences`, …) — honor them like the real API would (e.g. a forced `tool_choice` means you MUST return that tool call)
 - Both streaming SSE / non-streaming JSON are format-converted by the server, so the responder only needs to pass **canonical content blocks**
 
 ### 5. Do not take shortcuts
@@ -228,7 +229,7 @@ curl -s -X POST $PUPPET_URL/_control/error \
 | GET | `/_control/health` | Health check (also returns cumulative turn count) |
 | GET | `/_control/pending` | Immediately fetch currently pending requests (`has_pending: false` if none) |
 | GET | `/_control/wait_for_pending?timeout=N` | **long-poll**: wait up to N seconds for the next pending (default 270, max 600) |
-| POST | `/_control/respond` | Inject arbitrary content blocks (`{"content": [...]}`) into a pending |
+| POST | `/_control/respond` | Inject arbitrary content blocks (`{"content": [...], "stop_reason"?}`) into a pending |
 | POST | `/_control/auto` | Sugar for text-only injection (`{"text": "..."}`) |
 | POST | `/_control/error` | Inject an HTTP error response (`{"status": N, "type": "...", "message": "..."}`) |
 | GET | `/_control/history` | Cumulative (request, response, usage, cost, cache) history |
@@ -236,8 +237,10 @@ curl -s -X POST $PUPPET_URL/_control/error \
 | GET | `/_control/cache` | Pseudo prompt-cache index (hit/miss per prefix hash) |
 | POST | `/_control/clear` | Reset pending + history + cache |
 
-Note: each pending carries `provider` (`anthropic` / `bedrock`). The responder only passes provider-agnostic
-canonical content blocks; conversion to SSE / non-streaming JSON / Bedrock eventstream is done server-side.
+Note: each pending carries `provider` (`anthropic` / `bedrock` / `openai`). OpenAI-route requests are
+normalized to the canonical form (system / messages / tools) before being held, so you read the same shape
+regardless of provider. The responder only passes provider-agnostic canonical content blocks; conversion to
+SSE / non-streaming JSON / Bedrock eventstream / OpenAI chat.completion is done server-side.
 
 Full spec: `../README.md`
 
@@ -321,7 +324,7 @@ curl -s -X POST http://localhost:8765/_control/respond \
 - But the responder must not predict the real tool result; wait for the tool_result to come back
 
 ### Concurrency (multi-pending)
-- puppetllm can **hold multiple pending at once** (409 has been removed). Each pending has a unique `pending_id`.
+- puppetllm can **hold multiple pending at once**. Each pending has a unique `pending_id`.
   Respond by specifying `pending_id` on `_control/respond` to inject individually (see "Handling parallel requests (multi-pending)" above).
   Omitting pending_id is allowed only with a single pending (with multiple it is 400).
 - When multiple responders sit on the same `wait_for_pending`, all wake up, but only the first one can resolve each pending via

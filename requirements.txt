@@ -1,6 +1,7 @@
-# 本体 (server 起動): fastapi + uvicorn
+# Core (server startup): fastapi + uvicorn
 fastapi>=0.115
 uvicorn[standard]>=0.30
-# テスト: httpx (ASGITransport) + anthropic (SDK 互換性確認)
+# Tests: httpx (ASGITransport) + anthropic / openai (SDK compatibility checks)
 httpx>=0.27
 anthropic>=0.40
+openai>=1.40

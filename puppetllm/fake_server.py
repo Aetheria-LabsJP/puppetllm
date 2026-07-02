@@ -1,39 +1,43 @@
-"""Anthropic / Bedrock 互換 fake server (debug/regression 用)。
+"""Anthropic / Bedrock / OpenAI compatible fake server (for debug/regression).
 
-正式仕様・使用例・設計判断は **README.md** を参照。
+See **README.md** for the formal spec, usage examples, and design decisions.
 
-Anthropic SDK は環境変数 `ANTHROPIC_BASE_URL` を尊重するので、これを localhost に向ければ
-SDK の真の経路 (HTTP → SSE → stream イベントパース) をすべて通したまま、人間 or 別エージェントが
-レスポンスを供給できる。Bedrock SDK (`AnthropicBedrock` / boto3) も base_url 差し替えで
-本 server に向けられる。
+The Anthropic SDK honors the `ANTHROPIC_BASE_URL` environment variable, so pointing
+it at localhost lets a human or another agent supply the response while still exercising
+the SDK's real path (HTTP → SSE → stream event parsing). The Bedrock SDK
+(`AnthropicBedrock` / boto3) and the OpenAI SDK can likewise be pointed at this server
+by swapping their base_url.
 
-アーキテクチャ (provider 非依存の canonical core + アダプタ):
-- 本ファイル = canonical core: 正規化 snapshot 管理 + /_control/* + cost/cache 計算
-- Anthropic 経路: `/v1/messages` (本ファイル内に実装)
-- Bedrock 経路  : `providers/bedrock.py` (`/model/{id}/invoke[-with-response-stream]`)
-- 応答 content blocks / 制御 API は provider 共通 (注入は同じ /_control/respond)
+Architecture (provider-independent canonical core + adapters):
+- This file = canonical core: normalized snapshot management + /_control/* + cost/cache computation
+- Anthropic path: `/v1/messages` (implemented in this file)
+- Bedrock path  : `providers/bedrock.py` (`/model/{id}/invoke[-with-response-stream]`)
+- OpenAI path   : `providers/openai.py` (`/v1/chat/completions`)
+- Response content blocks / control API are provider-common (injection uses the same /_control/respond)
 
-実装範囲:
-- POST /v1/messages                  — Anthropic 互換 (SSE / 単一 JSON)
-- POST /model/{id}/invoke[...]        — Bedrock 互換 (providers/bedrock.py が追加)
-- GET  /_control/pending             — 保留中リクエスト (provider 込み)
-- GET  /_control/wait_for_pending    — long-poll で次 pending を待つ
-- POST /_control/respond             — 保留中リクエストに応答を注入
-- POST /_control/auto                — 簡易自動応答 (text のみ)
-- POST /_control/error               — HTTP error response 注入
-- GET  /_control/history             — (request, response, usage, cost) 履歴
-- GET  /_control/stats               — コスト目安・トークン・キャッシュの累計サマリ
-- GET  /_control/cache               — 擬似プロンプトキャッシュ index
-- POST /_control/clear               — pending/history/cache を空に
-- GET  /_control/health              — ヘルスチェック
+Implemented surface:
+- POST /v1/messages                  — Anthropic compatible (SSE / single JSON)
+- POST /model/{id}/invoke[...]        — Bedrock compatible (added by providers/bedrock.py)
+- POST /v1/chat/completions          — OpenAI compatible (added by providers/openai.py)
+- GET  /_control/pending             — pending requests (including provider)
+- GET  /_control/wait_for_pending    — long-poll until the next pending arrives
+- POST /_control/respond             — inject a response into a pending request
+- POST /_control/auto                — simple auto-response (text only)
+- POST /_control/error               — inject an HTTP error response
+- GET  /_control/history             — (request, response, usage, cost, cache) history
+- GET  /_control/stats               — cumulative summary of estimated cost, tokens, and cache
+- GET  /_control/cache               — pseudo prompt-cache index
+- POST /_control/clear               — empty pending/history/cache
+- GET  /_control/health              — health check
 
-Control 系は localhost のみ (デバッグ用)、認可なし。
+The control endpoints are localhost only (for debugging), with no authorization.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -47,12 +51,25 @@ from . import pricing
 from .cache_sim import CacheSimulator, analyze_request
 
 
-# ── 設定 (環境変数) ───────────────────────────────────────────────────
+# ── Configuration (environment variables) ─────────────────────────────
 
-# 擬似プロンプトキャッシュの TTL (秒) と TTL を honor するか。
-_CACHE_TTL = float(os.environ.get("PUPPETLLM_CACHE_TTL", "300"))
+# Pseudo prompt-cache TTL (seconds) and whether to honor the TTL.
+def _parse_cache_ttl(v: str | None) -> float:
+    # A non-numeric / non-finite / non-positive value must not crash startup or produce a
+    # degenerate cache (inf → never pruned = unbounded growth; nan/negative → always-cold +
+    # never pruned). Fall back to the 300s default. Mirrors _parse_cache_min's strictness.
+    if v is None:
+        return 300.0
+    try:
+        n = float(v)
+    except ValueError:
+        return 300.0
+    return n if math.isfinite(n) and n > 0 else 300.0
+
+
+_CACHE_TTL = _parse_cache_ttl(os.environ.get("PUPPETLLM_CACHE_TTL"))
 _CACHE_HONOR_TTL = os.environ.get("PUPPETLLM_CACHE_HONOR_TTL", "1") != "0"
-# 最小キャッシュ閾値。未設定/不正/負値 = モデル別 (Opus 4096/Sonnet 1024 等)。`0` で無効 (全 prefix キャッシュ)。
+# Minimum cacheable threshold. Unset/invalid/negative = per-model (Opus 4096/Sonnet 1024 etc.). `0` disables it (cache all prefixes).
 def _parse_cache_min(v: str | None) -> int | None:
     if v is None:
         return None
@@ -60,71 +77,95 @@ def _parse_cache_min(v: str | None) -> int | None:
         n = int(v)
     except ValueError:
         return None
-    return n if n >= 0 else None  # 負値は無意味 (実質全キャッシュ) なのでモデル別に戻す
+    return n if n >= 0 else None  # negative values are meaningless (effectively cache-all), so fall back to per-model
 
 
 _CACHE_MIN_TOKENS = _parse_cache_min(os.environ.get("PUPPETLLM_CACHE_MIN_TOKENS"))
 
 
-# ── サーバ状態 ────────────────────────────────────────────────────────
+# ── Server state ──────────────────────────────────────────────────────
 
 
 class _ServerState:
     def __init__(self) -> None:
-        # multi-pending (README §並列リクエスト対応): pending_id → {request, future, started_at}。
-        # 複数の同時 in-flight リクエストを保持できる (Phase 2 の並列 specialist 起動を
-        # proxy 経由で検証可能にするため)。単一 pending しか無い場合も dict に 1 件入るだけ。
+        # multi-pending (README §parallel-request support): pending_id → {request, future, started_at}.
+        # Can hold multiple concurrent in-flight requests (for testing cases where the
+        # caller hits the API in parallel via asyncio.gather etc.). With only a single
+        # pending, the dict just holds one entry.
         self.pending: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
         self.turn_count: int = 0
         self.lock = asyncio.Lock()
-        # /_control/wait_for_pending で待機中の future 群。
+        # The futures currently waiting in /_control/wait_for_pending.
         self.pending_arrival_waiters: list[asyncio.Future[dict[str, Any]]] = []
-        # 擬似プロンプトキャッシュ (prefix hash → hit/miss)。
+        # Pseudo prompt cache (prefix hash → hit/miss).
         self.cache = CacheSimulator(ttl_seconds=_CACHE_TTL, honor_ttl=_CACHE_HONOR_TTL,
                                     min_cacheable_tokens=_CACHE_MIN_TOKENS)
 
     def _oldest_pending(self) -> dict[str, Any] | None:
-        """received_at が最古の pending entry を返す (なければ None)。lock 内で呼ぶこと。"""
-        if not self.pending:
+        """Return the **unresolved** pending entry with the oldest received_at (or None). Call within the lock.
+
+        Skip done futures (resolved / cancelled) — this keeps entries that linger for
+        the brief instant between resolution and record completion, or that are left
+        behind by an unexpected error path, from being shown to the responder (prevents
+        ghost pendings).
+        """
+        live = [e for e in self.pending.values() if not e["future"].done()]
+        if not live:
             return None
-        return min(self.pending.values(), key=lambda e: e["request"].get("received_at", 0))
+        return min(live, key=lambda e: e["request"].get("received_at", 0))
 
 
 state = _ServerState()
-app = FastAPI(title="puppetllm fake-anthropic")
+app = FastAPI(title="puppetllm fake-llm-api")
 
 
-async def _parse_json_body(request: Request) -> tuple[dict[str, Any] | None, JSONResponse | None]:
-    """request body を JSON parse。失敗時は 500 でなく明確な 400 を返す。
+async def _parse_json_body(request: Request) -> tuple[dict[str, Any] | None, str | None]:
+    """JSON-parse the request body. → (body, None) or (None, error message).
 
-    responder が curl で複雑ネスト (render_chart の input 等) を送る際の
-    shell エスケープ崩れで malformed JSON になりがち。その場合に opaque な 500 では
-    なく `{"error": "invalid JSON body", ...}` の 400 を返し原因を分かりやすくする。
+    When a responder sends deeply nested payloads via curl (e.g. render_chart's input),
+    broken shell escaping tends to produce malformed JSON. Pass the error message back to
+    the caller so it can return a clear 400 instead of an opaque 500 — the control
+    endpoints use `_plain_400`, while provider paths format it with their own error
+    envelope (Anthropic/Bedrock/OpenAI shape).
     """
     try:
         body = await request.json()
     except Exception as e:
-        return None, JSONResponse(
-            {"error": "invalid JSON body", "detail": str(e)[:200]}, status_code=400
-        )
+        return None, f"invalid JSON body: {str(e)[:200]}"
     if not isinstance(body, dict):
-        return None, JSONResponse(
-            {"error": "JSON body must be an object"}, status_code=400
-        )
+        return None, "invalid JSON body: must be a JSON object"
     return body, None
 
 
-# ── canonical: コスト/キャッシュ計算 ─────────────────────────────────
+def _plain_400(message: str) -> JSONResponse:
+    """The legacy-format 400 for the control endpoints (/_control/*)."""
+    return JSONResponse({"error": message}, status_code=400)
+
+
+def _anthropic_error(status: int, etype: str, message: str,
+                     headers: dict[str, str] | None = None) -> JSONResponse:
+    """Anthropic's official error envelope (`{"type":"error","error":{...}}`)."""
+    return JSONResponse(
+        {"type": "error", "error": {"type": etype, "message": message}},
+        status_code=status, headers=headers,
+    )
+
+
+def _new_request_id() -> str:
+    return f"req_{uuid.uuid4().hex[:24]}"
+
+
+# ── canonical: cost/cache computation ────────────────────────────────
 
 
 def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]]) -> tuple[dict, dict]:
-    """snapshot (入力) と応答 content_blocks から usage と概算 cost を作る。
+    """Build usage and an estimated cost from the snapshot (input) and the response content_blocks.
 
-    Anthropic usage 意味論に合わせる:
-      input_tokens               = cache に乗らなかった入力 (= 総入力 - read - creation)
-      cache_creation_input_tokens = 今回 cache に書いた分 (miss 時の prefix)
-      cache_read_input_tokens     = cache から読んだ分 (hit 時の prefix)
+    Follows Anthropic usage semantics:
+      input_tokens               = input not served from cache (= total input - read - creation)
+      cache_creation_input_tokens = amount written to cache this time (the prefix on a miss)
+      cache_read_input_tokens     = amount read from cache (the prefix on a hit)
     """
     model = snapshot.get("model")
     total_in = int(snapshot.get("input_tokens_total", 0))
@@ -156,11 +197,12 @@ async def _record_and_reset(
     usage: dict[str, Any] | None = None,
     cost: dict[str, Any] | None = None,
 ) -> None:
-    """history に 1 件追記して当該 pending を registry から除去。
+    """Append one entry to history and remove that pending from the registry.
 
-    主処理から呼ばれる。`request_snapshot` は handler 側で確保した copy で、
-    その `pending_id` をキーに自分の entry だけを除去する (他の in-flight に影響しない)。
-    usage / cost / cache を併記して /_control/stats が集計できるようにする。
+    Called from the main flow. `request_snapshot` is a copy captured by the handler;
+    its `pending_id` is used as the key to remove only its own entry (without affecting
+    other in-flight requests). usage / cost / cache are recorded alongside so that
+    /_control/stats can aggregate them.
     """
     entry: dict[str, Any] = {
         "turn": request_snapshot.get("turn"),
@@ -177,13 +219,25 @@ async def _record_and_reset(
         entry["injected_error"] = injected_error
     pid = request_snapshot.get("pending_id")
     async with state.lock:
-        state.history.append(entry)
-        # 自分の pending_id の entry だけ除去。clear が先に走って消えていれば no-op。
+        # If clear ran first and the entry is already gone, don't append to history
+        # (prevents a "pre-clear request" from resurrecting and mixing in after a clear).
+        if pid is None or pid in state.pending:
+            state.history.append(entry)
         if pid is not None:
             state.pending.pop(pid, None)
 
 
-# ── canonical: リクエスト登録 / 応答待ち (provider 共通) ──────────────
+# ── canonical: request registration / awaiting response (provider-common) ──
+
+# Whitelist of auxiliary parameters carried along in the snapshot. Lets the responder
+# see the "constraints a real API would honor" (forcing tool_choice / response_format /
+# stop_sequences etc.). Unlike the main body (system/messages/tools/max_tokens), the
+# core does not interpret these — it just passes them through.
+_EXTRA_PARAM_KEYS: tuple[str, ...] = (
+    "tool_choice", "response_format", "temperature", "top_p", "top_k",
+    "stop_sequences", "stop", "thinking", "parallel_tool_calls", "n",
+    "metadata", "reasoning_effort", "service_tier",
+)
 
 
 async def register_request(
@@ -191,16 +245,23 @@ async def register_request(
     model: str | None,
     body: dict[str, Any],
     is_stream: bool,
+    *,
+    simulate_cache: bool = True,
 ) -> tuple[dict[str, Any], asyncio.Future]:
-    """正規化 snapshot を作り pending に登録、応答待ち future を返す。
+    """Build a normalized snapshot, register it as pending, and return a future to await the response.
 
-    入力トークン概算と擬似キャッシュ判定 (hit/miss) はここで turn 採番と同じ lock 内で行い、
-    並列リクエストでも順序が決まるようにする。provider に依らず共通。
+    Input-token estimation and pseudo-cache judgment (hit/miss) are done here inside the
+    same lock as turn numbering, so that ordering is deterministic even for parallel
+    requests. Provider-independent.
+
+    With simulate_cache=False, pseudo-cache observation is skipped and cache is always
+    "none" (for the OpenAI path: its caching is an automatic scheme rather than
+    cache_control based, so it is not simulated).
     """
     system = body.get("system")
     messages = body.get("messages", [])
     tools = body.get("tools", [])
-    # multi-breakpoint + 前方一致対応の解析 (segments/breakpoints/total を一括算出)。
+    # Analysis with multi-breakpoint + prefix-match support (computes segments/breakpoints/total at once).
     request_cache = analyze_request(system, tools, messages)
     input_tokens_total = request_cache.total_tokens
     now = time.time()
@@ -209,7 +270,13 @@ async def register_request(
         state.turn_count += 1
         turn = state.turn_count
         pending_id = uuid.uuid4().hex[:16]
-        cache = state.cache.observe(request_cache, model, now)
+        if simulate_cache:
+            cache = state.cache.observe(request_cache, model, now)
+        else:
+            # Same shape as observe()'s "none" (stats counts only hit/miss, so none is not aggregated)
+            cache = {"status": "none", "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                     "prefix_hash": None, "read_seg_count": 0,
+                     "breakpoints": len(request_cache.breakpoints)}
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         request_snapshot = {
             "pending_id": pending_id,
@@ -220,6 +287,9 @@ async def register_request(
             "messages": messages,
             "tools": tools,
             "max_tokens": body.get("max_tokens"),
+            # Retain auxiliary parameters (tool_choice / response_format / temperature etc.) as pass-through.
+            # The responder can look at these and inject a response consistent with "constraints a real API would honor".
+            "params": {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body},
             "stream": is_stream,
             "received_at": now,
             "input_tokens_total": input_tokens_total,
@@ -230,7 +300,7 @@ async def register_request(
             "future": fut,
             "started_at": now,
         }
-        # /_control/wait_for_pending で待機中の watcher を起こす。
+        # Wake watchers waiting in /_control/wait_for_pending.
         for w in state.pending_arrival_waiters:
             if not w.done():
                 w.set_result(request_snapshot)
@@ -239,49 +309,90 @@ async def register_request(
     return request_snapshot, fut
 
 
-async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dict[str, Any]:
-    """control 経由の応答を待ち、history に記録して結果を tagged dict で返す。
+def _discard_pending(snapshot: dict[str, Any]) -> None:
+    """Reliably remove a pending entry (for the error/cancel paths).
 
-    返り値の "kind":
-      "cleared" → /_control/clear された (caller は 503)
-      "error"   → エラー注入 ({"status", "type", "message"})
-      "ok"      → 正常 ({"content_blocks", "usage", "cost", "model", "message_id"})
-    provider 非依存。encode は各 provider 側で行う。
+    A single dict.pop within the event loop is atomic, so no lock is needed — cleanup can
+    happen without awaiting even while a CancelledError is propagating (the key to
+    preventing ghost pendings).
+    """
+    pid = snapshot.get("pending_id")
+    if pid is not None:
+        state.pending.pop(pid, None)
+
+
+async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dict[str, Any]:
+    """Await the control-injected response, record it in history, and return the result as a tagged dict.
+
+    The returned "kind":
+      "cleared" → was /_control/clear'd (caller returns 503)
+      "error"   → injected error ({"status", "type", "message", "code", "param"})
+      "ok"      → success ({"content_blocks", "usage", "cost", "model", "message_id", "stop_reason"})
+    Provider-independent. Encoding is done by each provider.
+
+    No path (cancel / unexpected exception) leaves a pending entry behind — if it did, a
+    responder in a long-poll would forever keep seeing an unresolvable pending and spin.
     """
     try:
         response_payload = await fut
     except RuntimeError as e:
-        # clear 経由のキャンセル。状態は clear がリセット済。
+        # Cancellation via clear. State has already been reset by clear.
         return {"kind": "cleared", "detail": str(e)}
+    except BaseException:
+        # Task cancellation from client disconnect etc.: clean up the entry, then propagate.
+        _discard_pending(snapshot)
+        raise
 
-    model = snapshot.get("model")
-    if isinstance(response_payload, dict) and response_payload.get("_inject_error"):
-        status = int(response_payload.get("status", 500))
-        etype = str(response_payload.get("type", "api_error"))
-        emsg = str(response_payload.get("message", "fake_server injected error"))
-        await _record_and_reset(
-            snapshot, response_blocks=None,
-            injected_error={"status": status, "type": etype, "message": emsg},
-        )
-        return {"kind": "error", "status": status, "type": etype, "message": emsg}
+    try:
+        model = snapshot.get("model")
+        if isinstance(response_payload, dict) and response_payload.get("_inject_error"):
+            status = int(response_payload.get("status", 500))
+            etype = str(response_payload.get("type", "api_error"))
+            emsg = str(response_payload.get("message", "fake_server injected error"))
+            await _record_and_reset(
+                snapshot, response_blocks=None,
+                injected_error={"status": status, "type": etype, "message": emsg},
+            )
+            return {"kind": "error", "status": status, "type": etype, "message": emsg,
+                    "code": response_payload.get("code"),
+                    "param": response_payload.get("param")}
 
-    content_blocks = response_payload.get("content") or []
-    if not isinstance(content_blocks, list):
-        content_blocks = []
-    usage, cost = _compute_usage(snapshot, content_blocks)
-    message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage, cost=cost)
-    return {
-        "kind": "ok",
-        "content_blocks": content_blocks,
-        "usage": usage,
-        "cost": cost,
-        "model": model,
-        "message_id": message_id,
-    }
+        content_blocks = response_payload.get("content") or []
+        if not isinstance(content_blocks, list):
+            content_blocks = []
+        # Keep only the block types puppetllm models (text / tool_use), dropping unknown
+        # ones (thinking, etc.) ONCE here — this is the single source of truth, so history,
+        # usage, and the encoded response (stream & non-stream, all providers) all agree.
+        # (The encoders also skip unknown blocks defensively, but this is what makes usage
+        # and /_control/history reflect exactly what the caller receives.)
+        content_blocks = [b for b in content_blocks
+                          if isinstance(b, dict) and b.get("type") in ("text", "tool_use")]
+        # Assign ids for any tool_use missing one, all in one place (so stream / non-stream /
+        # all providers use the same id. Previously only stream generated one and non-stream passed through).
+        for b in content_blocks:
+            if b.get("type") == "tool_use" and not b.get("id"):
+                b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
+        usage, cost = _compute_usage(snapshot, content_blocks)
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage, cost=cost)
+        return {
+            "kind": "ok",
+            "content_blocks": content_blocks,
+            "usage": usage,
+            "cost": cost,
+            "model": model,
+            "message_id": message_id,
+            # stop_reason override specified by the responder via /_control/respond (None if absent
+            # = each encoder auto-determines it from whether tool_use is present).
+            "stop_reason": response_payload.get("stop_reason"),
+        }
+    except BaseException:
+        # Unexpected error such as in usage computation: a 500 is returned, but the pending is always cleaned up.
+        _discard_pending(snapshot)
+        raise
 
 
-# ── SSE / stream イベント構築 helpers ────────────────────────────────
+# ── SSE / stream event construction helpers ──────────────────────────
 
 
 def _sse_event(event_name: str, data: dict[str, Any]) -> bytes:
@@ -293,19 +404,22 @@ def stream_event_dicts(
     model: str,
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
+    stop_reason: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Anthropic streaming protocol の (event_name, data) 列を構築する。
+    """Build the (event_name, data) sequence for the Anthropic streaming protocol.
 
-    SSE (Anthropic) でも eventstream (Bedrock) でも同じイベント列を使えるよう、
-    ワイヤ形式に依存しない dict 列で返す。usage 未指定なら fake 値。
+    Returns a wire-format-independent dict sequence so the same event stream can be used
+    for both SSE (Anthropic) and eventstream (Bedrock). If usage is unspecified, fake
+    values are used. Specifying stop_reason overrides the auto-determination (based on
+    whether tool_use is present), useful for testing branches like max_tokens.
     """
-    # usage が来ていれば実 (概算) 値、無ければ従来の fake 値。
+    # If usage was provided, use the real (estimated) values; otherwise the legacy fake values.
     if usage is not None:
         start_usage = {
             "input_tokens": usage.get("input_tokens", 1),
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-            # message_start 時点では出力は未生成。累計 output は message_delta 側で返す。
+            # At message_start no output has been generated yet. The cumulative output is returned on the message_delta side.
             "output_tokens": 0,
         }
         delta_usage = {"output_tokens": usage.get("output_tokens", 0)}
@@ -328,10 +442,15 @@ def stream_event_dicts(
         },
     }))
 
-    stop_reason = "end_turn"
-    for idx, block in enumerate(content_blocks):
-        btype = block.get("type")
+    derived_stop = "end_turn"
+    # The stream `index` is **a running count of emitted blocks**. Using enumerate's
+    # original position would create gaps when unknown blocks are skipped, crashing the
+    # real SDK's stream accumulator with an IndexError.
+    idx = -1
+    for block in content_blocks:
+        btype = block.get("type") if isinstance(block, dict) else None
         if btype == "text":
+            idx += 1
             out.append(("content_block_start", {
                 "type": "content_block_start", "index": idx,
                 "content_block": {"type": "text", "text": ""},
@@ -351,7 +470,8 @@ def stream_event_dicts(
                 "type": "content_block_stop", "index": idx,
             }))
         elif btype == "tool_use":
-            stop_reason = "tool_use"
+            derived_stop = "tool_use"
+            idx += 1
             tool_id = str(block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}")
             out.append(("content_block_start", {
                 "type": "content_block_start", "index": idx,
@@ -371,12 +491,12 @@ def stream_event_dicts(
                 "type": "content_block_stop", "index": idx,
             }))
         else:
-            # 未知ブロック (text/tool_use 以外) は skip。
+            # Skip unknown blocks (anything other than text/tool_use) (don't consume an index = don't create a gap).
             continue
 
     out.append(("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason or derived_stop, "stop_sequence": None},
         "usage": delta_usage,
     }))
     out.append(("message_stop", {"type": "message_stop"}))
@@ -388,12 +508,18 @@ def _build_sse_stream(
     model: str,
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
+    stop_reason: str | None = None,
 ) -> list[bytes]:
-    """Anthropic streaming protocol を満たす SSE バイト列を構築。
+    """Build the SSE byte sequence that satisfies the Anthropic streaming protocol.
 
-    note: `usage` を渡すと概算トークン/キャッシュ値が乗る。未指定なら fake 値 (旧挙動)。
+    note: passing `usage` includes estimated token/cache values. If unspecified, fake
+    values (legacy behavior). Like the real API, insert one `ping` right after
+    message_start (SSE path only; the SDK ignores it).
     """
-    return [_sse_event(name, data) for name, data in stream_event_dicts(message_id, model, content_blocks, usage)]
+    events = stream_event_dicts(message_id, model, content_blocks, usage, stop_reason)
+    out = [_sse_event(events[0][0], events[0][1]), _sse_event("ping", {"type": "ping"})]
+    out.extend(_sse_event(name, data) for name, data in events[1:])
+    return out
 
 
 def _build_non_stream_response(
@@ -401,8 +527,18 @@ def _build_non_stream_response(
     model: str,
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
+    stop_reason: str | None = None,
 ) -> dict[str, Any]:
-    stop_reason = "tool_use" if any(b.get("type") == "tool_use" for b in content_blocks) else "end_turn"
+    # Keep parity with the streaming path (stream_event_dicts), which only emits
+    # text/tool_use blocks: filter unknown block types here too so the same injection
+    # yields the same content whether the caller used stream=True or not. puppetllm
+    # only simulates text/tool_use (thinking/redacted_thinking/etc. are not modeled).
+    content_blocks = [b for b in content_blocks
+                      if isinstance(b, dict) and b.get("type") in ("text", "tool_use")]
+    if stop_reason is None:
+        stop_reason = "tool_use" if any(
+            b.get("type") == "tool_use" for b in content_blocks
+        ) else "end_turn"
     if usage is not None:
         usage_out = {
             "input_tokens": usage.get("input_tokens", 1),
@@ -424,14 +560,17 @@ def _build_non_stream_response(
     }
 
 
-# ── Anthropic 互換エンドポイント ─────────────────────────────────────
+# ── Anthropic compatible endpoint ────────────────────────────────────
 
 
 @app.post("/v1/messages")
 async def messages(request: Request) -> Any:
-    body, err = await _parse_json_body(request)
-    if err is not None:
-        return err
+    req_id = _new_request_id()
+    headers = {"request-id": req_id}
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        # Like the real API, errors on the Anthropic path are always returned in the official envelope.
+        return _anthropic_error(400, "invalid_request_error", errmsg, headers=headers)
     is_stream = bool(body.get("stream"))
     model = body.get("model")
 
@@ -439,31 +578,34 @@ async def messages(request: Request) -> Any:
     result = await await_resolution(snapshot, fut)
 
     if result["kind"] == "cleared":
-        return JSONResponse({"error": f"request cleared: {result['detail']}"}, status_code=503)
+        return _anthropic_error(503, "api_error",
+                                f"request cleared: {result['detail']}", headers=headers)
     if result["kind"] == "error":
-        return JSONResponse(
-            {"type": "error", "error": {"type": result["type"], "message": result["message"]}},
-            status_code=result["status"],
-        )
+        return _anthropic_error(result["status"], result["type"], result["message"],
+                                headers=headers)
 
     model_out = model or "claude-sonnet-mock"
     content_blocks = result["content_blocks"]
     usage = result["usage"]
     message_id = result["message_id"]
+    stop_reason = result.get("stop_reason")
 
     if is_stream:
-        events = _build_sse_stream(message_id, model_out, content_blocks, usage)
+        events = _build_sse_stream(message_id, model_out, content_blocks, usage, stop_reason)
 
         async def gen():
             for evt in events:
                 yield evt
                 await asyncio.sleep(0)
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
-    return JSONResponse(_build_non_stream_response(message_id, model_out, content_blocks, usage))
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+    return JSONResponse(
+        _build_non_stream_response(message_id, model_out, content_blocks, usage, stop_reason),
+        headers=headers,
+    )
 
 
-# ── 制御エンドポイント ───────────────────────────────────────────────
+# ── Control endpoints ────────────────────────────────────────────────
 
 
 @app.get("/_control/health")
@@ -473,10 +615,11 @@ async def health() -> dict[str, Any]:
 
 @app.get("/_control/pending")
 async def pending() -> dict[str, Any]:
-    """現在の全 pending を返す (multi-pending)。
+    """Return all current pendings (multi-pending).
 
-    後方互換: `has_pending` (bool) と、pending が 1 件以上なら最古を `request` /
-    `waiting_for_seconds` にも入れる。並列対応 caller は `pending` 配列を使う。
+    Backward compatible: `has_pending` (bool), and if there is at least one pending, the
+    oldest is also placed in `request` / `waiting_for_seconds`. Parallel-aware callers use
+    the `pending` array.
     """
     now = time.time()
     async with state.lock:
@@ -487,6 +630,7 @@ async def pending() -> dict[str, Any]:
                 "waiting_for_seconds": round(now - e["started_at"], 2),
             }
             for pid, e in state.pending.items()
+            if not e["future"].done()  # don't show resolved/awaiting-cleanup entries (ghost prevention)
         ]
         oldest = state._oldest_pending()
     items.sort(key=lambda x: x["request"].get("received_at", 0))
@@ -496,22 +640,23 @@ async def pending() -> dict[str, Any]:
         "has_pending": True,
         "count": len(items),
         "pending": items,
-        # 後方互換 (最古 pending)
+        # backward compatible (oldest pending)
         "request": oldest["request"] if oldest else None,
         "waiting_for_seconds": round(now - oldest["started_at"], 2) if oldest else None,
     }
 
 
-# Long-poll の安全上限 (Bash tool の 10 分タイムアウトを跨がない範囲で多少余裕)
+# Long-poll safety cap (with some margin, staying within the Bash tool's 10-minute timeout)
 _WAIT_TIMEOUT_MAX = 600.0
-_WAIT_TIMEOUT_DEFAULT = 270.0  # < 5 分 (Anthropic prompt cache TTL 内に収まるよう)
+_WAIT_TIMEOUT_DEFAULT = 270.0  # < 5 minutes (to stay within the Anthropic prompt cache TTL)
 
 
 @app.get("/_control/wait_for_pending")
 async def wait_for_pending(timeout: float = _WAIT_TIMEOUT_DEFAULT) -> dict[str, Any]:
-    """Long-polling: pending が出るまで block (最大 timeout 秒)。
+    """Long-polling: block until a pending appears (up to timeout seconds).
 
-    既に pending が存在すれば即返却。なければ次の /v1/messages 到着を待つ。
+    If a pending already exists, return immediately. Otherwise, wait for the next
+    /v1/messages to arrive.
     """
     timeout = max(0.5, min(float(timeout), _WAIT_TIMEOUT_MAX))
 
@@ -553,10 +698,10 @@ async def wait_for_pending(timeout: float = _WAIT_TIMEOUT_DEFAULT) -> dict[str, 
 async def _resolve_target_future(
     pending_id: str | None,
 ) -> tuple[asyncio.Future[dict[str, Any]] | None, JSONResponse | None]:
-    """注入先の pending future を解決する (multi-pending)。
+    """Resolve the target pending future for injection (multi-pending).
 
-    - `pending_id` 指定: その entry を使う (無ければ 400)
-    - 未指定: pending がちょうど 1 件ならそれを使う (後方互換)。0 件→400、複数→400
+    - `pending_id` given: use that entry (400 if it doesn't exist)
+    - unspecified: if there is exactly 1 pending, use it (backward compatible). 0 → 400, multiple → 400
     """
     async with state.lock:
         if pending_id is not None:
@@ -580,7 +725,7 @@ async def _resolve_target_future(
 def _safe_set_result(
     fut: asyncio.Future[dict[str, Any]], value: dict[str, Any]
 ) -> JSONResponse | None:
-    """future に結果を注入。done なら 409 (clear と競合等)。"""
+    """Inject a result into the future. Returns 409 if it's done (e.g. race with clear)."""
     try:
         fut.set_result(value)
     except asyncio.InvalidStateError:
@@ -592,18 +737,31 @@ def _safe_set_result(
 
 @app.post("/_control/respond")
 async def respond(request: Request) -> Any:
-    """Body: `{"content": [<content_block>, ...], "pending_id"?: "..."}` を注入。
+    """Inject Body: `{"content": [<content_block>, ...], "pending_id"?, "stop_reason"?}`.
 
-    content_block の type は "text" | "tool_use"。`pending_id` 省略時は pending が
-    1 件ならそれに注入 (後方互換)。複数 in-flight なら `pending_id` 必須。
+    The content_block type is "text" | "tool_use". When `pending_id` is omitted, inject
+    into the single pending if there is one (backward compatible). With multiple in-flight,
+    `pending_id` is required. `stop_reason` (optional) overrides the auto-determination
+    (e.g. "max_tokens" — for testing truncation branches; converted to finish_reason on
+    the OpenAI path).
     """
-    body, err = await _parse_json_body(request)
-    if err is not None:
-        return err
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    content = body.get("content", [])
+    # Validate the shape here and return 400 (if the encoder crashes after the future is
+    # resolved, history records a success while the calling SDK gets a 500 — an inconsistency).
+    if not isinstance(content, list) or not all(
+        isinstance(b, dict) and isinstance(b.get("type"), str) for b in content
+    ):
+        return _plain_400("content must be a list of content-block objects with a string 'type'")
+    stop_reason = body.get("stop_reason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        return _plain_400("stop_reason must be a string")
     fut, err = await _resolve_target_future(body.get("pending_id"))
     if err is not None:
         return err
-    err = _safe_set_result(fut, {"content": body.get("content", [])})
+    err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason})
     if err is not None:
         return err
     return {"ok": True}
@@ -611,10 +769,10 @@ async def respond(request: Request) -> Any:
 
 @app.post("/_control/auto")
 async def auto(request: Request) -> Any:
-    """簡易: `{"text": "...", "pending_id"?: "..."}` を text-only 応答として注入。"""
-    body, err = await _parse_json_body(request)
-    if err is not None:
-        return err
+    """Simple: inject `{"text": "...", "pending_id"?: "..."}` as a text-only response."""
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
     fut, err = await _resolve_target_future(body.get("pending_id"))
     if err is not None:
         return err
@@ -628,21 +786,23 @@ async def auto(request: Request) -> Any:
 
 @app.post("/_control/error")
 async def inject_error(request: Request) -> Any:
-    """エラー注入: pending リクエストに HTTP エラーを返させる。
+    """Error injection: make a pending request return an HTTP error.
 
-    Body: {"status": 429, "type": "rate_limit_error", "message": "..."}
-    Anthropic / Bedrock どちらの経路でも、各 provider が status/type を自経路の
-    エラー形式に直して返す。SDK は 5xx/429/408 を自動 retry する。
+    Body: {"status": 429, "type": "rate_limit_error", "message": "...",
+           "code"?: "...", "param"?: "..."}
+    On any of the Anthropic / Bedrock / OpenAI paths, each provider converts status/type
+    into its own path's error format (code/param are used only in the OpenAI format).
+    The SDK auto-retries 5xx/429/408.
     """
-    body, err = await _parse_json_body(request)
-    if err is not None:
-        return err
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
     try:
         status = int(body.get("status", 500))
     except (TypeError, ValueError):
-        return JSONResponse({"error": "status must be an integer"}, status_code=400)
+        return _plain_400("status must be an integer")
     if not (100 <= status <= 599):
-        return JSONResponse({"error": "status must be in [100, 599]"}, status_code=400)
+        return _plain_400("status must be in [100, 599]")
     fut, err = await _resolve_target_future(body.get("pending_id"))
     if err is not None:
         return err
@@ -651,6 +811,8 @@ async def inject_error(request: Request) -> Any:
         "status": status,
         "type": str(body.get("type", "api_error")),
         "message": str(body.get("message", "fake_server injected error")),
+        "code": body.get("code"),
+        "param": body.get("param"),
     })
     if err is not None:
         return err
@@ -659,14 +821,17 @@ async def inject_error(request: Request) -> Any:
 
 @app.get("/_control/history")
 async def history() -> dict[str, Any]:
-    return {"turn_count": state.turn_count, "history": state.history}
+    # Snapshot under the lock (a copy) for consistency with stats(); avoids handing out
+    # the live list while a concurrent request appends to it.
+    async with state.lock:
+        return {"turn_count": state.turn_count, "history": list(state.history)}
 
 
 @app.get("/_control/stats")
 async def stats() -> dict[str, Any]:
-    """history から累計のコスト目安・トークン・キャッシュサマリを集計する。
+    """Aggregate cumulative estimated-cost, token, and cache summaries from history.
 
-    note: 全て概算 (approx tokenizer)。実課金とは一致しない (README 参照)。
+    note: everything is an estimate (approx tokenizer). It does not match real billing (see README).
     """
     totals = {
         "input_tokens": 0,
@@ -737,11 +902,11 @@ async def stats() -> dict[str, Any]:
 
 @app.get("/_control/cache")
 async def cache_index() -> dict[str, Any]:
-    """擬似プロンプトキャッシュの現在の index (prefix hash 別)。"""
+    """The pseudo prompt-cache's current index (by prefix hash)."""
     now = time.time()
-    # entries() は state.cache.index を反復する。register_request は lock 内で
-    # cache.observe → index を mutate するため、ここも lock 内で snapshot を取らないと
-    # 並行スキャン中に "dictionary changed size during iteration" になる。
+    # entries() iterates state.cache.index. Since register_request does cache.observe →
+    # index mutation within the lock, this must also take a snapshot within the lock, or
+    # a concurrent scan hits "dictionary changed size during iteration".
     async with state.lock:
         entries = state.cache.entries(now)
     return {
@@ -754,7 +919,7 @@ async def cache_index() -> dict[str, Any]:
 @app.post("/_control/clear")
 async def clear() -> dict[str, Any]:
     async with state.lock:
-        # 全 in-flight pending を 503 でキャンセル (main handler は graceful に 503 を返す)
+        # Cancel all in-flight pendings with 503 (the main handler gracefully returns 503)
         for entry in state.pending.values():
             fut = entry["future"]
             if not fut.done():
@@ -766,24 +931,26 @@ async def clear() -> dict[str, Any]:
     return {"ok": True}
 
 
-# ── provider アダプタの登録 ──────────────────────────────────────────
-# bedrock router は canonical helper (register_request / await_resolution /
-# stream_event_dicts / _build_non_stream_response) を call-time 参照するため、
-# 全 helper 定義後の末尾で import & include する (循環 import 回避)。
+# ── Registering the provider adapters ────────────────────────────────
+# Each provider router references the canonical helpers (register_request /
+# await_resolution / stream_event_dicts / _build_non_stream_response) at call time, so
+# import & include them at the very end after all helpers are defined (avoids circular imports).
 
 from .providers import bedrock as _bedrock  # noqa: E402
+from .providers import openai as _openai  # noqa: E402
 
 app.include_router(_bedrock.build_router())
+app.include_router(_openai.build_router())
 
 
-# ── stand-alone 起動 ─────────────────────────────────────────────────
+# ── Stand-alone startup ──────────────────────────────────────────────
 
 
 def main() -> int:
     import argparse
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Fake Anthropic/Bedrock API server for debugging")
+    parser = argparse.ArgumentParser(description="Fake Anthropic/Bedrock/OpenAI API server for debugging")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -791,6 +958,7 @@ def main() -> int:
     print(f"[puppetllm] starting on http://{args.host}:{args.port}", file=sys.stderr)
     print(f"[puppetllm] Anthropic: set ANTHROPIC_BASE_URL=http://{args.host}:{args.port}", file=sys.stderr)
     print(f"[puppetllm] Bedrock:   point AnthropicBedrock base_url to http://{args.host}:{args.port}", file=sys.stderr)
+    print(f"[puppetllm] OpenAI:    set OPENAI_BASE_URL=http://{args.host}:{args.port}/v1  (note the /v1)", file=sys.stderr)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

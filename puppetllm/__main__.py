@@ -1,9 +1,10 @@
-"""`python -m puppetllm` のエントリポイント。
+"""Entry point for `python -m puppetllm`.
 
-fake_server.py を直接 `python -m puppetllm.fake_server` で起動すると、fake_server が
-`__main__` として読み込まれた上で providers.bedrock 経由で `puppetllm.fake_server` として
-再 import され、循環 import (build_router 未定義) になる。ここを薄い __main__ にして
-fake_server を **常に `puppetllm.fake_server` としてのみ** import させることで回避する。
+If fake_server.py is launched directly via `python -m puppetllm.fake_server`, it is
+loaded as `__main__` and then re-imported as `puppetllm.fake_server` through
+providers.bedrock, causing a circular import (build_router undefined). This thin
+__main__ avoids that by ensuring fake_server is **always imported only as
+`puppetllm.fake_server`**.
 """
 
 import sys

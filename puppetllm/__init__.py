@@ -1,4 +1,4 @@
-"""Claude API debug proxy (fake Anthropic-compatible server).
+"""LLM API debug proxy (fake Anthropic / Bedrock / OpenAI compatible server).
 
-詳細は README.md 参照。
+See README.md for details.
 """

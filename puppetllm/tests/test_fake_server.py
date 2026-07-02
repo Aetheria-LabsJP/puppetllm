@@ -1,13 +1,13 @@
 """Unit tests for puppetllm.fake_server.
 
-純粋ロジック (SSE 構築 / レスポンス shape) は同期的に検証。
-HTTP レイヤは httpx.AsyncClient + ASGITransport で async 制御し、
-最後に anthropic SDK との往復で SDK 互換性を確認する。
+Pure logic (SSE construction / response shape) is verified synchronously.
+The HTTP layer is driven asynchronously with httpx.AsyncClient + ASGITransport,
+and finally a round-trip through the anthropic SDK confirms SDK compatibility.
 
-実行 (repo root から、または tools/ 配下から):
+Run (from the repo root, or from under tools/):
   python3 -m unittest puppetllm.tests.test_fake_server -v
 
-Docker 経由:
+Via Docker:
   docker compose -f puppetllm/docker-compose.yml --profile test run --rm proxy-test
 """
 
@@ -15,21 +15,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 import unittest
 from typing import Any
 
+# HTTP tests use small prefixes, so disable the minimum cache threshold.
+# (The floor behavior itself is verified by the CacheSimulator unit tests. Setting this
+# here lets the plain `python3 -m unittest ...` from the docstring run as-is.)
+os.environ["PUPPETLLM_CACHE_MIN_TOKENS"] = "0"
+
 
 def _import_fresh():
-    """fake_server module をリロードしてサーバ状態をクリーンに保つ。"""
+    """Reload the fake_server module to keep server state clean."""
     import importlib
     from puppetllm import fake_server as fs
     importlib.reload(fs)
     return fs
 
 
-# ── 純粋ロジック (HTTP 不要) ────────────────────────────────────────
+# ── Pure logic (no HTTP required) ────────────────────────────────────────
 
 
 class TestSSEBuilder(unittest.TestCase):
@@ -49,7 +55,7 @@ class TestSSEBuilder(unittest.TestCase):
         self.assertIn("event: content_block_stop", joined)
         self.assertIn("event: message_delta", joined)
         self.assertIn("event: message_stop", joined)
-        # text-only の stop_reason は end_turn
+        # for text-only, stop_reason is end_turn
         self.assertIn('"end_turn"', joined)
 
     def test_tool_use_block(self) -> None:
@@ -61,7 +67,7 @@ class TestSSEBuilder(unittest.TestCase):
         joined = b"".join(events).decode("utf-8")
         self.assertIn('"tool_use"', joined)
         self.assertIn("input_json_delta", joined)
-        # input は partial_json に JSON 文字列として埋め込まれる (escaped quotes)
+        # input is embedded in partial_json as a JSON string (escaped quotes)
         self.assertIn("command", joined)
         self.assertIn("ls", joined)
 
@@ -74,13 +80,13 @@ class TestSSEBuilder(unittest.TestCase):
             ],
         )
         joined = b"".join(events).decode("utf-8")
-        # `event: content_block_start` ライン (data 内の同名文字列を除外) が 2 回
+        # the `event: content_block_start` line (excluding the same string inside data) appears twice
         self.assertEqual(joined.count("event: content_block_start"), 2)
-        # 混在時の stop_reason は tool_use 優先
+        # when mixed, stop_reason prefers tool_use
         self.assertIn('"tool_use"', joined.split("message_delta")[-1])
 
     def test_empty_text(self) -> None:
-        """空 text でもイベントは出る (start/delta/stop の構造)。"""
+        """Even empty text still emits events (start/delta/stop structure)."""
         events = self.mod._build_sse_stream("m", "c", [{"type": "text", "text": ""}])
         joined = b"".join(events).decode("utf-8")
         self.assertIn("content_block_start", joined)
@@ -110,7 +116,7 @@ class TestNonStreamResponse(unittest.TestCase):
         self.assertEqual(msg["stop_reason"], "tool_use")
 
 
-# ── HTTP レイヤ (httpx ASGITransport で async 制御) ────────────────
+# ── HTTP layer (driven async via httpx ASGITransport) ────────────────
 
 
 def _run(coro: Any) -> Any:
@@ -118,10 +124,10 @@ def _run(coro: Any) -> Any:
 
 
 class TestAsyncHttpx(unittest.TestCase):
-    """httpx + ASGITransport で fake_server の HTTP 経路を非同期検証。
+    """Asynchronously verify fake_server's HTTP paths with httpx + ASGITransport.
 
-    sync TestClient を threading で起動する形は async lock との相性が悪く
-    flaky になるため、純粋 async 経路で書く。
+    Starting a sync TestClient via threading interacts poorly with the async lock
+    and becomes flaky, so this is written as a pure async path.
     """
 
     def setUp(self) -> None:
@@ -153,23 +159,32 @@ class TestAsyncHttpx(unittest.TestCase):
         _run(run())
 
     def test_malformed_json_body_returns_400(self) -> None:
-        """壊れた JSON body は 500 でなく明確な 400 を返す。
+        """A broken JSON body returns a clear 400, not a 500.
 
-        responder が curl で render_chart の複雑ネスト input を送る際の
-        shell エスケープ崩れで malformed JSON になっても、opaque な 500 にせず
-        原因の分かる 400 にする回帰テスト。
+        Regression test ensuring that when a responder sends render_chart's deeply
+        nested input via curl and the shell escaping breaks, producing malformed JSON,
+        we return an intelligible 400 rather than an opaque 500.
         """
         async def run() -> None:
             async with await self._client() as c:
-                for path in ("/_control/respond", "/_control/auto",
-                             "/_control/error", "/v1/messages"):
+                # control endpoints: the traditional plain form {"error": "invalid JSON body: ..."}
+                for path in ("/_control/respond", "/_control/auto", "/_control/error"):
                     r = await c.post(
                         path, content=b"{bad json,,}",
                         headers={"Content-Type": "application/json"},
                     )
                     self.assertEqual(r.status_code, 400, f"{path} should 400 on bad JSON")
                     self.assertIn("invalid JSON body", r.json().get("error", ""))
-                # JSON だが object でない (配列) も 400
+                # Anthropic path: returns the official error envelope {"type":"error","error":{...}}
+                r = await c.post(
+                    "/v1/messages", content=b"{bad json,,}",
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r.status_code, 400)
+                self.assertEqual(r.json()["type"], "error")
+                self.assertEqual(r.json()["error"]["type"], "invalid_request_error")
+                self.assertIn("invalid JSON body", r.json()["error"]["message"])
+                # valid JSON that is not an object (an array) is also 400
                 r = await c.post("/_control/respond", json=[1, 2, 3])
                 self.assertEqual(r.status_code, 400)
         _run(run())
@@ -177,13 +192,13 @@ class TestAsyncHttpx(unittest.TestCase):
     def test_non_stream_round_trip(self) -> None:
         async def run() -> None:
             async with await self._client() as c:
-                # /v1/messages を background task で投入
+                # submit /v1/messages as a background task
                 req_task = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "claude-test", "stream": False,
                     "messages": [{"role": "user", "content": "hi"}],
                 }, timeout=10))
 
-                # pending 出るまで待つ
+                # wait until it becomes pending
                 for _ in range(50):
                     p = await c.get("/_control/pending")
                     if p.json().get("has_pending"):
@@ -196,7 +211,7 @@ class TestAsyncHttpx(unittest.TestCase):
                 ar = await c.post("/_control/auto", json={"text": "auto-reply"})
                 self.assertEqual(ar.status_code, 200)
 
-                # /v1/messages の結果
+                # the result of /v1/messages
                 r = await req_task
                 self.assertEqual(r.status_code, 200)
                 body = r.json()
@@ -204,17 +219,17 @@ class TestAsyncHttpx(unittest.TestCase):
                 self.assertEqual(body["content"], [{"type": "text", "text": "auto-reply"}])
                 self.assertEqual(body["stop_reason"], "end_turn")
 
-                # history 反映
+                # reflected in history
                 h = await c.get("/_control/history")
                 self.assertEqual(h.json()["turn_count"], 1)
                 self.assertEqual(len(h.json()["history"]), 1)
         _run(run())
 
     def test_parallel_requests_multi_pending(self) -> None:
-        """multi-pending: 同時 2 リクエストを両方受け付け、pending_id 指定で個別応答できる。"""
+        """multi-pending: accept two concurrent requests and respond to each individually via pending_id."""
         async def run() -> None:
             async with await self._client() as c:
-                # 2 件を同時 in-flight に
+                # put two requests in-flight simultaneously
                 t1 = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "x", "stream": False,
                     "messages": [{"role": "user", "content": "a"}],
@@ -224,7 +239,7 @@ class TestAsyncHttpx(unittest.TestCase):
                     "messages": [{"role": "user", "content": "b"}],
                 }, timeout=10))
 
-                # 両方 pending になるまで待つ (409 にならない)
+                # wait until both become pending (no 409)
                 ids: list[str] = []
                 for _ in range(50):
                     p = (await c.get("/_control/pending")).json()
@@ -236,13 +251,13 @@ class TestAsyncHttpx(unittest.TestCase):
                     self.fail("two requests never became pending")
                 self.assertEqual(len(set(ids)), 2)
 
-                # pending_id 指定なしで複数 pending → 400 (要 pending_id)
+                # multiple pending without a pending_id → 400 (pending_id required)
                 amb = await c.post("/_control/respond", json={"content": []})
                 self.assertEqual(amb.status_code, 400)
                 self.assertIn("multiple pending", amb.json()["error"])
 
-                # それぞれ pending_id 指定で個別応答
-                # どちらの request がどの id かを content で対応付け
+                # respond to each individually by pending_id
+                # map which request has which id by content
                 msg_by_id = {item["pending_id"]: item["request"]["messages"][0]["content"]
                              for item in p["pending"]}
                 for pid in ids:
@@ -255,7 +270,7 @@ class TestAsyncHttpx(unittest.TestCase):
                 r2 = await t2
                 self.assertEqual(r1.status_code, 200)
                 self.assertEqual(r2.status_code, 200)
-                # 各リクエストが「自分宛て」の応答を受け取った (取り違えなし)
+                # each request received the response addressed to it (no mix-up)
                 self.assertEqual(r1.json()["content"][0]["text"], "reply-a")
                 self.assertEqual(r2.json()["content"][0]["text"], "reply-b")
         _run(run())
@@ -263,7 +278,7 @@ class TestAsyncHttpx(unittest.TestCase):
     def test_clear_resets_state(self) -> None:
         async def run() -> None:
             async with await self._client() as c:
-                # 1 件 round-trip 走らせる
+                # run one round-trip
                 t = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "x", "stream": False,
                     "messages": [{"role": "user", "content": "y"}],
@@ -275,7 +290,7 @@ class TestAsyncHttpx(unittest.TestCase):
                 await c.post("/_control/auto", json={"text": "ok"})
                 r = await t
                 self.assertEqual(r.status_code, 200)
-                # history 1 件
+                # one history entry
                 self.assertEqual((await c.get("/_control/history")).json()["turn_count"], 1)
                 # clear
                 await c.post("/_control/clear")
@@ -285,9 +300,9 @@ class TestAsyncHttpx(unittest.TestCase):
         _run(run())
 
     def test_clear_during_pending_returns_503(self) -> None:
-        """clear が pending リクエスト中に呼ばれた場合、main handler は 503 を返す。
+        """When clear is called during a pending request, the main handler returns 503.
 
-        以前は set_exception の例外がそのまま伝播して 500 になっていた (H2 で修正)。
+        Previously the set_exception exception propagated as-is and became a 500 (fixed in H2).
         """
         async def run() -> None:
             async with await self._client() as c:
@@ -302,15 +317,17 @@ class TestAsyncHttpx(unittest.TestCase):
                 await c.post("/_control/clear")
                 r = await t
                 self.assertEqual(r.status_code, 503)
-                self.assertIn("cleared", r.json()["error"])
-                # state は空に
+                # errors on the Anthropic path return in the official envelope
+                self.assertEqual(r.json()["type"], "error")
+                self.assertIn("cleared", r.json()["error"]["message"])
+                # state is emptied
                 p = await c.get("/_control/pending")
                 self.assertFalse(p.json()["has_pending"])
                 self.assertEqual(p.json()["count"], 0)
         _run(run())
 
     def test_error_injection(self) -> None:
-        """`/_control/error` で HTTP error を pending リクエストに返せる。"""
+        """`/_control/error` can return an HTTP error to a pending request."""
         async def run() -> None:
             async with await self._client() as c:
                 t = asyncio.create_task(c.post("/v1/messages", json={
@@ -331,18 +348,19 @@ class TestAsyncHttpx(unittest.TestCase):
                 self.assertEqual(body["type"], "error")
                 self.assertEqual(body["error"]["type"], "rate_limit_error")
                 self.assertEqual(body["error"]["message"], "throttled")
-                # history にも記録されている
+                # also recorded in history
                 h = (await c.get("/_control/history")).json()
                 self.assertEqual(h["history"][-1]["injected_error"]["status"], 429)
                 self.assertIsNone(h["history"][-1]["response_blocks"])
         _run(run())
 
     def test_error_injection_invalid_status_does_not_hang_pending(self) -> None:
-        """不正な status の error 注入は 400 を返し、pending を壊さない。
+        """Error injection with an invalid status returns 400 and does not break the pending.
 
-        以前は `int("abc")` の未処理 ValueError で 500 + pending 未解決 →
-        /v1/messages がタイムアウトまでハングした。検証を resolve 前に行うことで、
-        不正注入後も pending は生き、正しい注入で正常に解決できることを確認。
+        Previously an unhandled ValueError from `int("abc")` caused a 500 with the pending
+        unresolved → /v1/messages hung until timeout. By validating before resolving, we
+        confirm the pending stays alive after a bad injection and can still be resolved
+        normally with a valid injection.
         """
         async def run() -> None:
             async with await self._client() as c:
@@ -354,13 +372,13 @@ class TestAsyncHttpx(unittest.TestCase):
                     if (await c.get("/_control/pending")).json().get("has_pending"):
                         break
                     await asyncio.sleep(0.05)
-                # 非数値 status → 400 (pending は触られない)
+                # non-numeric status → 400 (the pending is untouched)
                 bad = await c.post("/_control/error", json={"status": "abc", "type": "x"})
                 self.assertEqual(bad.status_code, 400)
-                # 範囲外 status → 400
+                # out-of-range status → 400
                 oor = await c.post("/_control/error", json={"status": 99})
                 self.assertEqual(oor.status_code, 400)
-                # pending はまだ生きている → 正しい注入で解決できる
+                # the pending is still alive → can be resolved with a valid injection
                 self.assertTrue((await c.get("/_control/pending")).json()["has_pending"])
                 ok = await c.post("/_control/error", json={"status": 500, "type": "api_error"})
                 self.assertEqual(ok.status_code, 200)
@@ -369,7 +387,7 @@ class TestAsyncHttpx(unittest.TestCase):
         _run(run())
 
     def test_streaming_round_trip(self) -> None:
-        """SSE streaming を httpx でパース。SDK 経由でなくとも raw SSE が flowing するか。"""
+        """Parse SSE streaming with httpx. Checks that raw SSE flows even without going through the SDK."""
         async def run() -> None:
             async with await self._client() as c:
                 t = asyncio.create_task(c.post("/v1/messages", json={
@@ -387,7 +405,7 @@ class TestAsyncHttpx(unittest.TestCase):
                 r = await t
                 self.assertEqual(r.status_code, 200)
                 body = r.text
-                # 主要 SSE イベントが含まれているか
+                # check that the key SSE events are present
                 self.assertIn("event: message_start", body)
                 self.assertIn("event: content_block_delta", body)
                 self.assertIn('"text_delta"', body)
@@ -397,7 +415,7 @@ class TestAsyncHttpx(unittest.TestCase):
 
 
 class TestWaitForPending(unittest.TestCase):
-    """Long-polling endpoint /_control/wait_for_pending の検証。"""
+    """Verification of the long-polling endpoint /_control/wait_for_pending."""
 
     def setUp(self) -> None:
         self.mod = _import_fresh()
@@ -410,21 +428,21 @@ class TestWaitForPending(unittest.TestCase):
         )
 
     def test_immediate_return_when_pending_exists(self) -> None:
-        """既に pending があれば即返却 (block しない)。"""
+        """If a pending already exists, return immediately (do not block)."""
         async def run() -> None:
             async with await self._client() as c:
-                # request を仕掛けて pending 化
+                # fire a request to make it pending
                 req_task = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "x", "stream": False,
                     "messages": [{"role": "user", "content": "y"}],
                 }, timeout=10))
-                # pending 確定まで待つ
+                # wait until pending is confirmed
                 for _ in range(50):
                     if (await c.get("/_control/pending")).json().get("has_pending"):
                         break
                     await asyncio.sleep(0.05)
 
-                # wait_for_pending: 即返却するはず
+                # wait_for_pending: should return immediately
                 start = time.time()
                 w = await c.get("/_control/wait_for_pending?timeout=10")
                 elapsed = time.time() - start
@@ -437,14 +455,14 @@ class TestWaitForPending(unittest.TestCase):
         _run(run())
 
     def test_blocks_then_wakes_on_new_pending(self) -> None:
-        """pending なし状態で wait → 新 request 到着で即起きる。"""
+        """Wait while no pending exists → wake immediately when a new request arrives."""
         async def run() -> None:
             async with await self._client() as c:
-                # waiter を background で投入
+                # submit a waiter in the background
                 wait_task = asyncio.create_task(
                     c.get("/_control/wait_for_pending?timeout=10")
                 )
-                # 少し待ってから新 pending を投入
+                # wait a bit, then submit a new pending
                 await asyncio.sleep(0.2)
                 req_task = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "x", "stream": False,
@@ -454,7 +472,7 @@ class TestWaitForPending(unittest.TestCase):
                 start = time.time()
                 w = await wait_task
                 elapsed = time.time() - start
-                # 新 pending 来てから 1 秒以内に起きるはず
+                # should wake within 1 second after the new pending arrives
                 self.assertLess(elapsed, 1.5, f"waiter took {elapsed:.2f}s to wake")
                 body = w.json()
                 self.assertTrue(body["has_pending"])
@@ -466,7 +484,7 @@ class TestWaitForPending(unittest.TestCase):
         _run(run())
 
     def test_timeout(self) -> None:
-        """pending が来ないと timeout で `{has_pending: False, timeout: True}` 返却。"""
+        """If no pending arrives, returns `{has_pending: False, timeout: True}` on timeout."""
         async def run() -> None:
             async with await self._client() as c:
                 start = time.time()
@@ -480,7 +498,7 @@ class TestWaitForPending(unittest.TestCase):
         _run(run())
 
     def test_multiple_waiters_all_woken(self) -> None:
-        """複数 waiter が同時待機 → 1 つの新 pending で全員起きる。"""
+        """Multiple waiters wait concurrently → all wake on a single new pending."""
         async def run() -> None:
             async with await self._client() as c:
                 tasks = [
@@ -503,13 +521,13 @@ class TestWaitForPending(unittest.TestCase):
         _run(run())
 
     def test_timeout_cap(self) -> None:
-        """timeout 値が _WAIT_TIMEOUT_MAX を超えても安全に処理される。"""
-        # 明示的に大きな値を渡す。実際 wait はしないので 0.5 に依存する形でテスト。
+        """A timeout value exceeding _WAIT_TIMEOUT_MAX is handled safely."""
+        # Pass an explicitly large value. Since it does not actually wait, the test does not depend on 0.5.
         async def run() -> None:
             async with await self._client() as c:
-                # 既に pending あれば即返却なので、cap が timeout=1 設定で実走しても OK
-                # ここでは「巨大値を渡しても 4xx エラーにならない」ことだけ確認
-                # (実 wait は test_timeout でカバー済み)
+                # since an existing pending returns immediately, it is OK even if the cap runs with timeout=1
+                # here we only confirm that "passing a huge value does not cause a 4xx error"
+                # (actual waiting is already covered by test_timeout)
                 req_task = asyncio.create_task(c.post("/v1/messages", json={
                     "model": "x", "stream": False,
                     "messages": [{"role": "user", "content": "y"}],
@@ -526,11 +544,11 @@ class TestWaitForPending(unittest.TestCase):
         _run(run())
 
 
-# ── Anthropic SDK 互換性 (実際の SDK で往復) ─────────────────────
+# ── Anthropic SDK compatibility (round-trip with the real SDK) ─────────────────────
 
 
 class TestAnthropicSDKCompatibility(unittest.TestCase):
-    """uvicorn で別ポート起動し、anthropic SDK を実際に走らせる。"""
+    """Start on a separate port with uvicorn and actually run the anthropic SDK."""
 
     PORT = 18765
 
@@ -574,11 +592,11 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
         cls._thread.join(timeout=3)
 
     def setUp(self) -> None:
-        """各テスト開始前に server state を clear する。
+        """Clear server state before each test starts.
 
-        setUpClass で uvicorn を 1 回だけ起動し 3 テストで共有しているため、
-        各テスト間で /_control/history と /_control/turn_count が累積する。
-        テスト追加 / 順序変更で flaky 化するのを防ぐため明示的に clear。
+        Because setUpClass starts uvicorn only once and shares it across 3 tests,
+        /_control/history and /_control/turn_count accumulate between tests.
+        Clear explicitly to prevent flakiness from adding tests or reordering them.
         """
         import urllib.request
         urllib.request.urlopen(
@@ -589,34 +607,34 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
         )
 
     def _respond_when_pending(self, payload: dict[str, Any]) -> threading.Event:
-        """別スレッドで pending を待って /_control/respond を投げる。
+        """Wait for a pending in a separate thread and POST /_control/respond.
 
-        戻り値は worker 完了通知の Event。テスト本体は SDK 呼び出し後に
-        `assertTrue(event.wait(timeout))` で worker の完了を確認できる
-        (silently exit による hang を検出可能、PR #94 review #3 対応)。
+        The return value is an Event signaling worker completion. After the SDK call,
+        the test body can confirm the worker finished via `assertTrue(event.wait(timeout))`
+        (detects hangs from silent exit; addresses PR #94 review #3).
         """
         return self._post_when_pending("/_control/respond", payload)
 
     def _respond_when_pending_error(self, payload: dict[str, Any]) -> threading.Event:
-        """別スレッドで pending を待って /_control/error を投げる。"""
+        """Wait for a pending in a separate thread and POST /_control/error."""
         return self._post_when_pending("/_control/error", payload)
 
     def _post_when_pending(
         self, endpoint: str, payload: dict[str, Any]
     ) -> threading.Event:
-        """polling worker を立ち上げ、pending を見つけたら endpoint に POST する。
+        """Spin up a polling worker and POST to endpoint once a pending is found.
 
-        Worker はどう終わっても (成功 / poll exhaust / 例外) 必ず Event を set する。
-        Poll exhaust 時は **fallback error を /_control/error に投げる** ことで
-        SDK 側を hang させない (テストハングを CI 上のミステリアスな timeout に
-        させないためのセーフティネット)。
+        However the worker ends (success / poll exhaustion / exception), it always sets the Event.
+        On poll exhaustion it **injects a fallback error to /_control/error** so the SDK
+        side does not hang (a safety net to avoid turning a test hang into a mysterious
+        timeout on CI).
         """
         import urllib.request
         done = threading.Event()
 
         def worker() -> None:
             try:
-                for _ in range(100):  # 100 * 0.05s = 最大 5 秒
+                for _ in range(100):  # 100 * 0.05s = up to 5 seconds
                     try:
                         p = json.loads(
                             urllib.request.urlopen(
@@ -634,12 +652,12 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
                             urllib.request.urlopen(req, timeout=2)
                             return
                     except Exception:
-                        # poll 中の transient なエラーは無視して次の sleep で retry。
+                        # ignore transient errors during polling and retry on the next sleep.
                         pass
                     time.sleep(0.05)
-                # exhaust: SDK が pending のまま hang しないよう fallback error を投げる。
-                # テストは done.wait() 後に endpoint 経由で何かが届いたことを確認することで
-                # 「worker は走ったが pending を見つけられなかった」を検出可能。
+                # exhaust: inject a fallback error so the SDK does not hang with a pending.
+                # After done.wait(), the test can confirm something arrived via the endpoint,
+                # detecting the "worker ran but never found a pending" case.
                 try:
                     fallback = urllib.request.Request(
                         f"http://127.0.0.1:{self.PORT}/_control/error",
@@ -652,9 +670,9 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
                     )
                     urllib.request.urlopen(fallback, timeout=2)
                 except Exception:
-                    # fallback error POST は best-effort セーフティネット (no pending /
-                    # server shutdown 等で 4xx/connect error になっても気にしない)。
-                    # finally の done.set() が hang 防止を保証するのでここは sink で OK。
+                    # the fallback error POST is a best-effort safety net (we don't care if it
+                    # becomes a 4xx/connect error due to no pending / server shutdown, etc.).
+                    # finally's done.set() guarantees hang prevention, so sinking here is OK.
                     pass
             finally:
                 done.set()
@@ -691,12 +709,12 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
         self.assertEqual(content[0].text, "round-trip OK")
 
     def test_sdk_raises_on_error_injection(self) -> None:
-        """`/_control/error` を経由した時、anthropic SDK は適切な例外を raise する。"""
+        """When going through `/_control/error`, the anthropic SDK raises the appropriate exception."""
         import anthropic
         responder_done: list[threading.Event] = []
 
         async def run() -> Exception | None:
-            # max_retries=0 で SDK 内蔵 retry を無効化 (即 raise を観察)
+            # max_retries=0 disables the SDK's built-in retry (observe the immediate raise)
             client = anthropic.AsyncAnthropic(
                 api_key="sk-mock",
                 base_url=f"http://127.0.0.1:{self.PORT}",
@@ -720,7 +738,7 @@ class TestAnthropicSDKCompatibility(unittest.TestCase):
         exc = _run(run())
         self.assertTrue(responder_done[0].wait(10), "responder thread did not finish")
         self.assertIsNotNone(exc, "expected anthropic SDK to raise on 429")
-        # SDK の例外型を判定
+        # check the SDK's exception type
         self.assertIsInstance(exc, anthropic.RateLimitError)
 
     def test_tool_use_streaming(self) -> None:

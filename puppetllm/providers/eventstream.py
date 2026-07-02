@@ -1,25 +1,26 @@
-"""AWS event stream (vnd.amazon.eventstream) バイナリエンコーダ (pure)。
+"""AWS event stream (vnd.amazon.eventstream) binary encoder (pure).
 
-Bedrock の `InvokeModelWithResponseStream` は SSE ではなく Amazon の event stream
-バイナリフレーミングで応答する。boto3 / anthropic[bedrock] SDK はこれをデコードする。
-fake server が Bedrock 経路を喋るには、Anthropic の各ストリームイベント (message_start /
-content_block_delta / ...) を 1 つの `chunk` メッセージに包んで送る必要がある。
+Bedrock's `InvokeModelWithResponseStream` responds not with SSE but with Amazon's
+event stream binary framing. The boto3 / anthropic[bedrock] SDK decodes it. For the
+fake server to speak the Bedrock route, it must wrap each Anthropic stream event
+(message_start / content_block_delta / ...) into a single `chunk` message and send it.
 
-フレーム構造 (全て big-endian):
+Frame structure (all big-endian):
   [total_len u32][headers_len u32][prelude_crc u32]  ← prelude (12 bytes)
   [headers ...]                                       ← headers_len bytes
   [payload ...]                                       ← total_len - headers_len - 16
-  [message_crc u32]                                   ← prelude+headers+payload の CRC32
+  [message_crc u32]                                   ← CRC32 of prelude+headers+payload
 
-header (1 つ):
+header (one):
   [name_len u8][name][value_type u8][value...]
-  value_type=7 (string) のとき: [value_len u16][value]
+  when value_type=7 (string): [value_len u16][value]
 
-chunk メッセージ:
+chunk message:
   headers: :event-type=chunk, :content-type=application/json, :message-type=event
   payload: {"bytes": base64(<anthropic event json>)}
 
-参考: AWS event stream encoding 仕様 (CRC32 は標準多項式、zlib.crc32 と同一)。
+Reference: AWS event stream encoding spec (CRC32 uses the standard polynomial,
+identical to zlib.crc32).
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def _encode_header(name: str, value: str) -> bytes:
 
 
 def encode_message(headers: dict[str, str], payload: bytes) -> bytes:
-    """1 つの event stream メッセージをバイナリ化する。"""
+    """Serialize a single event stream message to binary."""
     headers_b = b"".join(_encode_header(k, v) for k, v in headers.items())
     headers_len = len(headers_b)
     total_len = 12 + headers_len + len(payload) + 4  # prelude(12) + headers + payload + msg_crc(4)
@@ -61,7 +62,7 @@ def encode_message(headers: dict[str, str], payload: bytes) -> bytes:
 
 
 def encode_chunk(event_data: dict[str, Any]) -> bytes:
-    """Anthropic のストリームイベント dict を Bedrock `chunk` フレームに包む。"""
+    """Wrap an Anthropic stream event dict into a Bedrock `chunk` frame."""
     inner = json.dumps(event_data, ensure_ascii=False).encode("utf-8")
     payload = json.dumps(
         {"bytes": base64.b64encode(inner).decode("ascii")}
@@ -75,11 +76,12 @@ def encode_chunk(event_data: dict[str, Any]) -> bytes:
 
 
 def encode_exception(exception_type: str, message: str) -> bytes:
-    """エラーを event stream の exception メッセージとして包む (mid-stream エラー用)。
+    """Wrap an error as an event stream exception message (for mid-stream errors).
 
-    NOTE: 現状未使用。bedrock.py のエラー注入は stream 開始**前**に解決するため HTTP status で
-    返している (SDK は status で例外マッピング)。将来 stream 途中でのエラー注入を実装する際の
-    ユーティリティとして用意してある (例: throttling を N チャンク送出後に発生させる検証)。
+    NOTE: Currently unused. bedrock.py resolves error injection **before** the stream
+    starts, so it returns via HTTP status (the SDK maps exceptions by status). This is
+    provided as a utility for when mid-stream error injection is implemented in the
+    future (e.g. verifying throttling triggered after N chunks are emitted).
     """
     payload = json.dumps({"message": message}).encode("utf-8")
     headers = {
@@ -91,10 +93,10 @@ def encode_exception(exception_type: str, message: str) -> bytes:
 
 
 def decode_messages(data: bytes) -> list[dict[str, Any]]:
-    """テスト/検証用: encode した bytes 列をパースして event dict を取り出す。
+    """For testing/verification: parse an encoded byte sequence and extract event dicts.
 
-    chunk メッセージのみ対象 (payload.bytes を base64 decode → JSON)。
-    CRC は検証する (壊れていれば ValueError)。
+    Only chunk messages are targeted (payload.bytes base64 decode → JSON).
+    CRC is verified (ValueError if corrupted).
     """
     out: list[dict[str, Any]] = []
     off = 0
@@ -118,7 +120,7 @@ def decode_messages(data: bytes) -> list[dict[str, Any]]:
             inner = base64.b64decode(wrapper["bytes"])
             out.append(json.loads(inner))
         except (KeyError, ValueError):
-            # chunk 以外 (exception 等) は素の payload を入れておく
+            # For non-chunk messages (exception etc.), store the raw payload
             out.append({"_raw": payload.decode("utf-8", errors="replace")})
         off += total_len
     return out
