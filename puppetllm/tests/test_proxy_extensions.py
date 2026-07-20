@@ -12,6 +12,8 @@ import asyncio
 import json
 import os
 import re
+import threading
+import time
 import unittest
 from typing import Any
 
@@ -470,7 +472,7 @@ class TestCostAndCacheHttp(unittest.TestCase):
         _run(run())
 
     def test_uncached_not_clamped_with_string_system_and_message_breakpoint(self) -> None:
-        """P2 regression: even with a string system + a breakpoint on a message, uncached>0 and
+        """Even with a string system + a breakpoint on a message, uncached>0 and
         uncached = total - creation (prefix ⊆ total is preserved and does not clamp to 0)."""
         async def run() -> None:
             async with await self._client() as c:
@@ -930,11 +932,11 @@ class TestOpenAISDKCompatibility(unittest.TestCase):
         _run(run())
 
 
-# ── Regression tests for independent-review findings ─────────────────────────────────────
+# ── Regression tests for edge-case bugs / fidelity gaps ──────────────────────────────────
 
 
-class TestReviewRegressions(unittest.TestCase):
-    """Regression tests for bugs / fidelity gaps found in the independent review (2026-07)."""
+class TestRegressions(unittest.TestCase):
+    """Regression tests pinning fixed bugs and API-fidelity edge cases."""
 
     def setUp(self) -> None:
         self.mod = _import_fresh()
@@ -1142,7 +1144,7 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertEqual([r["tool_use_id"] for r in results], ["a", "b"])
 
     # pricing: codex is cross-generation / o3-mini / does not crash on a non-str model
-    def test_pricing_review_fixes(self) -> None:
+    def test_pricing_family_edge_cases(self) -> None:
         self.assertEqual(pricing.resolve_family("gpt-5.4-codex"), "codex")
         self.assertEqual(pricing.resolve_family("gpt-5.3-codex"), "codex")
         self.assertEqual(pricing.resolve_family("o3-mini"), "o3-mini")
@@ -1319,6 +1321,807 @@ class TestReviewRegressions(unittest.TestCase):
                 self.assertEqual(r.status_code, 400)
                 await t  # caller still completes with the first result
         _run(run())
+
+
+# ── /_control/respond usage override ─────────────────────────────────
+
+
+class TestUsageOverride(unittest.TestCase):
+    """Optional real-usage injection via /_control/respond (for relay responders)."""
+
+    def setUp(self) -> None:
+        self.mod = _import_fresh()
+
+    async def _client(self) -> Any:
+        import httpx
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.mod.app), base_url="http://test")
+
+    async def _make_pending(self, c, body: dict) -> Any:
+        t = asyncio.create_task(c.post("/v1/messages", json=body, timeout=10))
+        for _ in range(50):
+            if (await c.get("/_control/pending")).json().get("has_pending"):
+                return t
+            await asyncio.sleep(0.05)
+        self.fail("never became pending")
+
+    def test_full_override_reflected_everywhere(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                t = await self._make_pending(c, {
+                    "model": "claude-opus-4-1",
+                    "messages": [{"role": "user", "content": "x"}]})
+                await c.post("/_control/respond", json={
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1000, "output_tokens": 250,
+                              "cache_read_input_tokens": 500,
+                              "cache_creation_input_tokens": 0}})
+                u = (await t).json()["usage"]
+                self.assertEqual(u["input_tokens"], 1000)
+                self.assertEqual(u["output_tokens"], 250)
+                self.assertEqual(u["cache_read_input_tokens"], 500)
+                h = (await c.get("/_control/history")).json()["history"][-1]
+                self.assertTrue(h.get("usage_overridden"))
+                # cost is recomputed from the overridden numbers (opus: in $5 + out $25 + read $0.5 /Mtok)
+                expected = (1000 * 5.0 + 250 * 25.0 + 500 * 0.50) / 1_000_000
+                self.assertAlmostEqual(h["cost"]["total_usd"], expected, places=9)
+                s = (await c.get("/_control/stats")).json()
+                self.assertEqual(s["totals"]["input_tokens"], 1000)
+                self.assertEqual(s["totals"]["output_tokens"], 250)
+        _run(run())
+
+    def test_partial_override_keeps_approx_for_rest(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                t = await self._make_pending(c, {
+                    "model": "m", "messages": [{"role": "user", "content": "y" * 400}]})
+                await c.post("/_control/respond", json={
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"output_tokens": 7}})
+                u = (await t).json()["usage"]
+                self.assertEqual(u["output_tokens"], 7)      # overridden
+                self.assertGreater(u["input_tokens"], 0)      # approx kept
+        _run(run())
+
+    def test_invalid_usage_rejected_pending_intact(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                t = await self._make_pending(c, {
+                    "model": "m", "messages": [{"role": "user", "content": "x"}]})
+                for bad in ({"output_tokens": "7"},          # non-int
+                            {"output_tokens": -1},            # negative
+                            {"output_tokens": True},          # bool is not accepted
+                            {"unknown_key": 1},               # unknown key
+                            {},                               # empty
+                            "usage-as-string"):
+                    r = await c.post("/_control/respond", json={
+                        "content": [{"type": "text", "text": "ok"}], "usage": bad})
+                    self.assertEqual(r.status_code, 400, f"usage={bad!r}")
+                self.assertEqual((await c.get("/_control/pending")).json()["count"], 1)
+                await c.post("/_control/auto", json={"text": "done"})
+                self.assertEqual((await t).status_code, 200)
+        _run(run())
+
+
+# ── relay: pure translation units ────────────────────────────────────
+
+
+class TestRelayUnit(unittest.TestCase):
+    def test_model_map(self) -> None:
+        from puppetllm import relay
+        mm = relay.parse_model_map("claude-*=grok-3, gpt-*=grok-3-mini")
+        self.assertEqual(relay.map_model("claude-sonnet-4-5", None, mm), "grok-3")
+        self.assertEqual(relay.map_model("gpt-5.4", None, mm), "grok-3-mini")
+        self.assertEqual(relay.map_model("other", None, mm), "other")       # passthrough
+        self.assertEqual(relay.map_model("claude-x", "forced", mm), "forced")  # --model wins
+        with self.assertRaises(ValueError):
+            relay.parse_model_map("no-equals-sign")
+
+    def test_to_openai_request(self) -> None:
+        from puppetllm import relay
+        req = {
+            "system": "be terse",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "tu1", "name": "wx",
+                     "input": {"c": "Tokyo"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "sunny"},
+                    {"type": "text", "text": "and paris?"}]},
+            ],
+            "tools": [{"name": "wx", "description": "d",
+                       "input_schema": {"type": "object"}}],
+            "max_tokens": 128,
+            "params": {"temperature": 0.3, "stop_sequences": ["END"],
+                       "tool_choice": {"type": "any"}},
+        }
+        body = relay.to_openai_request(req, "grok-3")
+        self.assertEqual(body["model"], "grok-3")
+        self.assertEqual(body["messages"][0], {"role": "system", "content": "be terse"})
+        asst = body["messages"][2]
+        self.assertEqual(asst["content"], "checking")
+        self.assertEqual(asst["tool_calls"][0]["function"]["name"], "wx")
+        self.assertEqual(json.loads(asst["tool_calls"][0]["function"]["arguments"]),
+                         {"c": "Tokyo"})
+        # tool_result becomes a tool message (before the trailing user text)
+        self.assertEqual(body["messages"][3],
+                         {"role": "tool", "tool_call_id": "tu1", "content": "sunny"})
+        self.assertEqual(body["messages"][4], {"role": "user", "content": "and paris?"})
+        self.assertEqual(body["tools"][0]["function"]["name"], "wx")
+        self.assertEqual(body["temperature"], 0.3)
+        self.assertEqual(body["stop"], ["END"])
+        self.assertEqual(body["tool_choice"], "required")   # anthropic "any" -> openai
+        self.assertEqual(body["max_tokens"], 128)
+
+    def test_tool_choice_mappings(self) -> None:
+        from puppetllm.relay import _tool_choice_to_openai as f
+        self.assertEqual(f({"type": "auto"}), "auto")
+        self.assertEqual(f({"type": "tool", "name": "wx"}),
+                         {"type": "function", "function": {"name": "wx"}})
+        self.assertEqual(f("required"), "required")          # openai-style passthrough
+        self.assertIsNone(f(None))
+
+    def test_from_openai_response(self) -> None:
+        from puppetllm import relay
+        payload = relay.from_openai_response({
+            "choices": [{"index": 0, "finish_reason": "length", "message": {
+                "role": "assistant", "content": "partial",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "wx",
+                                             "arguments": "{\"c\": \"Osaka\"}"}}]}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 9,
+                      "prompt_tokens_details": {"cached_tokens": 40}},
+        })
+        types = [b["type"] for b in payload["content"]]
+        self.assertEqual(types, ["text", "tool_use"])
+        self.assertEqual(payload["content"][1]["input"], {"c": "Osaka"})
+        # tool_use present → tool_use wins over finish_reason "length" (see
+        # test_tool_calls_force_tool_use_stop_reason). The plain length -> max_tokens
+        # mapping (no tool calls) is asserted just below.
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(payload["usage"], {
+            "input_tokens": 60, "output_tokens": 9,             # 100 - 40 cached
+            "cache_read_input_tokens": 40, "cache_creation_input_tokens": 0})
+        # length -> max_tokens when there are no tool calls
+        self.assertEqual(relay.from_openai_response(
+            {"choices": [{"finish_reason": "length",
+                          "message": {"content": "partial"}}]})["stop_reason"], "max_tokens")
+
+    def test_from_openai_response_list_content_joined(self) -> None:
+        # Some OpenAI-compatible backends return content as a list of parts; join the text
+        # instead of str()-ing the whole list into the app's message.
+        from puppetllm import relay
+        p = relay.from_openai_response({"choices": [{"finish_reason": "stop", "message": {
+            "content": [{"type": "text", "text": "Hello "},
+                        {"type": "text", "text": "world"}]}}]})
+        self.assertEqual(p["content"], [{"type": "text", "text": "Hello world"}])
+        # a list with no text parts yields no text block (not a stringified list)
+        p2 = relay.from_openai_response({"choices": [{"finish_reason": "stop", "message": {
+            "content": [{"type": "image_url", "image_url": {"url": "x"}}]}}]})
+        self.assertEqual(p2["content"], [])
+        # plain string content still works
+        p3 = relay.from_openai_response({"choices": [{"finish_reason": "stop",
+                                        "message": {"content": "plain"}}]})
+        self.assertEqual(p3["content"], [{"type": "text", "text": "plain"}])
+
+    def test_from_response_omits_usage_when_upstream_has_none(self) -> None:
+        # Upstream without usage → usage=None so the relay keeps puppetllm's approx
+        # (rather than forcing zeros). Applies to both directions.
+        from puppetllm import relay
+        no_u = {"choices": [{"finish_reason": "stop",
+                             "message": {"content": "hi"}}]}
+        self.assertIsNone(relay.from_openai_response(no_u)["usage"])
+        self.assertIsNone(relay.from_openai_response(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}},],
+             "usage": {}})["usage"])
+        self.assertIsNone(relay.from_anthropic_response(
+            {"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"})["usage"])
+        # present usage still overrides
+        self.assertIsNotNone(relay.from_openai_response(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+             "usage": {"prompt_tokens": 5, "completion_tokens": 2}})["usage"])
+
+    def test_to_anthropic_request_defaults(self) -> None:
+        from puppetllm import relay
+        body = relay.to_anthropic_request(
+            {"messages": [{"role": "user", "content": "x"}], "max_tokens": None,
+             "params": {"top_k": 5}}, "claude-sonnet-4-5")
+        self.assertEqual(body["max_tokens"], 4096)   # required by /v1/messages
+        self.assertEqual(body["top_k"], 5)
+        self.assertNotIn("system", body)
+
+    def test_to_anthropic_request_translates_openai_params(self) -> None:
+        from puppetllm import relay
+        body = relay.to_anthropic_request({
+            "system": "sys", "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 64,
+            "tools": [{"name": "wx", "input_schema": {"type": "object"}}],
+            "params": {"tool_choice": "required", "stop": "END",
+                       "thinking": {"type": "enabled"}}},
+            "claude-sonnet-4-5")
+        self.assertEqual(body["system"], "sys")
+        self.assertEqual(body["tools"][0]["name"], "wx")
+        self.assertEqual(body["tool_choice"], {"type": "any"})       # required -> any
+        self.assertEqual(body["stop_sequences"], ["END"])            # str wrapped in list
+        self.assertNotIn("thinking", body)                          # dropped (server strips)
+
+    def test_tool_choice_to_anthropic(self) -> None:
+        from puppetllm.relay import _tool_choice_to_anthropic as f
+        self.assertEqual(f("required"), {"type": "any"})
+        self.assertEqual(f("auto"), {"type": "auto"})
+        self.assertEqual(f({"type": "function", "function": {"name": "wx"}}),
+                         {"type": "tool", "name": "wx"})
+        self.assertEqual(f({"type": "tool", "name": "wx"}),          # already anthropic
+                         {"type": "tool", "name": "wx"})
+        self.assertIsNone(f(None))
+
+    def test_from_anthropic_response_usage(self) -> None:
+        from puppetllm import relay
+        p = relay.from_anthropic_response({
+            "content": [{"type": "text", "text": "hi"}], "stop_reason": "tool_use",
+            "usage": {"input_tokens": 30, "output_tokens": 5,
+                      "cache_read_input_tokens": 10, "cache_creation_input_tokens": 2}})
+        self.assertEqual(p["stop_reason"], "tool_use")
+        self.assertEqual(p["usage"], {"input_tokens": 30, "output_tokens": 5,
+                                      "cache_read_input_tokens": 10,
+                                      "cache_creation_input_tokens": 2})
+
+    def test_usage_clamped_non_negative(self) -> None:
+        # A hostile/buggy upstream reporting negative token counts must be clamped (else the
+        # server rejects the inject and the request hot-loops / hangs).
+        from puppetllm import relay
+        po = relay.from_openai_response({
+            "choices": [{"finish_reason": "stop", "message": {"content": "x"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": -3,
+                      "prompt_tokens_details": {"cached_tokens": 999}}})
+        self.assertTrue(all(v >= 0 for v in po["usage"].values()))
+        pa = relay.from_anthropic_response({
+            "content": [], "stop_reason": "end_turn",
+            "usage": {"input_tokens": -1, "output_tokens": 4}})
+        self.assertTrue(all(v >= 0 for v in pa["usage"].values()))
+
+    def test_upstream_error_fields(self) -> None:
+        from puppetllm.relay import _upstream_error_fields as f
+        # OpenAI envelope, with code/param
+        e = f(429, {"error": {"message": "slow", "type": "rate_limit_error",
+                              "code": "rate_limit_exceeded", "param": None}})
+        self.assertEqual((e["status"], e["type"], e["code"]),
+                         (429, "rate_limit_error", "rate_limit_exceeded"))
+        # non-standard status clamped into [400,599]
+        self.assertEqual(f(999, {"error": {"message": "x", "type": "y"}})["status"], 599)
+        self.assertEqual(f(200, {"error": {"message": "x", "type": "y"}})["status"], 400)
+        # non-envelope body → api_error with stringified message
+        e2 = f(503, "plain text error")
+        self.assertEqual((e2["status"], e2["type"]), (503, "api_error"))
+        self.assertIn("plain text", e2["message"])
+
+    def test_max_tokens_param(self) -> None:
+        from puppetllm import relay
+        import argparse
+        cfg = argparse.Namespace(max_tokens_param="max_completion_tokens")
+        body = relay.to_openai_request(
+            {"messages": [{"role": "user", "content": "x"}], "max_tokens": 100}, "m", cfg)
+        self.assertEqual(body.get("max_completion_tokens"), 100)
+        self.assertNotIn("max_tokens", body)
+
+    def test_tool_calls_force_tool_use_stop_reason(self) -> None:
+        # A tool-calling turn must report stop_reason "tool_use" even when the upstream
+        # (mis)sets finish_reason to "stop"/"length" — else an Anthropic-SDK agent's tool
+        # loop stalls. Presence of a tool_use block wins over finish_reason.
+        from puppetllm import relay
+        for finish in ("stop", "length", None, "tool_calls", "weird"):
+            resp = {"choices": [{"finish_reason": finish, "message": {
+                "content": None,
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "wx", "arguments": "{}"}}]}}]}
+            p = relay.from_openai_response(resp)
+            self.assertEqual(p["stop_reason"], "tool_use", f"finish={finish!r}")
+            self.assertEqual([b["type"] for b in p["content"]], ["tool_use"])
+        # no tool calls → finish_reason still governs
+        self.assertEqual(relay.from_openai_response(
+            {"choices": [{"finish_reason": "stop",
+                          "message": {"content": "hi"}}]})["stop_reason"], "end_turn")
+
+    def test_malformed_prompt_tokens_details_does_not_raise(self) -> None:
+        # A non-dict prompt_tokens_details (garbage upstream) must not turn a billed 200 into
+        # a 502; it's treated as "no cached tokens" and the rest of usage still lands.
+        from puppetllm import relay
+        p = relay.from_openai_response({"choices": [
+            {"finish_reason": "stop", "message": {"content": "x"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4,
+                      "prompt_tokens_details": [1, 2, 3]}})   # list, not dict
+        self.assertEqual(p["usage"], {"input_tokens": 10, "output_tokens": 4,
+                                      "cache_read_input_tokens": 0,
+                                      "cache_creation_input_tokens": 0})
+
+    def test_unknown_finish_reason_falls_back(self) -> None:
+        # A non-standard finish_reason must not reach the app as a bogus stop_reason.
+        from puppetllm import relay
+        p = relay.from_openai_response({"choices": [
+            {"finish_reason": "weird_new_value", "message": {"content": "x"}}]})
+        self.assertEqual(p["stop_reason"], "end_turn")
+        # legacy single-function form maps to tool_use
+        p2 = relay.from_openai_response({"choices": [
+            {"finish_reason": "function_call", "message": {"content": "x"}}]})
+        self.assertEqual(p2["stop_reason"], "tool_use")
+
+    def test_empty_assistant_turn_dropped(self) -> None:
+        # An assistant turn that carried only thinking (stripped by the server) becomes empty;
+        # it must be dropped rather than emitted as {"content": None} with no tool_calls.
+        from puppetllm import relay
+        body = relay.to_openai_request({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": []},          # empty → dropped
+            {"role": "user", "content": "again"},
+        ]}, "m")
+        roles = [m["role"] for m in body["messages"]]
+        self.assertEqual(roles, ["user", "user"])          # no empty assistant
+
+    def test_anthropic_metadata_sanitized(self) -> None:
+        # OpenAI-inbound apps may attach arbitrary metadata; only user_id survives to Anthropic.
+        from puppetllm import relay
+        keep = relay.to_anthropic_request({"messages": [], "params": {
+            "metadata": {"user_id": "u1", "session": "drop-me"}}}, "m")
+        self.assertEqual(keep["metadata"], {"user_id": "u1"})
+        drop = relay.to_anthropic_request({"messages": [], "params": {
+            "metadata": {"session": "no-user-id"}}}, "m")
+        self.assertNotIn("metadata", drop)
+
+    def test_looks_foreign(self) -> None:
+        from puppetllm import relay
+        self.assertTrue(relay.looks_foreign("claude-sonnet-4-5", "openai"))
+        self.assertTrue(relay.looks_foreign("gpt-5.4", "anthropic"))
+        self.assertTrue(relay.looks_foreign("grok-3", "anthropic"))
+        self.assertFalse(relay.looks_foreign("grok-3", "openai"))       # native to openai kind
+        self.assertFalse(relay.looks_foreign("claude-x", "anthropic"))  # native to anthropic kind
+        self.assertFalse(relay.looks_foreign("", "openai"))
+
+    def test_claim_filter(self) -> None:
+        # --only claims matching inbound models and leaves the rest for another responder.
+        import argparse
+        from puppetllm import relay
+        cfg = argparse.Namespace(
+            model_map=None, only="gpt-*,o3-*", max_concurrency=0,
+            api_key_env="RELAY_TEST_KEY_UNSET", kind="openai", target="http://x.invalid",
+            timeout=1.0, poll_timeout=1.0, puppet="http://p.invalid", model=None,
+            max_tokens_param="max_tokens", max_requests=0)
+        r = relay.Relay(cfg)
+        try:
+            self.assertTrue(r._claims({"request": {"model": "gpt-5.4"}}))
+            self.assertTrue(r._claims({"request": {"model": "o3-mini"}}))
+            self.assertFalse(r._claims({"request": {"model": "claude-sonnet-4-5"}}))
+        finally:
+            _run(r.http.aclose())
+            _run(r.ctl.aclose())
+
+
+class TestRelayInjectResilience(unittest.TestCase):
+    """The inject path must settle a pending WITHOUT ever re-forwarding to the paid upstream,
+    even when the control plane is unreachable (transport error) rather than merely rejecting
+    the payload. Regression for the transport-error hot-loop."""
+
+    def _relay(self):
+        import argparse
+        from puppetllm import relay
+        cfg = argparse.Namespace(
+            model_map=None, api_key_env="RELAY_TEST_KEY_UNSET", kind="openai",
+            target="http://upstream.invalid", timeout=1.0, poll_timeout=1.0,
+            puppet="http://puppet.invalid", model=None,
+            max_tokens_param="max_tokens", max_requests=0)
+        return relay.Relay(cfg)
+
+    def test_transport_failure_quarantines_and_does_not_reforward(self) -> None:
+        import httpx
+
+        class _AlwaysFailCtl:
+            def __init__(self) -> None:
+                self.calls: list = []
+
+            async def post(self, path, json=None):
+                self.calls.append((path, json))
+                raise httpx.ConnectError("control plane down")
+
+            async def aclose(self) -> None:
+                pass
+
+        async def run() -> None:
+            r = self._relay()
+            r.ctl = _AlwaysFailCtl()
+            try:
+                # An undeliverable resolution must still "settle" (return True) so handle()
+                # doesn't leave the pending re-claimable → no re-forward to the upstream.
+                ok = await r._inject("pid1", "/_control/respond",
+                                     {"content": [{"type": "text", "text": "x"}]})
+                self.assertTrue(ok)
+                self.assertIn("pid1", r.quarantined)   # run loop can never re-claim it
+                paths = [c[0] for c in r.ctl.calls]
+                # the respond POST was retried (bounded), then a 502 fallback was attempted
+                self.assertEqual(paths.count("/_control/respond"), 3)
+                self.assertIn("/_control/error", paths)
+            finally:
+                await r.http.aclose()
+
+        _run(run())
+
+    def test_post_ctl_returns_response_on_first_success(self) -> None:
+        class _OkCtl:
+            def __init__(self) -> None:
+                self.n = 0
+
+            async def post(self, path, json=None):
+                self.n += 1
+                return httpx.Response(200, json={"ok": True})
+
+            async def aclose(self) -> None:
+                pass
+
+        import httpx
+
+        async def run() -> None:
+            r = self._relay()
+            r.ctl = _OkCtl()
+            try:
+                resp = await r._post_ctl("/_control/respond", {"pending_id": "p"})
+                self.assertIsNotNone(resp)
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(r.ctl.n, 1)           # no needless retries on success
+            finally:
+                await r.http.aclose()
+
+        _run(run())
+
+
+# ── relay: end-to-end (real servers + real anthropic SDK + relay loop) ──
+
+
+class _MockUpstream:
+    """Minimal OpenAI-compatible ASGI app: scripted (status, json) responses + capture."""
+
+    def __init__(self) -> None:
+        self.queue: list = []
+        self.seen: list = []
+        self.seen_headers: list = []
+        self.calls = 0
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            return
+        body = b""
+        while True:
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        self.calls += 1
+        self.seen_headers.append({k.decode(): v.decode()
+                                  for k, v in scope.get("headers", [])})
+        if scope.get("path", "").endswith("/_health"):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+            return
+        try:
+            self.seen.append(json.loads(body or b"{}"))
+        except ValueError:
+            self.seen.append(None)
+        status, payload = (self.queue.pop(0) if self.queue
+                           else (500, {"error": {"message": "mock queue empty",
+                                                 "type": "test_error"}}))
+        # payload may be a bytes to simulate a non-JSON body
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": data})
+
+
+class TestRelayE2E(unittest.TestCase):
+    """Front puppetllm (uvicorn) + mock OpenAI-compatible upstream + real relay loop.
+
+    Proves the headline: an app speaking the anthropic SDK transparently runs against
+    an OpenAI-compatible backend, with real usage/stop_reason relayed back.
+    """
+
+    @staticmethod
+    def _free_port() -> int:
+        """Bind :0 to let the OS pick a free port, then release it. Avoids fixed-port
+        collisions with residual processes / parallel CI runs (small TOCTOU window)."""
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import uvicorn
+        cls.FRONT = cls._free_port()
+        cls.UP = cls._free_port()
+        cls.mod = _import_fresh()
+        cls.upstream = _MockUpstream()
+        cls._servers = []
+        cls._threads = []
+        for app, port in ((cls.mod.app, cls.FRONT), (cls.upstream, cls.UP)):
+            server = uvicorn.Server(uvicorn.Config(
+                app, host="127.0.0.1", port=port, log_level="critical",
+                loop="asyncio"))
+            th = threading.Thread(
+                target=lambda s=server: asyncio.new_event_loop().run_until_complete(
+                    s.serve()),
+                daemon=True)
+            th.start()
+            cls._servers.append(server)
+            cls._threads.append(th)
+        import urllib.request
+        # Health-check BOTH servers (not just the front) so a silent bind failure on the
+        # upstream port fails fast here instead of surfacing as a misleading relay 502.
+        for url in (f"http://127.0.0.1:{cls.FRONT}/_control/health",
+                    f"http://127.0.0.1:{cls.UP}/_health"):
+            for _ in range(80):
+                try:
+                    urllib.request.urlopen(url, timeout=0.5)
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            else:
+                raise RuntimeError(f"server did not start: {url}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for s in cls._servers:
+            s.should_exit = True
+        for th in cls._threads:
+            th.join(timeout=3)
+
+    def _run_relay(self, max_requests: int, kind: str = "openai",
+                   target: str | None = None, extra: list | None = None) -> threading.Thread:
+        from puppetllm import relay
+        os.environ["RELAY_TEST_KEY"] = "k"
+        target = target or (f"http://127.0.0.1:{self.UP}/v1" if kind == "openai"
+                            else f"http://127.0.0.1:{self.UP}")
+        args = ["--puppet", f"http://127.0.0.1:{self.FRONT}",
+                "--kind", kind, "--target", target,
+                "--api-key-env", "RELAY_TEST_KEY", "--model", "mock-1",
+                "--poll-timeout", "3", "--timeout", "10",
+                "--max-requests", str(max_requests)] + (extra or [])
+        th = threading.Thread(target=relay.main, args=(args,), daemon=True)
+        th.start()
+        return th
+
+    def test_anthropic_app_bridged_to_openai_upstream(self) -> None:
+        import anthropic
+        self.upstream.queue[:] = [
+            (200, {"id": "cc1", "object": "chat.completion", "created": 1,
+                   "model": "mock-1",
+                   "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                "message": {"role": "assistant", "content": None,
+                                            "tool_calls": [{
+                                                "id": "call_up1", "type": "function",
+                                                "function": {"name": "wx",
+                                                             "arguments": "{\"c\": \"Tokyo\"}"}}]}}],
+                   "usage": {"prompt_tokens": 100, "completion_tokens": 9,
+                             "prompt_tokens_details": {"cached_tokens": 40}}}),
+            (200, {"id": "cc2", "object": "chat.completion", "created": 2,
+                   "model": "mock-1",
+                   "choices": [{"index": 0, "finish_reason": "stop",
+                                "message": {"role": "assistant",
+                                            "content": "Sunny in Tokyo."}}],
+                   "usage": {"prompt_tokens": 120, "completion_tokens": 7}}),
+        ]
+        self.upstream.seen.clear()
+        th = self._run_relay(max_requests=2)
+
+        client = anthropic.Anthropic(
+            api_key="sk-mock", base_url=f"http://127.0.0.1:{self.FRONT}",
+            max_retries=0)
+        tools = [{"name": "wx", "description": "weather",
+                  "input_schema": {"type": "object",
+                                   "properties": {"c": {"type": "string"}}}}]
+        m1 = client.messages.create(model="claude-sonnet-4-5", max_tokens=64,
+                                    system="be terse",
+                                    messages=[{"role": "user", "content": "weather?"}],
+                                    tools=tools)
+        # upstream tool_calls came back as a canonical tool_use with REAL usage
+        self.assertEqual(m1.stop_reason, "tool_use")
+        tb = [b for b in m1.content if b.type == "tool_use"][0]
+        self.assertEqual((tb.name, tb.input), ("wx", {"c": "Tokyo"}))
+        self.assertEqual(m1.usage.input_tokens, 60)          # 100 - 40 cached
+        self.assertEqual(m1.usage.cache_read_input_tokens, 40)
+        self.assertEqual(m1.usage.output_tokens, 9)
+
+        m2 = client.messages.create(model="claude-sonnet-4-5", max_tokens=64,
+                                    system="be terse",
+                                    messages=[
+                                        {"role": "user", "content": "weather?"},
+                                        {"role": "assistant",
+                                         "content": [b.model_dump() for b in m1.content]},
+                                        {"role": "user", "content": [
+                                            {"type": "tool_result",
+                                             "tool_use_id": tb.id,
+                                             "content": "sunny, 30C"}]},
+                                    ], tools=tools)
+        self.assertEqual(m2.stop_reason, "end_turn")
+        self.assertEqual(m2.content[0].text, "Sunny in Tokyo.")
+        self.assertEqual(m2.usage.input_tokens, 120)
+        th.join(timeout=10)
+        self.assertFalse(th.is_alive(), "relay did not exit after max-requests")
+
+        # the upstream saw well-formed OpenAI requests
+        first, second = self.upstream.seen[0], self.upstream.seen[1]
+        self.assertEqual(first["model"], "mock-1")            # model mapping applied
+        self.assertEqual(first["messages"][0],
+                         {"role": "system", "content": "be terse"})
+        self.assertEqual(first["tools"][0]["function"]["name"], "wx")
+        roles2 = [m["role"] for m in second["messages"]]
+        self.assertIn("tool", roles2)                          # tool_result -> tool msg
+        toolmsg = [m for m in second["messages"] if m["role"] == "tool"][0]
+        self.assertEqual(toolmsg["tool_call_id"], tb.id)
+        self.assertEqual(toolmsg["content"], "sunny, 30C")
+
+        # history marks the relayed usage as real
+        import urllib.request
+        h = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{self.FRONT}/_control/history", timeout=5).read())
+        self.assertTrue(all(e.get("usage_overridden") for e in h["history"][-2:]))
+
+        # stats prices by the INBOUND model id (documented caveat): the aggregation is keyed
+        # by "claude-sonnet-4-5", not the upstream "mock-1" that actually served the tokens.
+        s = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{self.FRONT}/_control/stats", timeout=5).read())
+        self.assertIn("claude-sonnet-4-5", s["by_model"])
+        self.assertNotIn("mock-1", s["by_model"])
+        self.assertGreater(s["totals"]["total_usd"], 0.0)
+
+    def test_upstream_error_relayed_to_sdk(self) -> None:
+        import anthropic
+        self.upstream.queue[:] = [
+            (429, {"error": {"message": "rate limited", "type": "rate_limit_error",
+                             "code": "rate_limit_exceeded"}})]
+        th = self._run_relay(max_requests=1)
+        client = anthropic.Anthropic(
+            api_key="sk-mock", base_url=f"http://127.0.0.1:{self.FRONT}",
+            max_retries=0)
+        with self.assertRaises(anthropic.RateLimitError) as ctx:
+            client.messages.create(model="claude-sonnet-4-5", max_tokens=16,
+                                   messages=[{"role": "user", "content": "x"}])
+        self.assertIn("rate limited", str(ctx.exception))
+        th.join(timeout=10)
+
+    def test_malformed_upstream_200_does_not_hang(self) -> None:
+        # A 200 with a valid-JSON but unexpected shape (no choices) must not hang the
+        # app's request; the relay surfaces it as a 502 instead of a silent empty message.
+        import anthropic
+        self.upstream.queue[:] = [(200, {"unexpected": "shape", "no": "choices"})]
+        th = self._run_relay(max_requests=1)
+        client = anthropic.Anthropic(
+            api_key="sk-mock", base_url=f"http://127.0.0.1:{self.FRONT}",
+            max_retries=0, timeout=8)
+        with self.assertRaises(anthropic.APIStatusError) as ctx:
+            client.messages.create(model="claude-sonnet-4-5", max_tokens=16,
+                                   messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(ctx.exception.status_code, 502)
+        th.join(timeout=10)
+
+    def test_non_json_2xx_upstream_does_not_hang(self) -> None:
+        # 200 with a non-JSON body → 502, not a hang.
+        import anthropic
+        self.upstream.queue[:] = [(200, b"<html>not json</html>")]
+        th = self._run_relay(max_requests=1)
+        client = anthropic.Anthropic(api_key="sk-mock",
+                                     base_url=f"http://127.0.0.1:{self.FRONT}",
+                                     max_retries=0, timeout=8)
+        with self.assertRaises(anthropic.APIStatusError) as ctx:
+            client.messages.create(model="claude-sonnet-4-5", max_tokens=16,
+                                   messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(ctx.exception.status_code, 502)
+        th.join(timeout=10)
+
+    def test_rejected_inject_does_not_hotloop(self) -> None:
+        # Regression for the hot-loop BLOCKER: if the server REJECTS the relay's inject
+        # payload (400), the relay must fall back to a 502 + quarantine the pending, NOT
+        # re-claim it and hammer the paid upstream forever. Trigger: an anthropic upstream
+        # returns content with a non-dict element, which the server's respond validation 400s.
+        import anthropic
+        self.upstream.queue[:] = [(200, {
+            "id": "m", "type": "message", "role": "assistant", "model": "mock-1",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}, 12345],   # non-dict element → 400
+            "usage": {"input_tokens": 3, "output_tokens": 1}})]
+        self.upstream.calls = 0
+        th = self._run_relay(max_requests=1, kind="anthropic")
+        client = anthropic.Anthropic(api_key="sk-mock",
+                                     base_url=f"http://127.0.0.1:{self.FRONT}",
+                                     max_retries=0, timeout=8)
+        with self.assertRaises(anthropic.APIStatusError) as ctx:
+            client.messages.create(model="claude-sonnet-4-5", max_tokens=16,
+                                   messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(ctx.exception.status_code, 502)
+        th.join(timeout=10)
+        self.assertEqual(self.upstream.calls, 1,
+                         "upstream must be called exactly once (no hot loop)")
+
+    def test_network_failure_relayed_as_502(self) -> None:
+        # Unreachable upstream → 502 to the app (not a hang, not a crash).
+        import anthropic
+        th = self._run_relay(max_requests=1, target="http://127.0.0.1:9")  # nothing listens
+        client = anthropic.Anthropic(api_key="sk-mock",
+                                     base_url=f"http://127.0.0.1:{self.FRONT}",
+                                     max_retries=0, timeout=8)
+        with self.assertRaises(anthropic.APIStatusError) as ctx:
+            client.messages.create(model="claude-sonnet-4-5", max_tokens=16,
+                                   messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertIn("unreachable", str(ctx.exception))
+        th.join(timeout=10)
+
+    def test_relay_multi_pending_no_mixup(self) -> None:
+        # Two concurrent app requests through the relay must each get a valid upstream
+        # response (exercises the inflight/dedup + task fan-out; a deadlock or double-handle
+        # would fail here).
+        import anthropic
+        self.upstream.queue[:] = []
+        results = {}
+
+        def worker(tag):
+            c = anthropic.Anthropic(api_key="sk-mock",
+                                    base_url=f"http://127.0.0.1:{self.FRONT}",
+                                    max_retries=0, timeout=12)
+            # queue an echo response right before the call so the upstream returns tag-tied text
+            self.upstream.queue.append((200, {
+                "id": "cc", "object": "chat.completion", "model": "mock-1",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": f"reply-{tag}"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2}}))
+            results[tag] = c.messages.create(
+                model="claude-sonnet-4-5", max_tokens=16,
+                messages=[{"role": "user", "content": tag}]).content[0].text
+
+        th = self._run_relay(max_requests=2)
+        ts = [threading.Thread(target=worker, args=(t,)) for t in ("Q1", "Q2")]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(15)
+        th.join(timeout=10)
+        # both completed; each got a valid reply (queue is content-agnostic, so assert set)
+        self.assertEqual(set(results.values()), {"reply-Q1", "reply-Q2"})
+
+    def test_openai_app_bridged_to_anthropic_upstream(self) -> None:
+        # The second headline: an OpenAI-SDK app transparently on a (mock) Anthropic API.
+        import openai
+        self.upstream.queue[:] = [(200, {
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "model": "mock-1", "stop_reason": "max_tokens", "stop_sequence": None,
+            "content": [{"type": "text", "text": "bridged to anthropic"}],
+            "usage": {"input_tokens": 42, "output_tokens": 5,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}})]
+        self.upstream.seen.clear()
+        self.upstream.seen_headers.clear()
+        th = self._run_relay(max_requests=1, kind="anthropic")
+        import httpx
+        client = openai.OpenAI(api_key="sk-mock",
+                               base_url=f"http://127.0.0.1:{self.FRONT}/v1",
+                               max_retries=0,
+                               http_client=httpx.Client(timeout=12))
+        r = client.chat.completions.create(
+            model="gpt-5.4", max_tokens=32,
+            messages=[{"role": "system", "content": "sys"},
+                      {"role": "user", "content": "hello"}])
+        # relayed Anthropic stop_reason -> OpenAI finish_reason, real usage
+        self.assertEqual(r.choices[0].message.content, "bridged to anthropic")
+        self.assertEqual(r.choices[0].finish_reason, "length")   # max_tokens -> length
+        self.assertEqual(r.usage.prompt_tokens, 42)
+        self.assertEqual(r.usage.completion_tokens, 5)
+        th.join(timeout=10)
+        # the mock Anthropic upstream saw the right auth headers, path, and body
+        hdr = self.upstream.seen_headers[0]
+        self.assertEqual(hdr.get("x-api-key"), "k")
+        self.assertIn("anthropic-version", hdr)
+        body = self.upstream.seen[0]
+        self.assertEqual(body["system"], "sys")
+        self.assertEqual(body["model"], "mock-1")
+        self.assertEqual(body["max_tokens"], 32)
 
 
 if __name__ == "__main__":

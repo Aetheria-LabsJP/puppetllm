@@ -229,7 +229,7 @@ curl -s -X POST $PUPPET_URL/_control/error \
 | GET | `/_control/health` | Health check (also returns cumulative turn count) |
 | GET | `/_control/pending` | Immediately fetch currently pending requests (`has_pending: false` if none) |
 | GET | `/_control/wait_for_pending?timeout=N` | **long-poll**: wait up to N seconds for the next pending (default 270, max 600) |
-| POST | `/_control/respond` | Inject arbitrary content blocks (`{"content": [...], "stop_reason"?}`) into a pending |
+| POST | `/_control/respond` | Inject arbitrary content blocks (`{"content": [...], "stop_reason"?, "usage"?}`) into a pending (`usage` = optional real token counts; as an improvising responder you normally omit both) |
 | POST | `/_control/auto` | Sugar for text-only injection (`{"text": "..."}`) |
 | POST | `/_control/error` | Inject an HTTP error response (`{"status": N, "type": "...", "message": "..."}`) |
 | GET | `/_control/history` | Cumulative (request, response, usage, cost, cache) history |

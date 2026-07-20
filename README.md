@@ -8,6 +8,7 @@ Use cases:
 
 - **Zero-cost debugging**: reproduce and inspect agent / orchestration behavior without hitting the real API.
 - **Deterministic testing**: inject arbitrary responses (text / tool_use, errors) to reproduce branches.
+- **Cross-provider bridge ([relay mode](#relay-mode-cross-provider-bridge))**: run an app written for one SDK against a *different* real provider (e.g. an Anthropic-SDK agent on Grok / GPT, or an OpenAI-SDK app on Claude) — without changing a line of app code.
 - **Cost estimates**: aggregate approximate tokens / pricing per request (`/_control/stats`).
 - **Pseudo prompt-cache observation**: verify by hash whether your app structures requests so `cache_control` actually takes effect (`/_control/cache`).
 
@@ -155,7 +156,11 @@ while true; do
 done
 ```
 
-Having an **AI agent "play the LLM" and respond faithfully** — rather than a human — is powerful. The instruction docs for that are [`responder/CLAUDE.md`](responder/CLAUDE.md) (for Claude Code) / [`responder/AGENTS.md`](responder/AGENTS.md) (for Codex CLI and other agents following the `AGENTS.md` convention). Both cover the core principle of staying neutral, multi-pending handling, the injection format, pitfalls, and JSON-escape traps (content is nearly identical; only the runtime assumptions differ).
+The responder can be any of three things — they all use the same control plane and can be swapped freely (even mid-session):
+
+1. **A human** with curl (as above).
+2. **An AI agent playing the LLM** (Claude Code / Codex reading the request and improvising a faithful response) — the instruction docs are [`responder/CLAUDE.md`](responder/CLAUDE.md) (for Claude Code) / [`responder/AGENTS.md`](responder/AGENTS.md) (for Codex CLI and other agents following the `AGENTS.md` convention). Both cover the core principle of staying neutral, multi-pending handling, the injection format, pitfalls, and JSON-escape traps (content is nearly identical; only the runtime assumptions differ).
+3. **The bundled relay** forwarding to a real API ([relay mode](#relay-mode-cross-provider-bridge) below).
 
 ### 4. Inject error responses to test handling
 
@@ -198,6 +203,36 @@ curl -s -X POST localhost:8765/_control/clear
 
 ---
 
+## Relay mode (cross-provider bridge)
+
+`python -m puppetllm.relay` is a bundled **automatic responder** that forwards every pending request to a **real** upstream API and injects the response back — turning puppetllm into a transparent cross-provider bridge. Your app keeps speaking its own SDK; the actual model behind it becomes swappable:
+
+```bash
+# An Anthropic-SDK app running on xAI Grok:
+python -m puppetllm.relay --target https://api.x.ai/v1 \
+    --api-key-env XAI_API_KEY --model grok-3
+
+# An OpenAI-SDK app running on real Claude:
+python -m puppetllm.relay --kind anthropic --model claude-sonnet-4-5
+
+# Per-model routing instead of a single forced model:
+python -m puppetllm.relay --model-map "claude-*=grok-3,gpt-*=grok-3-mini"
+
+# Relay only OpenAI-model requests; answer the rest by hand (concurrent, partitioned by model):
+python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
+```
+
+- `--kind openai` (default) speaks to **any OpenAI-compatible endpoint** — OpenAI, xAI Grok, Groq, Ollama, OpenRouter, … just point `--target` at its base URL. `--kind anthropic` speaks to the native Anthropic API.
+- Requests are translated from the canonical form (system / messages / tools / tool_choice / stop / temperature …); responses come back as canonical blocks with the **real `stop_reason` and real token usage** (via the `stop_reason` / `usage` fields of `/_control/respond`), so `/_control/stats` aggregates real numbers (history entries get `"usage_overridden": true`). When the upstream omits usage, puppetllm's approximation is kept instead.
+- For OpenAI reasoning / official gpt-5 endpoints that reject `max_tokens`, pass `--max-tokens-param max_completion_tokens`.
+- Upstream API errors are relayed with their status/type/message (and `code`/`param`), so your app's SDK raises the same exception class it would against the real provider.
+- The relay is *just another responder*. **By default it claims every pending it sees**, so it does not share a live queue with a human / AI-agent responder — the swap is sequential: stop the relay and take over by hand. To run them **concurrently**, use `--only "<glob>,…"` so the relay claims only the matching inbound models and leaves the rest for you (or another agent).
+- `--max-concurrency N` caps simultaneous in-flight upstream calls (default: unlimited), so a burst of pendings doesn't fan out and trip upstream rate limits.
+
+Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE but with first-token latency equal to the full upstream response time; multimodal (image) blocks are not translated; costs are **real** in this mode; `/_control/stats` prices tokens by the *inbound* model id, which may differ from the upstream model's actual pricing.
+
+---
+
 ## Control API (localhost only, no auth)
 
 | Method | Path | Description |
@@ -205,7 +240,7 @@ curl -s -X POST localhost:8765/_control/clear
 | GET  | `/_control/health` | Health check (`{"ok","turn_count"}`) |
 | GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`) |
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
-| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?}`) into a pending request. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route) |
+| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "usage"?}`) into a pending request. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route). `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]` — used by relay mode) |
 | POST | `/_control/auto` | Simple auto-response (`{"text":"...", "pending_id"?}`, text only) |
 | POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "pending_id"?}`) |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) history |
@@ -267,6 +302,7 @@ puppetllm/
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/*
 │   ├── cache_sim.py        # pseudo prompt cache
 │   ├── pricing.py          # approximate tokens + pricing
+│   ├── relay.py            # relay responder (cross-provider bridge to a real API)
 │   ├── providers/          # Bedrock / OpenAI adapters + AWS event stream
 │   └── tests/              # unit tests
 ├── responder/              # instruction docs for the responder (the agent that "plays the LLM")

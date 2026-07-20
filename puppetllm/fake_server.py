@@ -196,6 +196,7 @@ async def _record_and_reset(
     injected_error: dict[str, Any] | None = None,
     usage: dict[str, Any] | None = None,
     cost: dict[str, Any] | None = None,
+    usage_overridden: bool = False,
 ) -> None:
     """Append one entry to history and remove that pending from the registry.
 
@@ -217,6 +218,10 @@ async def _record_and_reset(
     }
     if injected_error is not None:
         entry["injected_error"] = injected_error
+    if usage_overridden:
+        # Real token counts were supplied via /_control/respond (e.g. relayed from an
+        # upstream API) instead of the approx tokenizer.
+        entry["usage_overridden"] = True
     pid = request_snapshot.get("pending_id")
     async with state.lock:
         # If clear ran first and the entry is already gone, don't append to history
@@ -373,8 +378,23 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dic
             if b.get("type") == "tool_use" and not b.get("id"):
                 b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
         usage, cost = _compute_usage(snapshot, content_blocks)
+        # Optional usage override from /_control/respond (validated there): real token
+        # counts, e.g. relayed from an upstream API. Partial overrides are allowed —
+        # provided keys replace the approx values; cost is recomputed from the result.
+        override = response_payload.get("usage")
+        usage_overridden = bool(override)
+        if usage_overridden:
+            usage.update(override)
+            cost = pricing.compute_cost(
+                model,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cache_write_tokens=usage["cache_creation_input_tokens"],
+                cache_read_tokens=usage["cache_read_input_tokens"],
+            )
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
-        await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage, cost=cost)
+        await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage,
+                                cost=cost, usage_overridden=usage_overridden)
         return {
             "kind": "ok",
             "content_blocks": content_blocks,
@@ -735,15 +755,25 @@ def _safe_set_result(
     return None
 
 
+_USAGE_OVERRIDE_KEYS = ("input_tokens", "output_tokens",
+                        "cache_creation_input_tokens", "cache_read_input_tokens")
+# Sane ceiling for an override token count (~1e12). Keeps cost math finite; far above any
+# real context window.
+_USAGE_MAX = 10 ** 12
+
+
 @app.post("/_control/respond")
 async def respond(request: Request) -> Any:
-    """Inject Body: `{"content": [<content_block>, ...], "pending_id"?, "stop_reason"?}`.
+    """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "usage"?}`.
 
     The content_block type is "text" | "tool_use". When `pending_id` is omitted, inject
     into the single pending if there is one (backward compatible). With multiple in-flight,
     `pending_id` is required. `stop_reason` (optional) overrides the auto-determination
     (e.g. "max_tokens" — for testing truncation branches; converted to finish_reason on
-    the OpenAI path).
+    the OpenAI path). `usage` (optional) overrides the approx token counts with real
+    ones — a dict with any subset of input_tokens / output_tokens /
+    cache_creation_input_tokens / cache_read_input_tokens as non-negative ints
+    (used by relay responders forwarding to a real API).
     """
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
@@ -758,10 +788,22 @@ async def respond(request: Request) -> Any:
     stop_reason = body.get("stop_reason")
     if stop_reason is not None and not isinstance(stop_reason, str):
         return _plain_400("stop_reason must be a string")
+    usage = body.get("usage")
+    if usage is not None:
+        # Upper bound guards downstream cost math: without it, huge ints overflow float()
+        # (int*float in pricing) or produce inf that then poisons /_control/stats JSON.
+        if not isinstance(usage, dict) or not usage or not all(
+            k in _USAGE_OVERRIDE_KEYS and type(v) is int and 0 <= v <= _USAGE_MAX
+            for k, v in usage.items()
+        ):
+            return _plain_400(
+                f"usage must be a non-empty object with integer values in [0, {_USAGE_MAX}] "
+                "for keys among: " + ", ".join(_USAGE_OVERRIDE_KEYS))
     fut, err = await _resolve_target_future(body.get("pending_id"))
     if err is not None:
         return err
-    err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason})
+    err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason,
+                                 "usage": usage})
     if err is not None:
         return err
     return {"ok": True}

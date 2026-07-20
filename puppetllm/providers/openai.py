@@ -163,6 +163,7 @@ _FINISH_REASON_MAP = {
     "tool_use": "tool_calls",
     "max_tokens": "length",
     "stop_sequence": "stop",
+    "refusal": "content_filter",
 }
 
 
