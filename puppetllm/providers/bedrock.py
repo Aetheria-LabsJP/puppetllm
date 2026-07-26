@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import eventstream
 
-# canonical core. ⚠ Beware circular import: fake_server imports this module at its end
+# canonical core. WARNING: circular import. fake_server imports this module at its end
 # and calls build_router(). Here we hold only a module reference; attributes like
 # `fs.register_request` must **always be resolved at call-time (inside the route
 # handler)** — touching fs.* at import time grabs a half-executed fake_server and

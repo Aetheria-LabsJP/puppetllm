@@ -82,6 +82,10 @@ The server can hold multiple concurrent requests (e.g. the caller fires several 
 
 Use each request's `system` / `messages` to identify "which agent this is" and return the correct response to each (beware of mix-ups).
 
+### Batch requests (Message Batches)
+
+Requests submitted through the Batches API (`/v1/messages/batches`) appear as **ordinary pendings** — one per `custom_id` — whose snapshots additionally carry `batch_id` and `custom_id`. Respond to them exactly as above; you may address them by `{"custom_id": "..."}` (plus `"batch_id"` if the same custom_id is unresolved in several batches) instead of `pending_id`. A batch of N arrives as N pendings at once, so the multi-pending rules apply. `canceled` / `expired` outcomes are injected by the operator via `/_control/batch/result` / `/_control/batch/end`, not by you.
+
 ## Principles for generating responses
 
 ### 1. Follow the system prompt

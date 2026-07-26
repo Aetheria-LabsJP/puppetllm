@@ -40,7 +40,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# canonical core. ⚠ Beware circular import (same constraint as providers/bedrock.py):
+# canonical core. WARNING: circular import (same constraint as providers/bedrock.py):
 # fake_server imports this module at its end and calls build_router(). Here we hold
 # only a module reference; attributes like `fs.register_request` must always be
 # resolved at call-time.

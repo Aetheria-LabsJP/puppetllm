@@ -23,6 +23,7 @@ provider 非依存の canonical core + アダプタ:
 - `puppetllm/fake_server.py` — canonical core（正規化 snapshot 管理 + `/_control/*` + cost/cache 計算）。Anthropic 経路 `POST /v1/messages` を内蔵
 - `puppetllm/providers/bedrock.py` — Bedrock 経路 `POST /model/{id}/invoke[-with-response-stream]`（AWS event stream フレーミングは `providers/eventstream.py`）
 - `puppetllm/providers/openai.py` — OpenAI 経路 `POST /v1/chat/completions`（リクエストは canonical（Anthropic 風）に正規化し、レスポンスは `chat.completion` JSON / SSE chunk に変換）
+- `puppetllm/batches.py` — Anthropic Message Batches 経路 `/v1/messages/batches*`（各 custom_id を通常の pending として保持。バッチのライフサイクルは `/_control/batch/*` から注入可能）
 - `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + 前方一致 + モデル別最小閾値 + 20-block lookback）
 - `puppetllm/pricing.py` — 概算トークン + 料金表（Claude / GPT 両ファミリ）
 
@@ -35,14 +36,14 @@ provider は **URL パスで自動判別**（モード切替・設定は不要�
 全体像は **3 つの登場人物**で考える:
 
 ```
-  ┌─── アプリ / SDK ───┐         ┌───── puppetllm ──────┐        ┌── responder ──┐
-  │ messages.create()  │ ──────▶ │ POST /v1/messages    │ ─────▶ │ 応答を注入    │
-  │ (応答までブロック) │ ◀────── │ (pending として保留) │ ◀───── │ /_control/... │
-  └────────────────────┘  応答   └──────────────────────┘        └───────────────┘
-         ①アプリ                   ②fake server (本体)           ③供給側 (人 or AI)
+  +--- アプリ / SDK ---+         +----- puppetllm ------+        +-- responder --+
+  | messages.create()  | ------> | POST /v1/messages    | -----> | 応答を注入    |
+  | (応答までブロック) | <------ | (pending として保留) | <----- | /_control/... |
+  +--------------------+  応答   +----------------------+        +---------------+
+        (1)アプリ                 (2)fake server (本体)        (3)供給側 (人 or AI)
 ```
 
-①が投げたリクエストを②が**保留 (pending)** し、③が `/_control/*` で応答を流し込むと、①の `create()` がその応答で返る。実 API は一切叩かない。
+(1) が投げたリクエストを (2) が**保留 (pending)** し、(3) が `/_control/*` で応答を流し込むと、(1) の `create()` がその応答で返る。実 API は一切叩かない。
 
 ### 1. proxy を起動する
 
@@ -201,6 +202,51 @@ curl -s -X POST localhost:8765/_control/clear
 
 `cache_savings_usd` は「キャッシュが効いた分、本物なら浮いたであろう概算額」。アプリが `cache_control` を正しい構造で投げられているかの検証に使う。（Anthropic / Bedrock 経路のみ — OpenAI 経路は常に cache status `"none"` で hit/miss カウンタも汚さない。）
 
+### 6. Message Batches API
+
+Anthropic Message Batches サーフェス（`/v1/messages/batches*`）も提供しているので、`client.messages.batches.create()` / `retrieve()` / `results()` / `cancel()` / `list()` / `delete()` がそのまま動く:
+
+```python
+batch = client.messages.batches.create(requests=[
+    {"custom_id": "r1", "params": {"model": "claude-sonnet-4-5", "max_tokens": 64,
+                                   "messages": [{"role": "user", "content": "hi"}]}},
+    {"custom_id": "r2", "params": {...}},
+])
+# "ended" までポーリングし、client.messages.batches.results(batch.id) をイテレート
+```
+
+各 `custom_id` は**通常の pending** になる（snapshot に `batch_id` / `custom_id` が追加で載る）。responder は同じ `/_control/respond` / `auto` / `error` で注入する — `pending_id` 指定のほか、`custom_id` 指定（同じ custom_id が複数バッチで未解決なら `batch_id` も併記）でも届く:
+
+```bash
+# r1 を成功、r2 をエラーに（custom_id 指定）
+curl -s -X POST localhost:8765/_control/respond \
+  -d '{"custom_id": "r1", "content": [{"type": "text", "text": "batch reply"}]}'
+curl -s -X POST localhost:8765/_control/error \
+  -d '{"custom_id": "r2", "status": 500, "type": "api_error", "message": "boom"}'
+```
+
+全 custom_id に結果が揃うとバッチは自動的に `ended` へ遷移する。ライフサイクルは制御 API からも操作できる:
+
+```bash
+curl -s localhost:8765/_control/batches            # レジストリ: 状態 / counts / 未解決 custom_id
+
+# respond/error では表現できない result type（canceled | expired）を個別注入
+curl -s -X POST localhost:8765/_control/batch/result \
+  -d '{"custom_id": "r2", "type": "expired"}'
+
+# 今すぐ強制 "ended"。未解決の custom_id は expired（または canceled）になる
+curl -s -X POST localhost:8765/_control/batch/end \
+  -d '{"batch_id": "msgbatch_...", "unresolved": "expired"}'
+```
+
+実 API との意図的な差分（忠実さより決定性）:
+
+- **時計による自動 expire はしない** — `expires_at`（作成 + 24h）は返すが、期限切れは `/_control/batch/end` / `/_control/batch/result` からの注入でのみ発生する。
+- **cancel は基本的に即時** — `POST .../cancel` は未解決の custom_id を全て `canceled` にし、通常はその場で `ended` のバッチを返す（実 API の非同期 `canceling` フェーズを省略）。その瞬間すでに注入が進行中（in-flight）だったエントリは、破棄されずに succeeded/errored として完了する（実 API でも処理中リクエストは cancel 後に完了しうる）。それが残っている間は `canceling` を返し、着地後に `ended` へ遷移する。
+- **コストには実 API 同様の 50% バッチ割引を適用** — history エントリに `"batch": true` と `cost.batch_discount = 0.5` が付き、`/_control/stats` は割引後の値を集計する。`canceled` / `expired` のエントリは history に記録しない（実 API 同様、課金対象外）。
+- 各リクエストの `params` は浅い検証のみ（params がオブジェクトであること・`stream: true` の拒否）。ただし外側の形式は実 API と同じ厳しさで検証する（`custom_id` は `^[a-zA-Z0-9_-]{1,64}$` かつ一意、リクエストは 100,000 件まで、list の `limit`/カーソルも検証）— 本番なら弾かれるアプリがここでは通ってしまう、という事態を防ぐため。浅い検証を通過しても処理段階で失敗する params（例: `messages` が list でない）は、作成全体をロールバックして 400 を返す — バッチも pending も history も残らない。
+- `results_url` は受信リクエストの Host から組み立てる。リバースプロキシ越しで使う場合は uvicorn を `--proxy-headers`（+ 適切な `FORWARDED_ALLOW_IPS`）付きで起動すること。
+
 ---
 
 ## relay モード（クロスプロバイダブリッジ）
@@ -246,7 +292,12 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴 |
 | GET  | `/_control/stats` | コスト目安・トークン・キャッシュの累計サマリ |
 | GET  | `/_control/cache` | 擬似プロンプトキャッシュ index |
-| POST | `/_control/clear` | pending / history / cache を空に（in-flight は 503 で解放） |
+| POST | `/_control/clear` | pending / history / cache / batches を空に（in-flight は 503 で解放） |
+| GET  | `/_control/batches` | バッチレジストリ（状態・request_counts・未解決 custom_id） |
+| POST | `/_control/batch/result` | 1 つの custom_id に `canceled` / `expired` を注入（`{"custom_id","type","batch_id"?}`） |
+| POST | `/_control/batch/end` | バッチを強制 `ended` に。未解決 custom_id は `expired`（既定）または `canceled` になる |
+
+`respond` / `auto` / `error` では、バッチのエントリを `pending_id` の代わりに `custom_id`（+ 任意で `batch_id`）で指定できる。
 
 ### 並列リクエスト（multi-pending）
 
@@ -287,7 +338,7 @@ docker compose --profile test run --rm proxy-test
 
 # または直接
 pip install -r requirements.txt
-python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions -v
+python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions puppetllm.tests.test_batches -v
 ```
 
 `puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。
@@ -300,6 +351,7 @@ python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_
 puppetllm/
 ├── puppetllm/              # パッケージ本体
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/*
+│   ├── batches.py          # Anthropic Message Batches 経路 + バッチ制御エンドポイント
 │   ├── cache_sim.py        # 擬似プロンプトキャッシュ
 │   ├── pricing.py          # 概算トークン + 料金
 │   ├── relay.py            # relay responder (実 API へのクロスプロバイダ・ブリッジ)

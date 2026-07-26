@@ -19,6 +19,7 @@ Implemented surface:
 - POST /v1/messages                  — Anthropic compatible (SSE / single JSON)
 - POST /model/{id}/invoke[...]        — Bedrock compatible (added by providers/bedrock.py)
 - POST /v1/chat/completions          — OpenAI compatible (added by providers/openai.py)
+- /v1/messages/batches[...]           — Anthropic Message Batches compatible (added by batches.py)
 - GET  /_control/pending             — pending requests (including provider)
 - GET  /_control/wait_for_pending    — long-poll until the next pending arrives
 - POST /_control/respond             — inject a response into a pending request
@@ -27,8 +28,9 @@ Implemented surface:
 - GET  /_control/history             — (request, response, usage, cost, cache) history
 - GET  /_control/stats               — cumulative summary of estimated cost, tokens, and cache
 - GET  /_control/cache               — pseudo prompt-cache index
-- POST /_control/clear               — empty pending/history/cache
+- POST /_control/clear               — empty pending/history/cache/batches
 - GET  /_control/health              — health check
+- GET  /_control/batches, POST /_control/batch/{end,result} — batch injection (added by batches.py)
 
 The control endpoints are localhost only (for debugging), with no authorization.
 """
@@ -94,6 +96,14 @@ class _ServerState:
         # pending, the dict just holds one entry.
         self.pending: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        # Message Batches (batches.py). batch_id → batch dict:
+        #   {"id", "created_at", "expires_at", "ended_at", "cancel_initiated_at",
+        #    "processing_status": "in_progress"|"canceling"|"ended",
+        #    "entries": {custom_id: {"pending_id", "result": None | {"type", ...}}}}
+        # Held here (not in batches.py) so that clear() wipes it atomically with pending,
+        # and so the control endpoints below can resolve custom_id → pending_id without
+        # a circular import.
+        self.batches: dict[str, dict[str, Any]] = {}
         self.turn_count: int = 0
         self.lock = asyncio.Lock()
         # The futures currently waiting in /_control/wait_for_pending.
@@ -156,6 +166,23 @@ def _new_request_id() -> str:
     return f"req_{uuid.uuid4().hex[:24]}"
 
 
+# The real Batches API bills all token usage at 50% of the standard price.
+_BATCH_DISCOUNT = 0.5
+
+
+def _apply_batch_discount(cost: dict[str, Any]) -> dict[str, Any]:
+    """Apply the Message Batches 50% discount to an estimated-cost dict (pricing.compute_cost).
+
+    Returns a new dict (does not mutate the input) with each USD field halved and a
+    `batch_discount` marker so history/stats readers can tell the discount was applied.
+    """
+    out = dict(cost)
+    for k in ("input_usd", "output_usd", "cache_write_usd", "cache_read_usd", "total_usd"):
+        out[k] = round(float(out.get(k, 0.0)) * _BATCH_DISCOUNT, 6)
+    out["batch_discount"] = _BATCH_DISCOUNT
+    return out
+
+
 # ── canonical: cost/cache computation ────────────────────────────────
 
 
@@ -197,6 +224,7 @@ async def _record_and_reset(
     usage: dict[str, Any] | None = None,
     cost: dict[str, Any] | None = None,
     usage_overridden: bool = False,
+    batch: bool = False,
 ) -> None:
     """Append one entry to history and remove that pending from the registry.
 
@@ -222,6 +250,9 @@ async def _record_and_reset(
         # Real token counts were supplied via /_control/respond (e.g. relayed from an
         # upstream API) instead of the approx tokenizer.
         entry["usage_overridden"] = True
+    if batch:
+        # Came in via the Message Batches route (cost carries the 50% discount).
+        entry["batch"] = True
     pid = request_snapshot.get("pending_id")
     async with state.lock:
         # If clear ran first and the entry is already gone, don't append to history
@@ -252,6 +283,7 @@ async def register_request(
     is_stream: bool,
     *,
     simulate_cache: bool = True,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], asyncio.Future]:
     """Build a normalized snapshot, register it as pending, and return a future to await the response.
 
@@ -262,6 +294,10 @@ async def register_request(
     With simulate_cache=False, pseudo-cache observation is skipped and cache is always
     "none" (for the OpenAI path: its caching is an automatic scheme rather than
     cache_control based, so it is not simulated).
+
+    `extra` is merged into the snapshot before it becomes visible to waiters — used by
+    the batches route to tag each pending with `batch_id` / `custom_id` so the responder
+    can tell which batch entry it is answering.
     """
     system = body.get("system")
     messages = body.get("messages", [])
@@ -300,6 +336,8 @@ async def register_request(
             "input_tokens_total": input_tokens_total,
             "cache": cache,
         }
+        if extra:
+            request_snapshot.update(extra)
         state.pending[pending_id] = {
             "request": request_snapshot,
             "future": fut,
@@ -326,14 +364,21 @@ def _discard_pending(snapshot: dict[str, Any]) -> None:
         state.pending.pop(pid, None)
 
 
-async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dict[str, Any]:
+async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
+                           *, is_batch: bool = False) -> dict[str, Any]:
     """Await the control-injected response, record it in history, and return the result as a tagged dict.
 
     The returned "kind":
       "cleared" → was /_control/clear'd (caller returns 503)
       "error"   → injected error ({"status", "type", "message", "code", "param"})
       "ok"      → success ({"content_blocks", "usage", "cost", "model", "message_id", "stop_reason"})
+      "batch_override" → a batch control endpoint (cancel / end / result) finalized this
+                  entry synchronously as canceled/expired ({"type"}); nothing was recorded
+                  in history (the real API doesn't bill unprocessed batch entries either)
     Provider-independent. Encoding is done by each provider.
+
+    is_batch=True (batches route): the estimated cost gets the 50% batch discount and the
+    history entry is tagged with `batch: true`.
 
     No path (cancel / unexpected exception) leaves a pending entry behind — if it did, a
     responder in a long-poll would forever keep seeing an unresolvable pending and spin.
@@ -350,6 +395,11 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dic
 
     try:
         model = snapshot.get("model")
+        if isinstance(response_payload, dict) and response_payload.get("_batch_override"):
+            # Batch control finalized this custom_id (canceled/expired) synchronously and
+            # already popped the pending — the discard here is a no-op safety net.
+            _discard_pending(snapshot)
+            return {"kind": "batch_override", "type": response_payload["_batch_override"]}
         if isinstance(response_payload, dict) and response_payload.get("_inject_error"):
             status = int(response_payload.get("status", 500))
             etype = str(response_payload.get("type", "api_error"))
@@ -357,6 +407,7 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dic
             await _record_and_reset(
                 snapshot, response_blocks=None,
                 injected_error={"status": status, "type": etype, "message": emsg},
+                batch=is_batch,
             )
             return {"kind": "error", "status": status, "type": etype, "message": emsg,
                     "code": response_payload.get("code"),
@@ -392,9 +443,11 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future) -> dic
                 cache_write_tokens=usage["cache_creation_input_tokens"],
                 cache_read_tokens=usage["cache_read_input_tokens"],
             )
+        if is_batch:
+            cost = _apply_batch_discount(cost)
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
         await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage,
-                                cost=cost, usage_overridden=usage_overridden)
+                                cost=cost, usage_overridden=usage_overridden, batch=is_batch)
         return {
             "kind": "ok",
             "content_blocks": content_blocks,
@@ -715,15 +768,65 @@ async def wait_for_pending(timeout: float = _WAIT_TIMEOUT_DEFAULT) -> dict[str, 
     }
 
 
+def _pending_for_custom_id(
+    batch_id: str | None, custom_id: str,
+) -> tuple[str | None, JSONResponse | None]:
+    """Resolve batch_id (optional) + custom_id → pending_id. Call within the lock.
+
+    With batch_id omitted, the custom_id must be unresolved in exactly one batch
+    (mirrors the pending_id-omitted convention: ambiguity → 400 listing candidates).
+    Batches still being created ARE addressable here on purpose: injecting a
+    response while registration is still running is safe (auto-end is suppressed
+    by the `creating` flag until the create call finishes).
+    """
+    if batch_id is not None:
+        batch = state.batches.get(batch_id)
+        if batch is None:
+            return None, _plain_400(f"unknown batch_id: {batch_id}")
+        entry = batch["entries"].get(custom_id)
+        if entry is None:
+            return None, _plain_400(f"no custom_id={custom_id} in batch {batch_id}")
+        if entry["result"] is not None:
+            return None, _plain_400(f"custom_id={custom_id} already resolved in batch {batch_id}")
+        return entry["pending_id"], None
+    matches = [b for b in state.batches.values()
+               if custom_id in b["entries"] and b["entries"][custom_id]["result"] is None]
+    if not matches:
+        return None, _plain_400(f"no unresolved custom_id={custom_id} in any batch")
+    if len(matches) > 1:
+        return None, JSONResponse(
+            {"error": f"custom_id={custom_id} is unresolved in multiple batches; specify batch_id",
+             "batch_ids": [b["id"] for b in matches]},
+            status_code=400,
+        )
+    return matches[0]["entries"][custom_id]["pending_id"], None
+
+
 async def _resolve_target_future(
     pending_id: str | None,
+    custom_id: str | None = None,
+    batch_id: str | None = None,
 ) -> tuple[asyncio.Future[dict[str, Any]] | None, JSONResponse | None]:
     """Resolve the target pending future for injection (multi-pending).
 
     - `pending_id` given: use that entry (400 if it doesn't exist)
+    - `custom_id` given (batches): resolve via the batch registry (batch_id optional
+      when the custom_id is unambiguous). `pending_id` wins if both are given.
     - unspecified: if there is exactly 1 pending, use it (backward compatible). 0 → 400, multiple → 400
     """
+    # Type guards: a non-string id (e.g. a dict from a malformed injection payload)
+    # would raise on dict lookup and turn into an opaque 500.
+    if pending_id is not None and not isinstance(pending_id, str):
+        return None, _plain_400("pending_id must be a string")
+    if custom_id is not None and not isinstance(custom_id, str):
+        return None, _plain_400("custom_id must be a string")
+    if batch_id is not None and not isinstance(batch_id, str):
+        return None, _plain_400("batch_id must be a string")
     async with state.lock:
+        if pending_id is None and custom_id is not None:
+            pending_id, err = _pending_for_custom_id(batch_id, custom_id)
+            if err is not None:
+                return None, err
         if pending_id is not None:
             entry = state.pending.get(pending_id)
             if entry is None or entry["future"].done():
@@ -768,7 +871,9 @@ async def respond(request: Request) -> Any:
 
     The content_block type is "text" | "tool_use". When `pending_id` is omitted, inject
     into the single pending if there is one (backward compatible). With multiple in-flight,
-    `pending_id` is required. `stop_reason` (optional) overrides the auto-determination
+    `pending_id` is required — or, for batch entries, address by `custom_id` (+ optional
+    `batch_id` when the custom_id appears in several batches).
+    `stop_reason` (optional) overrides the auto-determination
     (e.g. "max_tokens" — for testing truncation branches; converted to finish_reason on
     the OpenAI path). `usage` (optional) overrides the approx token counts with real
     ones — a dict with any subset of input_tokens / output_tokens /
@@ -799,7 +904,8 @@ async def respond(request: Request) -> Any:
             return _plain_400(
                 f"usage must be a non-empty object with integer values in [0, {_USAGE_MAX}] "
                 "for keys among: " + ", ".join(_USAGE_OVERRIDE_KEYS))
-    fut, err = await _resolve_target_future(body.get("pending_id"))
+    fut, err = await _resolve_target_future(body.get("pending_id"),
+                                            body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
     err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason,
@@ -811,11 +917,15 @@ async def respond(request: Request) -> Any:
 
 @app.post("/_control/auto")
 async def auto(request: Request) -> Any:
-    """Simple: inject `{"text": "...", "pending_id"?: "..."}` as a text-only response."""
+    """Simple: inject `{"text": "...", "pending_id"?: "..."}` as a text-only response.
+
+    Batch entries can also be addressed with `custom_id` (+ optional `batch_id`).
+    """
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         return _plain_400(errmsg)
-    fut, err = await _resolve_target_future(body.get("pending_id"))
+    fut, err = await _resolve_target_future(body.get("pending_id"),
+                                            body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
     err = _safe_set_result(fut, {
@@ -845,7 +955,8 @@ async def inject_error(request: Request) -> Any:
         return _plain_400("status must be an integer")
     if not (100 <= status <= 599):
         return _plain_400("status must be in [100, 599]")
-    fut, err = await _resolve_target_future(body.get("pending_id"))
+    fut, err = await _resolve_target_future(body.get("pending_id"),
+                                            body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
     err = _safe_set_result(fut, {
@@ -908,7 +1019,11 @@ async def stats() -> dict[str, Any]:
         totals["total_usd"] += float(cost.get("total_usd", 0.0))
 
         read = int(usage.get("cache_read_input_tokens", 0))
-        totals["cache_savings_usd"] += pricing.cache_savings_usd(model, read)
+        # Batch entries are billed at 50%, so the amount a cache hit saved is halved
+        # too — otherwise savings would be overstated for batch traffic (the discount
+        # factor is recorded on the entry's cost by _apply_batch_discount).
+        savings_factor = float(cost.get("batch_discount", 1.0))
+        totals["cache_savings_usd"] += pricing.cache_savings_usd(model, read) * savings_factor
 
         cstatus = cache.get("status")
         if cstatus == "hit":
@@ -970,6 +1085,9 @@ async def clear() -> dict[str, Any]:
         state.history.clear()
         state.turn_count = 0
         state.cache.reset()
+        # Batch registry too: the collector tasks awaiting the cancelled futures see
+        # kind "cleared" and return without touching the (now gone) batch objects.
+        state.batches.clear()
     return {"ok": True}
 
 
@@ -980,9 +1098,11 @@ async def clear() -> dict[str, Any]:
 
 from .providers import bedrock as _bedrock  # noqa: E402
 from .providers import openai as _openai  # noqa: E402
+from . import batches as _batches  # noqa: E402
 
 app.include_router(_bedrock.build_router())
 app.include_router(_openai.build_router())
+app.include_router(_batches.build_router())
 
 
 # ── Stand-alone startup ──────────────────────────────────────────────

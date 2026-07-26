@@ -39,5 +39,6 @@ services:
     working_dir: /app
     command: ["python3", "-m", "unittest",
               "puppetllm.tests.test_fake_server",
-              "puppetllm.tests.test_proxy_extensions", "-v"]
+              "puppetllm.tests.test_proxy_extensions",
+              "puppetllm.tests.test_batches", "-v"]
     restart: "no"
