@@ -21,11 +21,11 @@ Anthropic Messages API / Bedrock / OpenAI Chat Completions 互換の **fake serv
 provider 非依存の canonical core + アダプタ:
 
 - `puppetllm/fake_server.py` — canonical core（正規化 snapshot 管理 + `/_control/*` + cost/cache 計算）。Anthropic 経路 `POST /v1/messages` を内蔵
-- `puppetllm/providers/bedrock.py` — Bedrock 経路 `POST /model/{id}/invoke[-with-response-stream]`（AWS event stream フレーミングは `providers/eventstream.py`）
+- `puppetllm/providers/bedrock.py` — Bedrock 経路 `POST /model/{id}/invoke[-with-response-stream]`（モデル ID 正規化・`anthropic_version` 検証・AWS 形式のエラー / ヘッダ。AWS event stream フレーミングは `providers/eventstream.py`）
 - `puppetllm/providers/openai.py` — OpenAI 経路 `POST /v1/chat/completions`（リクエストは canonical（Anthropic 風）に正規化し、レスポンスは `chat.completion` JSON / SSE chunk に変換）
 - `puppetllm/batches.py` — Anthropic Message Batches 経路 `/v1/messages/batches*`（各 custom_id を通常の pending として保持。バッチのライフサイクルは `/_control/batch/*` から注入可能）
-- `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + 前方一致 + モデル別最小閾値 + 20-block lookback）
-- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude / GPT 両ファミリ）
+- `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + トップレベル `cache_control` の自動キャッシュ + 前方一致 + 世代別最小閾値 + 5m / 1h TTL + 20-block lookback + effort / thinking / tool_choice による無効化）
+- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude は Fable / Mythos / Sonnet 5 / Opus 4.1 を含む世代別、GPT / o 系ファミリ。公式料金ページに準拠）
 
 provider は **URL パスで自動判別**（モード切替・設定は不要）。応答 content blocks / 制御 API は provider 共通（注入は同じ `/_control/respond`）。
 
@@ -101,6 +101,15 @@ msg = client.messages.create(
 
 SigV4 署名のため bedrock extra が必要: `pip install 'anthropic[bedrock]'`。AWS クレデンシャルはダミーで良い（proxy は署名を検証しない）が、SDK が署名を作るために何かしらは必要。model は URL パス (`/model/{id}/invoke`) に入り、streaming は AWS event stream で返る — どちらも server が吸収する。**応答の注入方法は Anthropic 経路と完全に同じ**（下記 `/_control/respond` をそのまま使う）。
 
+Bedrock 経路固有の挙動（すべて URL パスから判定。モード切替は不要）:
+
+- **モデル ID の正規化**: `anthropic.claude-haiku-4-5-20251001-v1:0`、サフィックスなしの現行 ID（`anthropic.claude-opus-5`）、クロスリージョン推論プロファイル（`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … プレフィックス）、foundation-model / inference-profile の ARN（`aws` / `aws-cn` / `aws-us-gov` の全パーティション）を Anthropic 側の名前（`claude-haiku-4-5-20251001`）にマップする。pending snapshot の `model`・応答の `model` フィールド・`/_control/stats` の `by_model` はこの正規名を使うので、同じモデルの Bedrock 経由と Anthropic 直の呼び出しが 1 行に合流し、relay の `--model-map` / `--only` の glob も `claude-*` でマッチする。生の ID は snapshot / history エントリの `bedrock_model_id` に保持する。`anthropic.` セグメントを含まない ID はそのまま素通しする。
+- **`anthropic_version` を検証する**（Anthropic モデル ID のみ）: 欠落、または `bedrock-2023-05-31` 以外の値は受付時点で `400 ValidationException` として弾く（pending は作られない）— 自前実装クライアントのミスを早期に検出する。他ベンダーの ID（`meta.llama…`、`amazon.titan…`）はボディ形式が異なるため検証せず素通しする。不正な `cache_control` 配置（§5 参照）も同じ形で弾く。
+- **SigV4 は検証しない**: `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` は無視する。
+- **レスポンスヘッダ**: 非ストリーミング応答には `X-Amzn-Bedrock-Input-Token-Count`（Converse の `inputTokens` と同様、非キャッシュ分のみ）/ `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency`（+ `x-amzn-requestid`、`X-Amzn-Bedrock-Service-Tier`）を付与する。ストリーミングは実 Bedrock と同様に最終チャンクの `amazon-bedrock-invocationMetrics`（`cacheReadInputTokenCount` / `cacheWriteInputTokenCount` 込み）に載せ、`X-Amzn-Bedrock-Content-Type` を付ける。
+- **`AnthropicBedrockMantle` 向け Messages API エイリアス**: `POST /anthropic/v1/messages`（`bedrock-runtime` / `bedrock-mantle` ホストが提供するパス）は Bedrock モデル ID 正規化付きの Anthropic ハンドラで、さらに素の `/v1/messages` 経路も `model` が Bedrock 形式（`[region.]anthropic.…` / ARN）なら同じハンドラに渡すため、`AnthropicBedrockMantle(base_url="http://localhost:8765")` はルート直下でも `/anthropic` 付きでも動く（SSE ストリーミング、Anthropic エラー形式、`anthropic-version` ヘッダ、ボディに `anthropic_version` なし）。Batches / count_tokens はこのエイリアスでは提供しない（Bedrock と同じ）。
+- **受信ログ**: Bedrock 経路のリクエスト（および拒否）は 1 件ごとに stderr へ `[bedrock] invoke model=<raw> -> <canonical> pending=<id> …` の 1 行を出すので、他経路との区別が一目でつく。
+
 **OpenAI SDK (`openai`):**
 
 ```python
@@ -140,6 +149,8 @@ curl -s -X POST localhost:8765/_control/respond \
       ]}'
 ```
 
+注入できる content は `text` / `tool_use` のほか、`thinking`（`{"type":"thinking","thinking":"…","signature"?}` — signature 省略時は不透明な値を生成）と `redacted_thinking`（`{"data":"…"}`）も含められる。これらは応答に保持され、ストリームでは `thinking_delta` / `signature_delta` として流れ、`usage.output_tokens_details.thinking_tokens` に計上され、次ターンではそのまま送り返されることを期待する — 現行モデルが既定で返す形そのもの。`stop_reason` は公式語彙（`end_turn` / `max_tokens` / `stop_sequence` / `tool_use` / `pause_turn` / `refusal` / `model_context_window_exceeded`）を受け付け、`"refusal"` なら `stop_details`（`stop_details` を渡さなければ `{"type":"refusal","category":null,"explanation":null}`）、`"stop_sequence"` ならリクエストの `stop_sequences` から `stop_sequence` を埋める（明示指定も可）。
+
 `tool_use` を返すとアプリ側が実ツールを実行 → 結果が次の `messages.create()` に `tool_result` として積まれて再び pending になる。これを繰り返すことでマルチターン / ツール実行ループを丸ごと再現できる。
 
 **responder ループ（long-poll で待ち受ける運用）:**
@@ -166,6 +177,8 @@ responder は次の 3 択で、どれも同じ制御 API を使うため**自由
 ### 4. エラー応答を注入してハンドリングを試す
 
 分岐テスト用に、任意の HTTP エラーを pending に返させられる（Anthropic / Bedrock / OpenAI の 3 経路すべてで各 provider のエラー形式に変換される）。任意の `code` / `param` フィールドは OpenAI 経路で素通しされる（例 `"code": "rate_limit_exceeded"`）:
+
+Bedrock 経路ではボディが `{"message": "...", "__type": "<AwsException>"}` になり、`x-amzn-ErrorType` ヘッダが付く。`type` がすでに AWS の例外名（`Exception` で終わる）ならそのまま使い、そうでなければ `status` から導出する: 400 → `ValidationException`、401 → `UnrecognizedClientException`、403 → `AccessDeniedException`、404 → `ResourceNotFoundException`、408/504 → `ModelTimeoutException`、413 → `RequestEntityTooLargeException`、424 → `ModelErrorException`、429 → `ThrottlingException`、500 → `InternalServerException`、503 → `ServiceUnavailableException`、529 → `overloaded_error`（Bedrock は Anthropic の 529 をそのまま通す）— その他 4xx → `ValidationException`、その他 5xx → `InternalServerException`。それ以外は AWS の例外名を明示する（`ServiceQuotaExceededException` 400、`ModelNotReadyException` 429、`ModelStreamErrorException` 424）。つまり同じ `{"status": 429, "type": "rate_limit_error"}` の注入が、Bedrock クライアントには `ThrottlingException`、Anthropic クライアントには `rate_limit_error` として届く。
 
 ```bash
 # 429 → SDK が自動 retry する
@@ -201,6 +214,19 @@ curl -s -X POST localhost:8765/_control/clear
 ```
 
 `cache_savings_usd` は「キャッシュが効いた分、本物なら浮いたであろう概算額」。アプリが `cache_control` を正しい構造で投げられているかの検証に使う。（Anthropic / Bedrock 経路のみ — OpenAI 経路は常に cache status `"none"` で hit/miss カウンタも汚さない。）
+
+擬似キャッシュが再現する挙動（公式の prompt-caching ドキュメントに準拠）:
+
+- **配置**: ブロック単位の `cache_control`（最大 4 つ）と、**トップレベル** `cache_control`（自動キャッシュ: 最後のキャッシュ可能ブロックに 1 つ置く。`thinking` と空テキストは飛ばす）。前方一致の順序は `tools → system → messages`、マーカー自体はキーに含まない。
+- **最小キャッシュ長は世代別**: Fable 5 / 5.1、Mythos、Opus 5 = 512 トークン、Opus 4.8 = 1024、Opus 4.7 = 2048、Opus 4.6 / 4.5 = 4096、Opus 4.1 / 4 = 1024、Sonnet 全世代 = 1024、Haiku 4.5 = 4096、Haiku 3.5 = 2048。未満なら実 API 同様にエラーなしで `"none"` と観測する。
+- **TTL**: `{"type":"ephemeral"}` は 5 分、`{"type":"ephemeral","ttl":"1h"}` は 1 時間（テスト用に短縮するなら `PUPPETLLM_CACHE_TTL` / `PUPPETLLM_CACHE_TTL_1H`。read で延長）。書き込みは TTL 別に `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` に分けて報告し、単価は入力の 1.25x / 2x。
+- **無効化**: `output_config.effort`、`thinking`、`tool_choice` をターン間で変えると *messages* 側のプレフィックスが無効になる。`speed`（fast mode）の切り替えは system + messages を無効化し tools は生きる。これは公式の無効化表の意図的な簡略化で、公式表は thinking / effort について tools / system キャッシュを「モデル依存」（設定を system プロンプトより前に描画するモデルがある）としているが、puppetllm は messages のみとして扱う。明示の既定値は省略と同じ扱い: `effort: high`、`tool_choice: auto`（`disable_parallel_tool_use: false` 付きも同様）、モデルの既定 thinking モード（Opus 5 / Sonnet 5 / Fable / Mythos は `adaptive`、それ以前は `disabled`。`display: omitted`）。モデル変更は全無効。
+- **検証**: 実 API が拒否する配置はここでも `400 invalid_request_error`（pending は作られない）: 不正なマーカーや未知の `ttl`、明示ブレークポイント 5 個以上、`thinking` ブロック上のマーカー、5m ブレークポイントの後の 1h ブレークポイント、明示 4 個があるところへのトップレベル `cache_control`、最後のブロックの明示マーカーと食い違うトップレベル `ttl`。
+- **fast mode**: `speed: "fast"` は公式の 2 倍で課金し（Anthropic / Bedrock 経路のみ）、`usage.speed: "fast"` を返し、Anthropic 上流へはアプリの `anthropic-beta` ヘッダごと転送する（OpenAI 互換上流へは警告を出して落とす）。モデル / プラットフォームの対応可否は検証しない。
+- **lookback**: 各ブレークポイントは最大 20 ポジション遡る。連続する `tool_use`（または `tool_result`）ブロックの並びは 1 ポジションと数える。
+- **usage の形**: 2026 年の usage オブジェクト（`cache_creation`、`output_tokens_details.thinking_tokens`、`server_tool_use`、`service_tier`（`standard` / `batch`）、`inference_geo`、fast mode 要求時は `speed`）を返し、ストリームの `message_delta.usage` には実 API と同様に累積の input / cache 各値も載る。
+
+料金は公式の世代別表に従う（例: Opus 5 $5/$25、Sonnet 5 $2/$10、Sonnet 4.6 $3/$15、Haiku 4.5 $1/$5、Fable 5.1 $10/$50・cache read $0.25、Opus 4.1 $15/$75）。未知の Claude ID は Sonnet 4.x 価格、未知の `gpt-*` は gpt-5.4 価格にフォールバックする。
 
 ### 6. Message Batches API
 
@@ -244,7 +270,7 @@ curl -s -X POST localhost:8765/_control/batch/end \
 - **時計による自動 expire はしない** — `expires_at`（作成 + 24h）は返すが、期限切れは `/_control/batch/end` / `/_control/batch/result` からの注入でのみ発生する。
 - **cancel は基本的に即時** — `POST .../cancel` は未解決の custom_id を全て `canceled` にし、通常はその場で `ended` のバッチを返す（実 API の非同期 `canceling` フェーズを省略）。その瞬間すでに注入が進行中（in-flight）だったエントリは、破棄されずに succeeded/errored として完了する（実 API でも処理中リクエストは cancel 後に完了しうる）。それが残っている間は `canceling` を返し、着地後に `ended` へ遷移する。
 - **コストには実 API 同様の 50% バッチ割引を適用** — history エントリに `"batch": true` と `cost.batch_discount = 0.5` が付き、`/_control/stats` は割引後の値を集計する。`canceled` / `expired` のエントリは history に記録しない（実 API 同様、課金対象外）。
-- 各リクエストの `params` は浅い検証のみ（params がオブジェクトであること・`stream: true` の拒否）。ただし外側の形式は実 API と同じ厳しさで検証する（`custom_id` は `^[a-zA-Z0-9_-]{1,64}$` かつ一意、リクエストは 100,000 件まで、list の `limit`/カーソルも検証）— 本番なら弾かれるアプリがここでは通ってしまう、という事態を防ぐため。浅い検証を通過しても処理段階で失敗する params（例: `messages` が list でない）は、作成全体をロールバックして 400 を返す — バッチも pending も history も残らない。
+- 各リクエストの `params` は浅い検証のみ（params がオブジェクトであること。`stream: true`・`speed`（fast mode）・`max_tokens: 0` は実 API 同様に作成時点で拒否。`fallbacks` を含む項目は受理したうえでその項目だけ `errored` 結果になり、pending にはならない — これも実 API と同じ）。ただし外側の形式は実 API と同じ厳しさで検証する（`custom_id` は `^[a-zA-Z0-9_-]{1,64}$` かつ一意、リクエストは 100,000 件まで、list の `limit` は `[1, 1000]`、カーソルも検証）— 本番なら弾かれるアプリがここでは通ってしまう、という事態を防ぐため。浅い検証を通過しても処理段階で失敗する params（例: `messages` が list でない）は、作成全体をロールバックして 400 を返す — バッチも pending も history も残らない。
 - `results_url` は受信リクエストの Host から組み立てる。リバースプロキシ越しで使う場合は uvicorn を `--proxy-headers`（+ 適切な `FORWARDED_ALLOW_IPS`）付きで起動すること。
 
 ---
@@ -269,13 +295,14 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 ```
 
 - `--kind openai`（既定）は **OpenAI 互換の任意エンドポイント**に対応 — OpenAI / xAI Grok / Groq / Ollama / OpenRouter など、`--target` に base URL を向けるだけ。`--kind anthropic` は本家 Anthropic API。
-- リクエストは canonical（system / messages / tools / tool_choice / stop / temperature 等）から変換され、レスポンスは**実の `stop_reason` と実トークン usage** 込みで canonical blocks として戻る（`/_control/respond` の `stop_reason` / `usage` フィールドを使用）。`/_control/stats` は実数値を集計する（history エントリに `"usage_overridden": true`）。上流が usage を返さない場合は puppetllm の概算を維持する。
-- `max_tokens` を拒否する OpenAI reasoning / 公式 gpt-5 系エンドポイント向けには `--max-tokens-param max_completion_tokens` を指定する。
+- リクエストは canonical（system / messages / tools（`strict` と OpenAI の `custom` ツール込み）/ tool_choice / stop / temperature / seed / verbosity / prompt_cache_key / metadata 等。画像ブロック ↔ `image_url` パートは双方向に変換）から変換され、レスポンスは canonical blocks として戻る — 上流の実 signature 付き `thinking` ブロック、OpenAI の `refusal` はテキスト + `stop_reason: "refusal"` — **実の `stop_reason` / `stop_details` と実トークン usage** 込み（`/_control/respond` の `stop_reason` / `stop_details` / `usage` フィールドを使用。usage は `cache_creation` / `output_tokens_details` / `service_tier` のオブジェクトごと透過）。`/_control/stats` は実数値を集計する（history エントリに `"usage_overridden": true`）。上流が usage を返さない場合は puppetllm の概算を維持する。
+- 実 Anthropic 上流へは、OpenAI 形式で入った `response_format: json_schema` を `output_config.format` に、`reasoning_effort` を `output_config.effort`（`none` / `minimal` → `low`）に変換する。Anthropic 形式で入った `thinking` / `output_config` / `cache_control` / `inference_geo` / `speed` はそのまま転送し、アプリの `anthropic-beta` ヘッダ（`params.anthropic_beta` として捕捉）も Anthropic 上流へ再送するので、ベータ機能（fast mode、compaction など）が relay 越しでも動く。ベンダー固有の語彙は転送せず変換する: `service_tier`（`standard_only` ↔ `default`、`flex` / `priority` → `auto`）、Anthropic の `effort: max` → OpenAI の `reasoning_effort: xhigh`。`n` は転送しない（relay は 1 choice しか使わず、余分なサンプルは課金されるだけ）。puppetllm 内部の canonical キー（`_openai_custom`、`_openai_detail`）はどの wire にも出ない。変換できないパラメータは 1 回だけ警告して落とす。
+- `--max-tokens-param` の既定は `auto`: ターゲット URL のホスト名が正確に `api.openai.com` なら `max_completion_tokens`（そこでは `max_tokens` は非推奨で reasoning 系モデルに拒否される）、他の OpenAI 互換バックエンドには `max_tokens`。バックエンドが合わない場合は明示指定する。
 - 上流 API のエラーは status/type/message（および `code`/`param`）ごと中継されるので、アプリの SDK は実プロバイダ相手と同じ例外クラスを送出する。
 - relay は*あくまで responder の一種*。**既定では見えた pending を全て掴む**ため、人間 / AI エージェント responder とはライブなキューを共有しない（切替は逐次的: relay を止めて手動に引き継ぐ）。**並行**させたい場合は `--only "<glob>,…"` を使い、マッチする inbound モデルだけを掴ませて残りを人間（や別エージェント）に委ねる。
 - `--max-concurrency N` で同時 in-flight な上流呼び出し数を上限化（既定: 無制限）。pending がバーストしても一気にファンアウトして上流のレート制限を踏まない。
 
-注意: 上流呼び出しは非ストリーミングのため、ストリーミングアプリの SSE は正しく動くが最初のトークンまでの遅延が上流の完全応答時間になる。マルチモーダル（画像）ブロックは未変換。このモードは**実課金**が発生する。`/_control/stats` の料金換算は*受信側* model id 基準なので、上流モデルの実際の価格とはずれうる。
+注意: 上流呼び出しは非ストリーミングのため、ストリーミングアプリの SSE は正しく動くが最初のトークンまでの遅延が上流の完全応答時間になる。音声 / ファイルパートと `document` ブロックは未変換（画像は変換する）。このモードは**実課金**が発生する。`/_control/stats` の料金換算は*受信側* model id 基準なので、上流モデルの実際の価格とはずれうる。
 
 ---
 
@@ -286,18 +313,20 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | GET  | `/_control/health` | ヘルスチェック（`{"ok","turn_count"}`） |
 | GET  | `/_control/pending` | 保留中リクエスト一覧（`pending[]` + provider 込み、最古は `request` にも） |
 | GET  | `/_control/wait_for_pending?timeout=N` | 次の pending を long-poll で待つ（既定 270s / 上限 600s。なければ `{"timeout":true}`） |
-| POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "usage"?}`）を注入。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int — relay モードが使用） |
+| POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`）を注入。`content` のブロックは `text` / `tool_use` / `thinking` / `redacted_thinking`。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`"refusal"` なら `stop_details` を生成（`stop_details` で `category` / `explanation` を指定可。`recommended_model` などの追加フィールドは素通し）し、OpenAI 経路では OpenAI の refusal 形式（`message.refusal` / `delta.refusal`、`content: null`、`finish_reason: "stop"`）になる。`"stop_sequence"` なら `stop_sequence` を埋める。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int。加えて `cache_creation` / `output_tokens_details` / `server_tool_use` のオブジェクトと `service_tier` / `inference_geo` / `speed` の文字列も任意 — relay モードが使用） |
 | POST | `/_control/auto` | 簡易自動応答（`{"text":"...", "pending_id"?}`、text のみ） |
-| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "pending_id"?}`） |
+| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?}`）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等） |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴 |
 | GET  | `/_control/stats` | コスト目安・トークン・キャッシュの累計サマリ |
 | GET  | `/_control/cache` | 擬似プロンプトキャッシュ index |
-| POST | `/_control/clear` | pending / history / cache / batches を空に（in-flight は 503 で解放） |
+| POST | `/_control/clear` | pending / history / cache / batches を空に（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503） |
 | GET  | `/_control/batches` | バッチレジストリ（状態・request_counts・未解決 custom_id） |
 | POST | `/_control/batch/result` | 1 つの custom_id に `canceled` / `expired` を注入（`{"custom_id","type","batch_id"?}`） |
 | POST | `/_control/batch/end` | バッチを強制 `ended` に。未解決 custom_id は `expired`（既定）または `canceled` になる |
 
 `respond` / `auto` / `error` では、バッチのエントリを `pending_id` の代わりに `custom_id`（+ 任意で `batch_id`）で指定できる。
+
+以前のバージョンから変わった観測可能な挙動（旧値を前提にしたアプリやテストハーネスは更新が必要）: 処理中に clear されたリクエストは Anthropic / Bedrock-Messages 経路で `529 overloaded_error`（旧 `503 api_error`）。OpenAI 経路のエラー `type` は OpenAI 語彙（`server_error`、`service_unavailable_error` 等。旧 `api_error` / `service_unavailable`）。canonical の `refusal` は OpenAI の `message.refusal` + `finish_reason: "stop"` になる（旧 `finish_reason: "content_filter"`。フィルタ形式が欲しければ `stop_reason` に `"content_filter"` を渡す）。Bedrock の pending / 応答は正規化した Anthropic モデル名を持つ。`thinking` ブロックは捨てずに保持する。OpenAI の usage は `n` 個の choice すべてを計上し（応答・history・stats で一致。該当する pending の snapshot には `choices` フィールドが載る）、明示された `service_tier` を返す。`inference_geo: "us"` のリクエストには公式の 1.1 倍を課金に適用する。
 
 ### 並列リクエスト（multi-pending）
 
@@ -324,9 +353,10 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 
 | 変数 | 既定 | 説明 |
 |---|---|---|
-| `PUPPETLLM_CACHE_TTL` | `300` | 擬似キャッシュ TTL（秒） |
+| `PUPPETLLM_CACHE_TTL` | `300` | 5 分ブレークポイントの擬似キャッシュ TTL（秒） |
+| `PUPPETLLM_CACHE_TTL_1H` | `PUPPETLLM_CACHE_TTL` × 12 | `ttl: "1h"` ブレークポイントの TTL（秒）。未設定なら 3600 で、5m 側の TTL に連動する |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` で TTL を無視（常に生存） |
-| `PUPPETLLM_CACHE_MIN_TOKENS` | （モデル別） | 最小キャッシュ閾値の上書き。`0` で無効（全 prefix キャッシュ）。未設定は Opus 4096 / Sonnet 1024 / Haiku 4096 |
+| `PUPPETLLM_CACHE_MIN_TOKENS` | （モデル別） | 最小キャッシュ閾値の上書き。`0` で無効（全 prefix キャッシュ）。未設定は世代別テーブル（Opus 5 / Fable 512、Opus 4.8 1024、Opus 4.7 2048、Opus 4.6 / 4.5 4096、Sonnet 1024、Haiku 4.5 4096 …） |
 
 ---
 
@@ -338,7 +368,7 @@ docker compose --profile test run --rm proxy-test
 
 # または直接
 pip install -r requirements.txt
-python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions puppetllm.tests.test_batches -v
+python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions puppetllm.tests.test_batches puppetllm.tests.test_conformance -v
 ```
 
 `puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。
@@ -355,6 +385,7 @@ puppetllm/
 │   ├── cache_sim.py        # 擬似プロンプトキャッシュ
 │   ├── pricing.py          # 概算トークン + 料金
 │   ├── relay.py            # relay responder (実 API へのクロスプロバイダ・ブリッジ)
+│   ├── openai_wire.py      # OpenAI ↔ canonical の純粋変換（アダプタと relay が共用）
 │   ├── providers/          # Bedrock / OpenAI アダプタ + AWS event stream
 │   └── tests/              # 単体テスト
 ├── responder/              # responder (LLM のフリをするエージェント) 向け指示書

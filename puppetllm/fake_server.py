@@ -50,7 +50,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import pricing
-from .cache_sim import CacheSimulator, analyze_request
+from .cache_sim import CacheControlError, CacheSimulator, analyze_request
+from .openai_wire import strip_private
+
+
+class RequestValidationError(ValueError):
+    """A request the real API rejects with 400 invalid_request_error (raised by
+    register_request; each route encodes it in its own error envelope)."""
 
 
 # ── Configuration (environment variables) ─────────────────────────────
@@ -70,6 +76,10 @@ def _parse_cache_ttl(v: str | None) -> float:
 
 
 _CACHE_TTL = _parse_cache_ttl(os.environ.get("PUPPETLLM_CACHE_TTL"))
+# 1-hour breakpoints: explicit override, else 12x the 5-minute TTL (so shortening
+# PUPPETLLM_CACHE_TTL for tests scales both kinds).
+_CACHE_TTL_1H = (_parse_cache_ttl(os.environ.get("PUPPETLLM_CACHE_TTL_1H"))
+                 if os.environ.get("PUPPETLLM_CACHE_TTL_1H") else _CACHE_TTL * 12)
 _CACHE_HONOR_TTL = os.environ.get("PUPPETLLM_CACHE_HONOR_TTL", "1") != "0"
 # Minimum cacheable threshold. Unset/invalid/negative = per-model (Opus 4096/Sonnet 1024 etc.). `0` disables it (cache all prefixes).
 def _parse_cache_min(v: str | None) -> int | None:
@@ -110,7 +120,8 @@ class _ServerState:
         self.pending_arrival_waiters: list[asyncio.Future[dict[str, Any]]] = []
         # Pseudo prompt cache (prefix hash → hit/miss).
         self.cache = CacheSimulator(ttl_seconds=_CACHE_TTL, honor_ttl=_CACHE_HONOR_TTL,
-                                    min_cacheable_tokens=_CACHE_MIN_TOKENS)
+                                    min_cacheable_tokens=_CACHE_MIN_TOKENS,
+                                    ttl_1h_seconds=_CACHE_TTL_1H)
 
     def _oldest_pending(self) -> dict[str, Any] | None:
         """Return the **unresolved** pending entry with the oldest received_at (or None). Call within the lock.
@@ -154,10 +165,16 @@ def _plain_400(message: str) -> JSONResponse:
 
 
 def _anthropic_error(status: int, etype: str, message: str,
-                     headers: dict[str, str] | None = None) -> JSONResponse:
+                     headers: dict[str, str] | None = None,
+                     request_id: str | None = None) -> JSONResponse:
     """Anthropic's official error envelope (`{"type":"error","error":{...}}`)."""
+    # Every error carries a request id, in the body AND the `request-id` header (the real
+    # API does both on every route, batches included).
+    headers = dict(headers or {})
+    rid = request_id or headers.get("request-id") or _new_request_id()
+    headers.setdefault("request-id", rid)
     return JSONResponse(
-        {"type": "error", "error": {"type": etype, "message": message}},
+        {"type": "error", "error": {"type": etype, "message": message}, "request_id": rid},
         status_code=status, headers=headers,
     )
 
@@ -199,22 +216,92 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
     cache = snapshot.get("cache") or {}
     read = int(cache.get("cache_read_tokens", 0))
     creation = int(cache.get("cache_creation_tokens", 0))
+    creation_1h = int(cache.get("cache_creation_1h_tokens", 0))
+    creation_5m = int(cache.get("cache_creation_5m_tokens", creation - creation_1h))
     uncached = max(0, total_in - read - creation)
-    output = pricing.estimate_output_tokens(content_blocks)
+    # OpenAI `n`: the fake duplicates one generated answer into n choices, and the real API
+    # bills every choice — fold it into the canonical usage so wire, history and stats agree.
+    n = _choices(snapshot)
+    output = pricing.estimate_output_tokens(content_blocks) * n
+    geo, speed = _geo_and_speed(snapshot)
     cost = pricing.compute_cost(
         model,
         input_tokens=uncached,
         output_tokens=output,
-        cache_write_tokens=creation,
+        cache_write_tokens=creation_5m,
         cache_read_tokens=read,
+        cache_write_1h_tokens=creation_1h,
+        inference_geo=geo, speed=speed,
     )
     usage = {
         "input_tokens": uncached,
         "output_tokens": output,
         "cache_creation_input_tokens": creation,
         "cache_read_input_tokens": read,
+        # Real-API breakdown of cache writes by TTL.
+        "cache_creation": {"ephemeral_5m_input_tokens": creation_5m,
+                           "ephemeral_1h_input_tokens": creation_1h},
+        "output_tokens_details": {"thinking_tokens": _thinking_tokens(content_blocks) * n},
+        "server_tool_use": None,
+        "service_tier": "batch" if snapshot.get("batch_id") else "standard",
+        "inference_geo": geo or "global",
     }
+    if speed == "fast":
+        usage["speed"] = "fast"  # the real API reports the speed actually used
     return usage, cost
+
+
+def _choices(snapshot: dict[str, Any]) -> int:
+    try:
+        return max(1, int(snapshot.get("choices") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _geo_and_speed(snapshot: dict[str, Any]) -> tuple[str | None, str | None]:
+    params = snapshot.get("params") or {}
+    geo = params.get("inference_geo")
+    speed = params.get("speed")
+    if snapshot.get("provider") == "openai":
+        speed = None  # `speed` is not a Chat Completions parameter; never price it there
+    return (geo if isinstance(geo, str) else None,
+            speed if isinstance(speed, str) else None)
+
+
+def _thinking_tokens(content_blocks: list[dict[str, Any]]) -> int:
+    blocks = [b for b in content_blocks
+              if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")]
+    return pricing.approx_tokens(blocks) if blocks else 0
+
+
+# Usage keys that may carry an object (or null) rather than an int.
+_USAGE_OBJECT_KEYS = ("cache_creation", "output_tokens_details", "server_tool_use")
+_USAGE_SCALAR_KEYS = ("service_tier", "inference_geo", "speed")
+# Wire-format usage: only the fields the real API emits, in a stable order.
+_USAGE_WIRE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+                    "cache_creation", "output_tokens", "output_tokens_details",
+                    "server_tool_use", "service_tier", "inference_geo", "speed", "iterations")
+
+
+def _usage_wire(usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Project an internal usage dict onto the real API's usage object shape."""
+    if usage is None:
+        return {"input_tokens": 1, "output_tokens": 100,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    out: dict[str, Any] = {}
+    for k in _USAGE_WIRE_KEYS:
+        if k in usage:
+            out[k] = usage[k]
+    out.setdefault("input_tokens", 1)
+    out.setdefault("output_tokens", 0)
+    out.setdefault("cache_creation_input_tokens", 0)
+    out.setdefault("cache_read_input_tokens", 0)
+    out.setdefault("cache_creation", {"ephemeral_5m_input_tokens": out["cache_creation_input_tokens"],
+                                      "ephemeral_1h_input_tokens": 0})
+    out.setdefault("output_tokens_details", {"thinking_tokens": 0})
+    out.setdefault("server_tool_use", None)
+    out.setdefault("service_tier", "standard")
+    return out
 
 
 async def _record_and_reset(
@@ -270,9 +357,17 @@ async def _record_and_reset(
 # stop_sequences etc.). Unlike the main body (system/messages/tools/max_tokens), the
 # core does not interpret these — it just passes them through.
 _EXTRA_PARAM_KEYS: tuple[str, ...] = (
-    "tool_choice", "response_format", "temperature", "top_p", "top_k",
-    "stop_sequences", "stop", "thinking", "parallel_tool_calls", "n",
-    "metadata", "reasoning_effort", "service_tier",
+    # Anthropic Messages API (2026)
+    "tool_choice", "temperature", "top_p", "top_k", "stop_sequences", "thinking",
+    "output_config", "cache_control", "metadata", "service_tier", "inference_geo",
+    "container", "context_management", "fallbacks", "speed", "mcp_servers",
+    "anthropic_beta",
+    # OpenAI Chat Completions (also carried through the OpenAI route's normalization)
+    "response_format", "stop", "parallel_tool_calls", "n", "reasoning_effort",
+    "max_completion_tokens", "seed", "store", "prompt_cache_key", "safety_identifier",
+    "user", "logprobs", "top_logprobs", "frequency_penalty", "presence_penalty",
+    "logit_bias", "prediction", "web_search_options", "verbosity", "modalities",
+    "audio", "stream_options",
 )
 
 
@@ -284,6 +379,7 @@ async def register_request(
     *,
     simulate_cache: bool = True,
     extra: dict[str, Any] | None = None,
+    request_headers: Any = None,
 ) -> tuple[dict[str, Any], asyncio.Future]:
     """Build a normalized snapshot, register it as pending, and return a future to await the response.
 
@@ -302,8 +398,21 @@ async def register_request(
     system = body.get("system")
     messages = body.get("messages", [])
     tools = body.get("tools", [])
+    params = {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body}
+    # The `anthropic-beta` request header (Anthropic route) is surfaced like Bedrock's
+    # `anthropic_beta` body field so the responder can see which betas the app requested.
+    beta_header = request_headers.get("anthropic-beta") if request_headers is not None else None
+    if beta_header and "anthropic_beta" not in params:
+        params["anthropic_beta"] = [b.strip() for b in str(beta_header).split(",") if b.strip()]
     # Analysis with multi-breakpoint + prefix-match support (computes segments/breakpoints/total at once).
-    request_cache = analyze_request(system, tools, messages)
+    # Top-level cache_control (automatic caching) and prompt-rendered params (effort / thinking /
+    # tool_choice) are folded in exactly like the real API.
+    try:
+        request_cache = analyze_request(system, tools, messages,
+                                        top_level_cache_control=body.get("cache_control"),
+                                        params=params, model=model)
+    except CacheControlError as e:
+        raise RequestValidationError(str(e)) from e
     input_tokens_total = request_cache.total_tokens
     now = time.time()
 
@@ -316,6 +425,7 @@ async def register_request(
         else:
             # Same shape as observe()'s "none" (stats counts only hit/miss, so none is not aggregated)
             cache = {"status": "none", "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                     "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
                      "prefix_hash": None, "read_seg_count": 0,
                      "breakpoints": len(request_cache.breakpoints)}
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -328,9 +438,9 @@ async def register_request(
             "messages": messages,
             "tools": tools,
             "max_tokens": body.get("max_tokens"),
-            # Retain auxiliary parameters (tool_choice / response_format / temperature etc.) as pass-through.
+            # Retain auxiliary parameters (tool_choice / output_config / temperature etc.) as pass-through.
             # The responder can look at these and inject a response consistent with "constraints a real API would honor".
-            "params": {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body},
+            "params": params,
             "stream": is_stream,
             "received_at": now,
             "input_tokens_total": input_tokens_total,
@@ -369,7 +479,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
     """Await the control-injected response, record it in history, and return the result as a tagged dict.
 
     The returned "kind":
-      "cleared" → was /_control/clear'd (caller returns 503)
+      "cleared" → was /_control/clear'd (caller returns a retryable error: 529 overloaded_error
+                  on the Anthropic route, 503 on Bedrock / OpenAI)
       "error"   → injected error ({"status", "type", "message", "code", "param"})
       "ok"      → success ({"content_blocks", "usage", "cost", "model", "message_id", "stop_reason"})
       "batch_override" → a batch control endpoint (cancel / end / result) finalized this
@@ -411,23 +522,32 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             )
             return {"kind": "error", "status": status, "type": etype, "message": emsg,
                     "code": response_payload.get("code"),
-                    "param": response_payload.get("param")}
+                    "param": response_payload.get("param"),
+                    # Extra response headers requested by the injector (e.g. retry-after).
+                    "headers": response_payload.get("headers") or {}}
 
         content_blocks = response_payload.get("content") or []
         if not isinstance(content_blocks, list):
             content_blocks = []
-        # Keep only the block types puppetllm models (text / tool_use), dropping unknown
-        # ones (thinking, etc.) ONCE here — this is the single source of truth, so history,
-        # usage, and the encoded response (stream & non-stream, all providers) all agree.
-        # (The encoders also skip unknown blocks defensively, but this is what makes usage
-        # and /_control/history reflect exactly what the caller receives.)
+        # Keep only the block types puppetllm models (text / tool_use / thinking /
+        # redacted_thinking), dropping unknown ones ONCE here — this is the single source of
+        # truth, so history, usage, and the encoded response (stream & non-stream, all
+        # providers) all agree. (The encoders also skip unknown blocks defensively, but this
+        # is what makes usage and /_control/history reflect exactly what the caller receives.)
         content_blocks = [b for b in content_blocks
-                          if isinstance(b, dict) and b.get("type") in ("text", "tool_use")]
+                          if isinstance(b, dict) and b.get("type") in _MODELED_BLOCK_TYPES]
         # Assign ids for any tool_use missing one, all in one place (so stream / non-stream /
-        # all providers use the same id. Previously only stream generated one and non-stream passed through).
+        # all providers use the same id). Thinking blocks get a signature if missing (the real
+        # API always returns one; the SDK round-trips it verbatim).
         for b in content_blocks:
             if b.get("type") == "tool_use" and not b.get("id"):
                 b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
+            elif b.get("type") == "thinking":
+                b["thinking"] = "" if b.get("thinking") is None else str(b["thinking"])
+                if not b.get("signature"):
+                    b["signature"] = _fake_signature()
+            elif b.get("type") == "redacted_thinking":
+                b["data"] = "" if b.get("data") is None else str(b["data"])
         usage, cost = _compute_usage(snapshot, content_blocks)
         # Optional usage override from /_control/respond (validated there): real token
         # counts, e.g. relayed from an upstream API. Partial overrides are allowed —
@@ -435,13 +555,45 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         override = response_payload.get("usage")
         usage_overridden = bool(override)
         if usage_overridden:
+            override = dict(override)
+            n = _choices(snapshot)
+            if n > 1:
+                # The override describes ONE generated answer (a relay never forwards `n`);
+                # the fake hands out n copies, so bill n like the real API would. Only the
+                # overridden keys are scaled — the computed values are already n-folded.
+                if "output_tokens" in override:
+                    override["output_tokens"] = override["output_tokens"] * n
+                otd = override.get("output_tokens_details")
+                if isinstance(otd, dict) and isinstance(otd.get("thinking_tokens"), int):
+                    override["output_tokens_details"] = {
+                        **otd, "thinking_tokens": otd["thinking_tokens"] * n}
             usage.update(override)
+            # Real-API invariant: thinking_tokens <= output_tokens (an override of the total
+            # alone must not leave the computed thinking estimate above it).
+            otd = usage.get("output_tokens_details")
+            if isinstance(otd, dict) and isinstance(otd.get("thinking_tokens"), int) \
+                    and otd["thinking_tokens"] > usage["output_tokens"]:
+                usage["output_tokens_details"] = {**otd, "thinking_tokens": usage["output_tokens"]}
+            # The 5m/1h split follows the override when it carries one, is re-derived from
+            # the sim only when the total write count was NOT overridden, and otherwise
+            # defaults to "all 5m" (an overridden total with no breakdown).
+            if "cache_creation" not in override and "cache_creation_input_tokens" in override:
+                usage["cache_creation"] = {
+                    "ephemeral_5m_input_tokens": usage["cache_creation_input_tokens"],
+                    "ephemeral_1h_input_tokens": 0}
+            cc = usage.get("cache_creation")
+            creation_1h = int(cc.get("ephemeral_1h_input_tokens") or 0) if isinstance(cc, dict) else 0
+            geo = usage.get("inference_geo")
+            speed = usage.get("speed")
             cost = pricing.compute_cost(
                 model,
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
-                cache_write_tokens=usage["cache_creation_input_tokens"],
+                cache_write_tokens=max(0, usage["cache_creation_input_tokens"] - creation_1h),
                 cache_read_tokens=usage["cache_read_input_tokens"],
+                cache_write_1h_tokens=creation_1h,
+                inference_geo=geo if isinstance(geo, str) else None,
+                speed=speed if isinstance(speed, str) else None,
             )
         if is_batch:
             cost = _apply_batch_discount(cost)
@@ -458,6 +610,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             # stop_reason override specified by the responder via /_control/respond (None if absent
             # = each encoder auto-determines it from whether tool_use is present).
             "stop_reason": response_payload.get("stop_reason"),
+            "stop_sequence": response_payload.get("stop_sequence"),
+            "stop_details": response_payload.get("stop_details"),
         }
     except BaseException:
         # Unexpected error such as in usage computation: a 500 is returned, but the pending is always cleaned up.
@@ -466,6 +620,46 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
 
 
 # ── SSE / stream event construction helpers ──────────────────────────
+
+# Content block types the server models end-to-end (history / usage / encoders agree).
+_MODELED_BLOCK_TYPES = ("text", "tool_use", "thinking", "redacted_thinking")
+
+
+def _fake_signature() -> str:
+    # Opaque, base64-looking token — the real signature is a server-side MAC over the
+    # thinking text; apps must treat it as opaque and round-trip it verbatim.
+    return "sig_" + uuid.uuid4().hex + uuid.uuid4().hex
+
+
+def _resolve_stop(content_blocks: list[dict[str, Any]], stop_reason: str | None,
+                  stop_sequence: Any = None, stop_details: Any = None,
+                  params: dict[str, Any] | None = None) -> tuple[str, Any, Any]:
+    """Derive (stop_reason, stop_sequence, stop_details) with the real API's defaults:
+    tool_use when a tool_use block is present else end_turn; stop_sequence only when
+    stop_reason == stop_sequence (defaulting to the first configured one); stop_details
+    only on refusal (an object with null category/explanation when not supplied)."""
+    if stop_reason is None:
+        stop_reason = "tool_use" if any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks
+        ) else "end_turn"
+    if stop_reason == "stop_sequence":
+        if stop_sequence is None:
+            seqs = (params or {}).get("stop_sequences") or (params or {}).get("stop")
+            if isinstance(seqs, str):
+                stop_sequence = seqs
+            elif isinstance(seqs, list) and seqs:
+                stop_sequence = seqs[0]
+    else:
+        stop_sequence = None
+    if stop_reason == "refusal":
+        # Documented fields are guaranteed present; extra fields a relay forwards from a real
+        # refusal (recommended_model, fallback_credit_token, ...) pass through untouched.
+        base = {"type": "refusal", "category": None, "explanation": None}
+        stop_details = {**base, **(stop_details if isinstance(stop_details, dict) else {}),
+                        "type": "refusal"}
+    else:
+        stop_details = None
+    return stop_reason, stop_sequence, stop_details
 
 
 def _sse_event(event_name: str, data: dict[str, Any]) -> bytes:
@@ -478,6 +672,9 @@ def stream_event_dicts(
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
     stop_reason: str | None = None,
+    stop_sequence: Any = None,
+    stop_details: Any = None,
+    params: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Build the (event_name, data) sequence for the Anthropic streaming protocol.
 
@@ -487,18 +684,15 @@ def stream_event_dicts(
     whether tool_use is present), useful for testing branches like max_tokens.
     """
     # If usage was provided, use the real (estimated) values; otherwise the legacy fake values.
-    if usage is not None:
-        start_usage = {
-            "input_tokens": usage.get("input_tokens", 1),
-            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-            # At message_start no output has been generated yet. The cumulative output is returned on the message_delta side.
-            "output_tokens": 0,
-        }
-        delta_usage = {"output_tokens": usage.get("output_tokens", 0)}
-    else:
-        start_usage = {"input_tokens": 1, "output_tokens": 1}
-        delta_usage = {"output_tokens": 100}
+    # message_start carries the input side with output_tokens = 1 (the real API reports a
+    # non-zero value even for an empty response); message_delta carries the CUMULATIVE usage
+    # (the real API repeats input / cache counts there too).
+    final_usage = _usage_wire(usage)
+    start_usage = dict(final_usage)
+    start_usage["output_tokens"] = 1
+    delta_usage = dict(final_usage)
+    stop_reason, stop_sequence, stop_details = _resolve_stop(
+        content_blocks, stop_reason, stop_sequence, stop_details, params)
 
     out: list[tuple[str, dict[str, Any]]] = []
     out.append(("message_start", {
@@ -511,11 +705,11 @@ def stream_event_dicts(
             "model": model,
             "stop_reason": None,
             "stop_sequence": None,
+            "stop_details": None,
             "usage": start_usage,
         },
     }))
 
-    derived_stop = "end_turn"
     # The stream `index` is **a running count of emitted blocks**. Using enumerate's
     # original position would create gaps when unknown blocks are skipped, crashing the
     # real SDK's stream accumulator with an IndexError.
@@ -542,8 +736,36 @@ def stream_event_dicts(
             out.append(("content_block_stop", {
                 "type": "content_block_stop", "index": idx,
             }))
+        elif btype == "thinking":
+            # thinking_delta* (none when the text is empty = display "omitted"), then exactly
+            # one signature_delta before content_block_stop — the real event sequence.
+            idx += 1
+            out.append(("content_block_start", {
+                "type": "content_block_start", "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }))
+            text = str(block.get("thinking") or "")
+            chunk_size = 80
+            for i in range(0, len(text), chunk_size):
+                out.append(("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": text[i:i + chunk_size]},
+                }))
+            out.append(("content_block_delta", {
+                "type": "content_block_delta", "index": idx,
+                "delta": {"type": "signature_delta",
+                          "signature": str(block.get("signature") or "")},
+            }))
+            out.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
+        elif btype == "redacted_thinking":
+            idx += 1
+            out.append(("content_block_start", {
+                "type": "content_block_start", "index": idx,
+                "content_block": {"type": "redacted_thinking",
+                                  "data": str(block.get("data") or "")},
+            }))
+            out.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
         elif btype == "tool_use":
-            derived_stop = "tool_use"
             idx += 1
             tool_id = str(block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}")
             out.append(("content_block_start", {
@@ -555,21 +777,26 @@ def stream_event_dicts(
                     "input": {},
                 },
             }))
+            # The real stream opens with an empty partial_json and then sends the JSON in
+            # several chunks; SDK accumulators concatenate them, so chunking is spec-valid.
             input_json = json.dumps(block.get("input", {}) or {}, ensure_ascii=False)
-            out.append(("content_block_delta", {
-                "type": "content_block_delta", "index": idx,
-                "delta": {"type": "input_json_delta", "partial_json": input_json},
-            }))
+            pieces = [""] + [input_json[i:i + 40] for i in range(0, len(input_json), 40)]
+            for piece in pieces:
+                out.append(("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "input_json_delta", "partial_json": piece},
+                }))
             out.append(("content_block_stop", {
                 "type": "content_block_stop", "index": idx,
             }))
         else:
-            # Skip unknown blocks (anything other than text/tool_use) (don't consume an index = don't create a gap).
+            # Skip unknown blocks (anything outside _MODELED_BLOCK_TYPES) (don't consume an index = don't create a gap).
             continue
 
     out.append(("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason or derived_stop, "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence,
+                  "stop_details": stop_details},
         "usage": delta_usage,
     }))
     out.append(("message_stop", {"type": "message_stop"}))
@@ -582,6 +809,9 @@ def _build_sse_stream(
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
     stop_reason: str | None = None,
+    stop_sequence: Any = None,
+    stop_details: Any = None,
+    params: dict[str, Any] | None = None,
 ) -> list[bytes]:
     """Build the SSE byte sequence that satisfies the Anthropic streaming protocol.
 
@@ -589,7 +819,8 @@ def _build_sse_stream(
     values (legacy behavior). Like the real API, insert one `ping` right after
     message_start (SSE path only; the SDK ignores it).
     """
-    events = stream_event_dicts(message_id, model, content_blocks, usage, stop_reason)
+    events = stream_event_dicts(message_id, model, content_blocks, usage, stop_reason,
+                                stop_sequence, stop_details, params)
     out = [_sse_event(events[0][0], events[0][1]), _sse_event("ping", {"type": "ping"})]
     out.extend(_sse_event(name, data) for name, data in events[1:])
     return out
@@ -601,35 +832,28 @@ def _build_non_stream_response(
     content_blocks: list[dict[str, Any]],
     usage: dict[str, Any] | None = None,
     stop_reason: str | None = None,
+    stop_sequence: Any = None,
+    stop_details: Any = None,
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # Keep parity with the streaming path (stream_event_dicts), which only emits
-    # text/tool_use blocks: filter unknown block types here too so the same injection
-    # yields the same content whether the caller used stream=True or not. puppetllm
-    # only simulates text/tool_use (thinking/redacted_thinking/etc. are not modeled).
+    # Keep parity with the streaming path (stream_event_dicts), which only emits the
+    # modeled block types: filter unknown block types here too so the same injection
+    # yields the same content whether the caller used stream=True or not.
     content_blocks = [b for b in content_blocks
-                      if isinstance(b, dict) and b.get("type") in ("text", "tool_use")]
-    if stop_reason is None:
-        stop_reason = "tool_use" if any(
-            b.get("type") == "tool_use" for b in content_blocks
-        ) else "end_turn"
-    if usage is not None:
-        usage_out = {
-            "input_tokens": usage.get("input_tokens", 1),
-            "output_tokens": usage.get("output_tokens", 0),
-            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-        }
-    else:
-        usage_out = {"input_tokens": 1, "output_tokens": 100}
+                      if isinstance(b, dict) and b.get("type") in _MODELED_BLOCK_TYPES]
+    stop_reason, stop_sequence, stop_details = _resolve_stop(
+        content_blocks, stop_reason, stop_sequence, stop_details, params)
     return {
         "id": message_id,
         "type": "message",
         "role": "assistant",
-        "content": content_blocks,
+        # puppetllm-private keys (e.g. `_openai_custom`) never reach an Anthropic wire.
+        "content": strip_private(content_blocks),
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": usage_out,
+        "stop_sequence": stop_sequence,
+        "stop_details": stop_details,
+        "usage": _usage_wire(usage),
     }
 
 
@@ -640,31 +864,62 @@ def _build_non_stream_response(
 async def messages(request: Request) -> Any:
     req_id = _new_request_id()
     headers = {"request-id": req_id}
+    # A Bedrock / Mantle client pointed straight at the fake's root posts here with an
+    # `anthropic.`-prefixed (or ARN) model id: hand it to the Bedrock adapter so the model is
+    # normalized, the pending is tagged provider=bedrock, and the receipt is logged.
+    try:
+        peek = await request.json()
+    except Exception:
+        peek = None
+    if isinstance(peek, dict) and _bedrock.is_bedrock_model_id(peek.get("model")):
+        return await _bedrock.handle_messages(request)
+    return await handle_messages(request, provider="anthropic", headers=headers)
+
+
+async def handle_messages(request: Request, *, provider: str, headers: dict[str, str],
+                          model_override: str | None = None,
+                          extra: dict[str, Any] | None = None,
+                          on_registered: Any = None) -> Any:
+    """Shared Messages-API handler (Anthropic route and Bedrock's Messages/Mantle alias).
+
+    `model_override` replaces the body model in the snapshot / response (Bedrock ids are
+    normalized to the Anthropic name), `extra` is merged into the snapshot, and
+    `on_registered(snapshot)` is called once the pending exists (receipt logging).
+    """
+    req_id = headers["request-id"]
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         # Like the real API, errors on the Anthropic path are always returned in the official envelope.
         return _anthropic_error(400, "invalid_request_error", errmsg, headers=headers)
     is_stream = bool(body.get("stream"))
-    model = body.get("model")
+    model = model_override if model_override is not None else body.get("model")
 
-    snapshot, fut = await register_request("anthropic", model, body, is_stream)
+    try:
+        snapshot, fut = await register_request(provider, model, body, is_stream, extra=extra,
+                                               request_headers=request.headers)
+    except RequestValidationError as e:
+        return _anthropic_error(400, "invalid_request_error", str(e), headers=headers)
+    if on_registered is not None:
+        on_registered(snapshot)
     result = await await_resolution(snapshot, fut)
 
     if result["kind"] == "cleared":
-        return _anthropic_error(503, "api_error",
+        # 529 overloaded_error is the documented "temporarily unavailable, retry" shape.
+        return _anthropic_error(529, "overloaded_error",
                                 f"request cleared: {result['detail']}", headers=headers)
     if result["kind"] == "error":
         return _anthropic_error(result["status"], result["type"], result["message"],
-                                headers=headers)
+                                headers={**headers, **_error_headers(result)})
 
     model_out = model or "claude-sonnet-mock"
     content_blocks = result["content_blocks"]
     usage = result["usage"]
     message_id = result["message_id"]
-    stop_reason = result.get("stop_reason")
+    stop_args = (result.get("stop_reason"), result.get("stop_sequence"),
+                 result.get("stop_details"), snapshot.get("params"))
 
     if is_stream:
-        events = _build_sse_stream(message_id, model_out, content_blocks, usage, stop_reason)
+        events = _build_sse_stream(message_id, model_out, content_blocks, usage, *stop_args)
 
         async def gen():
             for evt in events:
@@ -673,9 +928,14 @@ async def messages(request: Request) -> Any:
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
     return JSONResponse(
-        _build_non_stream_response(message_id, model_out, content_blocks, usage, stop_reason),
+        _build_non_stream_response(message_id, model_out, content_blocks, usage, *stop_args),
         headers=headers,
     )
+
+
+def _error_headers(result: dict[str, Any]) -> dict[str, str]:
+    """Extra response headers attached to an injected error (validated in /_control/error)."""
+    return {str(k): str(v) for k, v in (result.get("headers") or {}).items()}
 
 
 # ── Control endpoints ────────────────────────────────────────────────
@@ -860,6 +1120,7 @@ def _safe_set_result(
 
 _USAGE_OVERRIDE_KEYS = ("input_tokens", "output_tokens",
                         "cache_creation_input_tokens", "cache_read_input_tokens")
+_USAGE_OVERRIDE_ALL = _USAGE_OVERRIDE_KEYS + _USAGE_OBJECT_KEYS + _USAGE_SCALAR_KEYS
 # Sane ceiling for an override token count (~1e12). Keeps cost math finite; far above any
 # real context window.
 _USAGE_MAX = 10 ** 12
@@ -867,9 +1128,11 @@ _USAGE_MAX = 10 ** 12
 
 @app.post("/_control/respond")
 async def respond(request: Request) -> Any:
-    """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "usage"?}`.
+    """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "stop_sequence"?,
+    "stop_details"?, "usage"?}`.
 
-    The content_block type is "text" | "tool_use". When `pending_id` is omitted, inject
+    The content_block type is "text" | "tool_use" | "thinking" | "redacted_thinking"
+    (anything else is dropped). When `pending_id` is omitted, inject
     into the single pending if there is one (backward compatible). With multiple in-flight,
     `pending_id` is required — or, for batch entries, address by `custom_id` (+ optional
     `batch_id` when the custom_id appears in several batches).
@@ -893,22 +1156,46 @@ async def respond(request: Request) -> Any:
     stop_reason = body.get("stop_reason")
     if stop_reason is not None and not isinstance(stop_reason, str):
         return _plain_400("stop_reason must be a string")
+    stop_sequence = body.get("stop_sequence")
+    if stop_sequence is not None and not isinstance(stop_sequence, str):
+        return _plain_400("stop_sequence must be a string")
+    stop_details = body.get("stop_details")
+    if stop_details is not None and not isinstance(stop_details, dict):
+        return _plain_400("stop_details must be an object")
     usage = body.get("usage")
     if usage is not None:
         # Upper bound guards downstream cost math: without it, huge ints overflow float()
         # (int*float in pricing) or produce inf that then poisons /_control/stats JSON.
+        # Object-valued keys (cache_creation / output_tokens_details / server_tool_use) and
+        # scalar tags (service_tier / inference_geo / speed) are passed through so a relay can
+        # forward the upstream usage object intact.
+        def _ok(k: str, v: Any) -> bool:
+            if k in _USAGE_OVERRIDE_KEYS:
+                return type(v) is int and 0 <= v <= _USAGE_MAX
+            if k == "cache_creation":
+                # must be the documented object with both TTL buckets
+                return (isinstance(v, dict)
+                        and set(v) == {"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"}
+                        and all(type(x) is int and 0 <= x <= _USAGE_MAX for x in v.values()))
+            if k in _USAGE_OBJECT_KEYS:
+                return v is None or (isinstance(v, dict) and v and all(
+                    type(x) is int and 0 <= x <= _USAGE_MAX for x in v.values()))
+            if k in _USAGE_SCALAR_KEYS:
+                return isinstance(v, str) and bool(v)
+            return False
         if not isinstance(usage, dict) or not usage or not all(
-            k in _USAGE_OVERRIDE_KEYS and type(v) is int and 0 <= v <= _USAGE_MAX
-            for k, v in usage.items()
-        ):
+            _ok(k, v) for k, v in usage.items()
+        ) or not any(k in _USAGE_OVERRIDE_KEYS for k in usage):
             return _plain_400(
                 f"usage must be a non-empty object with integer values in [0, {_USAGE_MAX}] "
-                "for keys among: " + ", ".join(_USAGE_OVERRIDE_KEYS))
+                "for keys among: " + ", ".join(_USAGE_OVERRIDE_KEYS)
+                + " (plus optional " + ", ".join(_USAGE_OBJECT_KEYS + _USAGE_SCALAR_KEYS) + ")")
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
     err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason,
+                                 "stop_sequence": stop_sequence, "stop_details": stop_details,
                                  "usage": usage})
     if err is not None:
         return err
@@ -936,15 +1223,42 @@ async def auto(request: Request) -> Any:
     return {"ok": True}
 
 
+# Headers an injector may not set: framing / hop-by-hop values would corrupt the response
+# the server itself writes (h11 fails mid-write and the client sees a dropped connection).
+_RESERVED_INJECT_HEADERS = frozenset((
+    "content-length", "content-type", "transfer-encoding", "connection", "keep-alive",
+    "upgrade", "te", "trailer", "proxy-connection",
+))
+
+
+def _validate_inject_headers(hdrs: Any) -> str | None:
+    """Return an error message if `hdrs` is not a safe string → string/number map."""
+    if not isinstance(hdrs, dict):
+        return "headers must be an object of string → string/number"
+    for k, v in hdrs.items():
+        if not isinstance(k, str) or not isinstance(v, (str, int, float)) or isinstance(v, bool):
+            return "headers must be an object of string → string/number"
+        if not k or not all(c.isalnum() or c in "-_" for c in k):
+            return f"headers: invalid header name {k!r}"
+        if k.lower() in _RESERVED_INJECT_HEADERS:
+            return f"headers: {k!r} is a framing header and cannot be injected"
+        sv = str(v)
+        if any(ord(c) < 32 or ord(c) > 255 for c in sv) or "\x7f" in sv:
+            return f"headers: value of {k!r} must be printable Latin-1 without control characters"
+    return None
+
+
 @app.post("/_control/error")
 async def inject_error(request: Request) -> Any:
     """Error injection: make a pending request return an HTTP error.
 
     Body: {"status": 429, "type": "rate_limit_error", "message": "...",
-           "code"?: "...", "param"?: "..."}
+           "code"?: "...", "param"?: "...", "headers"?: {"retry-after": "3"}}
     On any of the Anthropic / Bedrock / OpenAI paths, each provider converts status/type
     into its own path's error format (code/param are used only in the OpenAI format).
-    The SDK auto-retries 5xx/429/408.
+    `headers` (string → string) are attached to the error response verbatim — e.g.
+    `retry-after` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — so an
+    app's backoff logic can be exercised. The SDK auto-retries 5xx/429/408.
     """
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
@@ -955,6 +1269,11 @@ async def inject_error(request: Request) -> Any:
         return _plain_400("status must be an integer")
     if not (100 <= status <= 599):
         return _plain_400("status must be in [100, 599]")
+    hdrs = body.get("headers")
+    if hdrs is not None:
+        err_msg = _validate_inject_headers(hdrs)
+        if err_msg is not None:
+            return _plain_400(err_msg)
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
@@ -966,6 +1285,7 @@ async def inject_error(request: Request) -> Any:
         "message": str(body.get("message", "fake_server injected error")),
         "code": body.get("code"),
         "param": body.get("param"),
+        "headers": {k: str(v) for k, v in (hdrs or {}).items()},
     })
     if err is not None:
         return err
@@ -1076,7 +1396,7 @@ async def cache_index() -> dict[str, Any]:
 @app.post("/_control/clear")
 async def clear() -> dict[str, Any]:
     async with state.lock:
-        # Cancel all in-flight pendings with 503 (the main handler gracefully returns 503)
+        # Cancel all in-flight pendings (the main handlers gracefully return a retryable error)
         for entry in state.pending.values():
             fut = entry["future"]
             if not fut.done():

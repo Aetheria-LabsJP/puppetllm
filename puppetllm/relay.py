@@ -42,8 +42,11 @@ import os
 import sys
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+
+from . import openai_wire as _oai
 
 # Upper bound on the quarantine set (see Relay.quarantined). Far above any realistic
 # count of concurrently-failing pendings; keeps a long-running relay from leaking.
@@ -131,6 +134,43 @@ def looks_foreign(model: str, kind: str) -> bool:
 # ── canonical -> OpenAI-compatible request ───────────────────────────
 
 
+_image_to_openai = _oai.image_to_openai
+
+
+def _effort_to_anthropic(effort: Any) -> str | None:
+    """OpenAI reasoning_effort → Anthropic output_config.effort."""
+    if not isinstance(effort, str):
+        return None
+    return {"none": "low", "minimal": "low"}.get(effort, effort) if effort in (
+        "none", "minimal", "low", "medium", "high", "xhigh", "max") else None
+
+
+def _effort_to_openai(effort: Any) -> str | None:
+    """Anthropic output_config.effort → OpenAI reasoning_effort (`max` is Anthropic-only)."""
+    if not isinstance(effort, str):
+        return None
+    return {"max": "xhigh"}.get(effort, effort) if effort in (
+        "low", "medium", "high", "xhigh", "max") else None
+
+
+# service_tier vocabularies differ: Anthropic `auto` | `standard_only`, OpenAI
+# `auto` | `default` | `flex` | `priority` (+ `scale`). Map instead of forwarding verbatim.
+_TIER_TO_OPENAI = {"auto": "auto", "standard_only": "default",
+                   "default": "default", "flex": "flex", "priority": "priority", "scale": "scale"}
+_TIER_TO_ANTHROPIC = {"auto": "auto", "standard_only": "standard_only",
+                      "default": "standard_only", "flex": "auto", "priority": "auto", "scale": "auto"}
+
+
+_warned_dropped: set[str] = set()
+
+
+def _warn_dropped(what: str) -> None:
+    """Log once per parameter that cannot be translated for the upstream kind."""
+    if what not in _warned_dropped:
+        _warned_dropped.add(what)
+        _log(f"WARNING: {what} cannot be translated for this upstream and is dropped")
+
+
 def _text_of(content: Any) -> str:
     """Join the text of a canonical str-or-blocks content value (cache_control etc. dropped)."""
     if isinstance(content, str):
@@ -148,10 +188,10 @@ def _tool_result_text(content: Any) -> str:
     if isinstance(content, list):
         return "".join(
             str(b.get("text", "")) if isinstance(b, dict) and b.get("type") == "text"
-            else json.dumps(b, ensure_ascii=False)
+            else json.dumps(_oai.strip_private(b), ensure_ascii=False)
             for b in content
         )
-    return json.dumps(content, ensure_ascii=False)
+    return json.dumps(_oai.strip_private(content), ensure_ascii=False)
 
 
 def _tool_choice_to_openai(tc: Any) -> Any:
@@ -173,10 +213,29 @@ def _tool_choice_to_openai(tc: Any) -> Any:
     return None
 
 
+def resolve_max_tokens_param(cfg: Any) -> str:
+    """Which field carries the token limit on the OpenAI route.
+
+    `max_tokens` is deprecated on the official API (rejected by o-series / reasoning
+    models) in favor of `max_completion_tokens`, while many OpenAI-compatible backends
+    still only know `max_tokens`. Default ("auto"): `max_completion_tokens` when the
+    target host is api.openai.com, `max_tokens` otherwise; an explicit value wins.
+    """
+    explicit = getattr(cfg, "max_tokens_param", None)
+    if explicit in ("max_tokens", "max_completion_tokens"):
+        return explicit
+    target = str(getattr(cfg, "target", "") or "")
+    try:
+        host = (urlsplit(target).hostname or "").lower()
+    except ValueError:
+        host = ""
+    return "max_completion_tokens" if host == "api.openai.com" else "max_tokens"
+
+
 def to_openai_request(req: dict[str, Any], model: str,
                       cfg: Any = None) -> dict[str, Any]:
     """Canonical snapshot -> OpenAI-compatible chat.completions request body."""
-    max_tokens_param = getattr(cfg, "max_tokens_param", "max_tokens") or "max_tokens"
+    max_tokens_param = resolve_max_tokens_param(cfg)
     messages: list[dict[str, Any]] = []
     system = req.get("system")
     if system:
@@ -197,15 +256,7 @@ def to_openai_request(req: dict[str, Any], model: str,
                     if b.get("type") == "text":
                         texts.append(str(b.get("text", "")))
                     elif b.get("type") == "tool_use":
-                        tool_calls.append({
-                            "id": str(b.get("id") or ""),
-                            "type": "function",
-                            "function": {
-                                "name": str(b.get("name", "")),
-                                "arguments": json.dumps(b.get("input") or {},
-                                                        ensure_ascii=False),
-                            },
-                        })
+                        tool_calls.append(_oai.tool_call_from_canonical(b, keep_id=True))
                 joined = "".join(texts)
                 # Drop a fully-empty assistant turn (e.g. it held only thinking blocks,
                 # which the server strips): {"content": None} with no tool_calls is
@@ -220,7 +271,8 @@ def to_openai_request(req: dict[str, Any], model: str,
                 messages.append({"role": "assistant", "content": _text_of(content)})
         else:  # user (or unknown -> treat as user)
             if isinstance(content, list):
-                texts = []
+                parts: list[dict[str, Any]] = []
+                has_image = False
                 for b in content:
                     if not isinstance(b, dict):
                         continue
@@ -235,13 +287,29 @@ def to_openai_request(req: dict[str, Any], model: str,
                             "content": _tool_result_text(b.get("content")),
                         })
                     elif b.get("type") == "text":
-                        texts.append(str(b.get("text", "")))
-                    elif b.get("type") in ("image", "input_image", "document"):
-                        # multimodal blocks aren't translated; keep the turn non-empty so
-                        # the message sequence stays valid rather than silently vanishing.
-                        texts.append("[non-text content omitted by relay]")
-                if texts:
-                    messages.append({"role": "user", "content": "".join(texts)})
+                        parts.append({"type": "text", "text": str(b.get("text", ""))})
+                    elif b.get("type") == "image":
+                        part = _image_to_openai(b)
+                        if part is not None:
+                            parts.append(part)
+                            has_image = True
+                        else:
+                            parts.append({"type": "text",
+                                          "text": "[image omitted by relay]"})
+                    elif b.get("type") in ("image_url", "input_audio", "file"):
+                        parts.append(b)  # already OpenAI-shaped (OpenAI-inbound passthrough)
+                        has_image = True
+                    elif b.get("type") in ("input_image", "document"):
+                        # not translated; keep the turn non-empty so the message
+                        # sequence stays valid rather than silently vanishing.
+                        parts.append({"type": "text",
+                                      "text": "[non-text content omitted by relay]"})
+                if parts:
+                    if has_image:
+                        messages.append({"role": "user", "content": parts})
+                    else:
+                        messages.append({"role": "user",
+                                         "content": "".join(p["text"] for p in parts)})
             else:
                 messages.append({"role": "user", "content": _text_of(content)})
 
@@ -250,19 +318,47 @@ def to_openai_request(req: dict[str, Any], model: str,
         body[max_tokens_param] = req["max_tokens"]
     tools = req.get("tools") or []
     if tools:
-        body["tools"] = [{
-            "type": "function",
-            "function": {
+        out_tools: list[dict[str, Any]] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if t.get("_openai_custom"):
+                custom: dict[str, Any] = {"name": t.get("name")}
+                if t.get("description"):
+                    custom["description"] = t["description"]
+                if t.get("format") is not None:
+                    custom["format"] = t["format"]
+                out_tools.append({"type": "custom", "custom": custom})
+                continue
+            fn: dict[str, Any] = {
                 "name": t.get("name"),
                 "description": t.get("description") or "",
                 "parameters": t.get("input_schema") or {"type": "object"},
-            },
-        } for t in tools if isinstance(t, dict)]
+            }
+            if t.get("strict") is not None:
+                fn["strict"] = bool(t["strict"])
+            out_tools.append({"type": "function", "function": fn})
+        body["tools"] = out_tools
     params = req.get("params") or {}
-    for k in ("temperature", "top_p", "response_format", "parallel_tool_calls",
-              "reasoning_effort"):
+    for k in _OPENAI_PASSTHROUGH_PARAMS:
         if k in params:
             body[k] = params[k]
+    # Anthropic-inbound effort → OpenAI reasoning_effort (`max` clamps to `xhigh`).
+    oc = params.get("output_config")
+    if "reasoning_effort" not in body and isinstance(oc, dict) and oc.get("effort"):
+        eff = _effort_to_openai(oc["effort"])
+        if eff is not None:
+            body["reasoning_effort"] = eff
+        else:
+            _warn_dropped(f"output_config.effort={oc['effort']!r}")
+    tier = params.get("service_tier")
+    if isinstance(tier, str):
+        if tier in _TIER_TO_OPENAI:
+            body["service_tier"] = _TIER_TO_OPENAI[tier]
+        else:
+            _warn_dropped(f"service_tier={tier!r}")
+    if params.get("speed") == "fast":
+        _warn_dropped("speed=fast (Anthropic fast mode has no Chat Completions equivalent)")
     if "stop_sequences" in params:
         body["stop"] = params["stop_sequences"]
     elif "stop" in params:
@@ -271,6 +367,17 @@ def to_openai_request(req: dict[str, Any], model: str,
     if tc is not None:
         body["tool_choice"] = tc
     return body
+
+
+# Chat Completions parameters forwarded verbatim from the snapshot when present.
+# (`n` is deliberately NOT forwarded — the relay uses one choice, so extra samples would
+# only be billed; `service_tier` is mapped, not forwarded.)
+_OPENAI_PASSTHROUGH_PARAMS = (
+    "temperature", "top_p", "response_format", "parallel_tool_calls", "reasoning_effort",
+    "seed", "frequency_penalty", "presence_penalty", "logit_bias", "logprobs",
+    "top_logprobs", "verbosity", "prompt_cache_key", "safety_identifier", "user",
+    "metadata", "store", "prediction", "web_search_options", "modalities", "audio",
+)
 
 
 def from_openai_response(resp: dict[str, Any]) -> dict[str, Any]:
@@ -284,20 +391,23 @@ def from_openai_response(resp: dict[str, Any]) -> dict[str, Any]:
     text = _text_of(message.get("content"))
     if text:
         blocks.append({"type": "text", "text": text})
+    refusal = message.get("refusal")
+    refused = isinstance(refusal, str) and bool(refusal)
+    if refused:
+        # A refusal comes back with content null + refusal text; surface it as the
+        # message text and as stop_reason "refusal" so the app can branch on it.
+        blocks.append({"type": "text", "text": refusal})
     for tc in message.get("tool_calls") or []:
         if not isinstance(tc, dict):
             continue
-        fn = tc.get("function") or {}
-        raw = fn.get("arguments")
-        try:
-            args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        except ValueError:
-            args = {"_raw": raw}
-        blocks.append({"type": "tool_use", "id": str(tc.get("id") or ""),
-                       "name": str(fn.get("name") or ""), "input": args})
+        blk = _oai.tool_call_to_canonical(tc)
+        if blk is not None:
+            blocks.append(blk)
 
     finish = choice.get("finish_reason")
     stop_reason = _FINISH_TO_STOP.get(finish, _FINISH_FALLBACK) if finish else None
+    if refused:
+        stop_reason = "refusal"
     # If the message carries tool calls, the turn IS a tool_use turn regardless of what
     # finish_reason says. Some OpenAI-compatible backends (Ollama / llama.cpp / vLLM /
     # routers) emit tool_calls while still reporting finish_reason "stop"/"length"; passing
@@ -317,14 +427,16 @@ def from_openai_response(resp: dict[str, Any]) -> dict[str, Any]:
         # a successful, billed response into a 502 (AttributeError on .get). Treat as absent.
         cached = max(0, _as_int(details.get("cached_tokens"))
                      if isinstance(details, dict) else 0)
+        written = max(0, _as_int(details.get("cache_write_tokens"))
+                      if isinstance(details, dict) else 0)
         usage = {
-            # canonical (Anthropic) vocabulary: input_tokens excludes cached reads.
+            # canonical (Anthropic) vocabulary: input_tokens excludes cached reads/writes.
             # Clamp every value non-negative — a buggy/hostile upstream reporting negatives
             # would otherwise be rejected by the server and hang/loop the request.
-            "input_tokens": max(0, _as_int(u.get("prompt_tokens")) - cached),
+            "input_tokens": max(0, _as_int(u.get("prompt_tokens")) - cached - written),
             "output_tokens": max(0, _as_int(u.get("completion_tokens"))),
             "cache_read_input_tokens": cached,
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": written,
         }
     return {"content": blocks, "stop_reason": stop_reason, "usage": usage}
 
@@ -353,18 +465,57 @@ def to_anthropic_request(req: dict[str, Any], model: str,
         "model": model,
         # /v1/messages requires max_tokens; OpenAI-route inbound may not have one.
         "max_tokens": req.get("max_tokens") or 4096,
-        "messages": req.get("messages") or [],
+        # puppetllm-private keys (`_openai_custom`, `_openai_detail`) never go on the wire:
+        # the real Messages API rejects unknown fields.
+        "messages": _oai.strip_private(req.get("messages") or []),
     }
     if req.get("system"):
-        body["system"] = req["system"]
+        body["system"] = _oai.strip_private(req["system"])
     if req.get("tools"):
-        body["tools"] = req["tools"]
+        tools = []
+        for t in req["tools"]:
+            if not isinstance(t, dict):
+                continue
+            if t.get("_openai_custom"):
+                # OpenAI free-form tools have no Anthropic equivalent beyond their canonical
+                # single-string schema; drop the OpenAI-only `format`.
+                t = {k: v for k, v in t.items() if k != "format"}
+            tools.append(_oai.strip_private(t))
+        body["tools"] = tools
     params = req.get("params") or {}
-    # NOTE: "thinking" is intentionally NOT forwarded — the server strips thinking blocks
-    # from injected responses, so a preserved-thinking tool loop would 400 on the real API.
-    for k in ("temperature", "top_p", "top_k", "stop_sequences"):
+    # thinking / output_config are forwarded: the server keeps thinking blocks (with the
+    # upstream's real signatures) in injected responses, so a preserved-thinking tool loop
+    # round-trips. (Mixing responders mid-conversation — fake signatures from a human
+    # responder, then relay — would still 400 upstream.)
+    for k in ("temperature", "top_p", "top_k", "stop_sequences", "thinking", "output_config",
+              "cache_control", "inference_geo", "container", "context_management", "speed"):
         if k in params:
             body[k] = params[k]
+    if not isinstance(body.get("output_config"), dict):
+        body.pop("output_config", None)  # a malformed value must not crash the relay
+    tier = params.get("service_tier")
+    if isinstance(tier, str):
+        if tier in _TIER_TO_ANTHROPIC:
+            body["service_tier"] = _TIER_TO_ANTHROPIC[tier]
+        else:
+            _warn_dropped(f"service_tier={tier!r}")
+    # OpenAI-inbound structured output / effort → the Anthropic equivalents.
+    rf = params.get("response_format")
+    if isinstance(rf, dict) and "output_config" not in body:
+        if rf.get("type") == "json_schema" and isinstance(rf.get("json_schema"), dict) \
+                and isinstance(rf["json_schema"].get("schema"), dict):
+            body["output_config"] = {"format": {"type": "json_schema",
+                                                "schema": rf["json_schema"]["schema"]}}
+        elif rf.get("type") in ("json_object", "json_schema"):
+            _warn_dropped(f"response_format.type={rf.get('type')} (without a schema)")
+    effort = _effort_to_anthropic(params.get("reasoning_effort"))
+    if effort is not None and "effort" not in (body.get("output_config") or {}):
+        body.setdefault("output_config", {})
+        body["output_config"] = {**body["output_config"], "effort": effort}
+    elif params.get("reasoning_effort") is not None and effort is None:
+        _warn_dropped(f"reasoning_effort={params.get('reasoning_effort')!r}")
+    if body.get("output_config") == {}:
+        del body["output_config"]
     # metadata: Anthropic only accepts {"user_id": str}. An OpenAI-inbound app may attach an
     # arbitrary metadata dict, which the real /v1/messages would 400 on — so forward only the
     # user_id subset and drop the rest.
@@ -388,12 +539,27 @@ def from_anthropic_response(resp: dict[str, Any]) -> dict[str, Any]:
         usage = {k: max(0, _as_int(u.get(k))) for k in (
             "input_tokens", "output_tokens",
             "cache_creation_input_tokens", "cache_read_input_tokens")}
-    return {
-        # unknown block types (thinking etc.) are filtered by the server on inject
+        # Forward the richer usage objects intact (cache TTL breakdown, thinking tokens,
+        # server tool use, service tier, inference geo) — the server passes them through.
+        for k in ("cache_creation", "output_tokens_details", "server_tool_use"):
+            v = u.get(k)
+            if isinstance(v, dict) and all(type(x) is int and x >= 0 for x in v.values()):
+                usage[k] = v
+        for k in ("service_tier", "inference_geo", "speed"):
+            if isinstance(u.get(k), str):
+                usage[k] = u[k]
+    out: dict[str, Any] = {
+        # thinking / redacted_thinking blocks are kept by the server (with the upstream's
+        # signatures); unknown block types are filtered on inject
         "content": resp.get("content") or [],
         "stop_reason": resp.get("stop_reason"),
         "usage": usage,
     }
+    if isinstance(resp.get("stop_sequence"), str):
+        out["stop_sequence"] = resp["stop_sequence"]
+    if isinstance(resp.get("stop_details"), dict):
+        out["stop_details"] = resp["stop_details"]
+    return out
 
 
 # ── upstream call + error relaying ───────────────────────────────────
@@ -508,6 +674,20 @@ class Relay:
                            "(control plane rejected the payload or was unreachable)"})
         return True
 
+    def _request_headers(self, req: dict[str, Any]) -> dict[str, str]:
+        """Per-request upstream headers. Towards Anthropic, the betas the app asked for
+        (`anthropic-beta`, captured as `params.anthropic_beta`) are forwarded — fast mode,
+        compaction, context editing etc. are rejected upstream without them."""
+        if self.cfg.kind != "anthropic":
+            return {}
+        betas = (req.get("params") or {}).get("anthropic_beta")
+        if isinstance(betas, str):
+            betas = [betas]
+        if not isinstance(betas, list):
+            return {}
+        names = [str(b).strip() for b in betas if str(b).strip()]
+        return {"anthropic-beta": ",".join(names)} if names else {}
+
     def _claims(self, item: dict[str, Any]) -> bool:
         """Whether the relay should claim this pending. With --only set, claim only when the
         inbound model matches one of the globs (leaving the rest for another responder);
@@ -543,7 +723,8 @@ class Relay:
                 body = to_anthropic_request(req, model, self.cfg)
             else:
                 body = to_openai_request(req, model, self.cfg)
-            r = await self.http.post(self.upstream_url, json=body)
+            r = await self.http.post(self.upstream_url, json=body,
+                                     headers=self._request_headers(req))
             try:
                 data = r.json()
             except ValueError:
@@ -678,11 +859,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help='glob mapping "pat=model,pat2=model2", e.g. '
                         '"claude-*=grok-3,gpt-*=grok-3" (first match wins; '
                         '--model takes precedence)')
-    p.add_argument("--max-tokens-param", choices=("max_tokens", "max_completion_tokens"),
-                   default="max_tokens",
+    p.add_argument("--max-tokens-param",
+                   choices=("auto", "max_tokens", "max_completion_tokens"), default="auto",
                    help="which field to send the token limit as on the OpenAI route "
-                        "(default max_tokens; use max_completion_tokens for OpenAI "
-                        "reasoning / official gpt-5 endpoints that reject max_tokens)")
+                        "(default auto: max_completion_tokens when the target host is "
+                        "api.openai.com — max_tokens is deprecated there and rejected by "
+                        "o-series / reasoning models — and max_tokens for other "
+                        "OpenAI-compatible backends)")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="upstream request timeout in seconds (default 120)")
     p.add_argument("--poll-timeout", type=float, default=55.0,

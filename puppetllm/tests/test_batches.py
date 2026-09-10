@@ -223,6 +223,7 @@ class TestBatchHTTP(unittest.TestCase):
                 self.assertEqual(err["error"]["type"], "error")
                 self.assertEqual(err["error"]["error"]["type"], "rate_limit_error")
                 self.assertEqual(err["error"]["error"]["message"], "throttled")
+                self.assertTrue(err["error"]["request_id"].startswith("req_"))
 
                 # no pendings left behind
                 p = await c.get("/_control/pending")
@@ -581,10 +582,13 @@ class TestBatchHTTP(unittest.TestCase):
                                  [b3["id"], b2["id"]])
                 self.assertFalse(r.json()["has_more"])
                 # out-of-range limit and unknown cursors are rejected, not papered over
-                for params in ({"limit": 0}, {"limit": -5}, {"limit": 101}):
+                for params in ({"limit": 0}, {"limit": -5}, {"limit": 1001}):
                     r = await c.get("/v1/messages/batches", params=params)
                     self.assertEqual(r.status_code, 400, params)
                     self.assertEqual(r.json()["error"]["type"], "invalid_request_error")
+                # the real upper bound is 1000 (an app paging with limit=500 must work)
+                r = await c.get("/v1/messages/batches", params={"limit": 1000})
+                self.assertEqual(r.status_code, 200)
                 for params in ({"after_id": "msgbatch_nope"},
                                {"before_id": "msgbatch_nope"}):
                     r = await c.get("/v1/messages/batches", params=params)
@@ -610,13 +614,48 @@ class TestBatchHTTP(unittest.TestCase):
                 reqs[0]["custom_id"] = "A-z_0-9" + "x" * 57  # exactly 64 chars
                 r = await c.post("/v1/messages/batches", json={"requests": reqs})
                 self.assertEqual(r.status_code, 200)
+                # params the real API rejects at create time (besides stream)
+                for bad in ({"speed": "fast"}, {"max_tokens": 0}):
+                    reqs = _batch_requests("ok")
+                    reqs[0]["params"].update(bad)
+                    r = await c.post("/v1/messages/batches", json={"requests": reqs})
+                    self.assertEqual(r.status_code, 400, bad)
+                    self.assertIn(next(iter(bad)), r.json()["error"]["message"])
+                self.assertEqual((await c.get("/_control/batches")).json()["count"], 1)
+                # `fallbacks` is accepted but that item alone comes back `errored`
+                # (no pending, nothing billed); the other item runs normally
+                reqs = _batch_requests("fb", "plain")
+                reqs[0]["params"]["fallbacks"] = "default"
+                r = await c.post("/v1/messages/batches", json={"requests": reqs})
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["request_counts"], {"processing": 1, "succeeded": 0,
+                                                              "errored": 1, "canceled": 0, "expired": 0})
+                pend = (await c.get("/_control/pending")).json()["pending"]
+                cids = [p["request"].get("custom_id") for p in pend]
+                self.assertIn("plain", cids)
+                self.assertNotIn("fb", cids)
+                await c.post("/_control/respond", json={"custom_id": "plain",
+                                                        "content": [{"type": "text", "text": "ok"}]})
+                for _ in range(50):
+                    b = (await c.get(f"/v1/messages/batches/{r.json()['id']}")).json()
+                    if b["processing_status"] == "ended":
+                        break
+                    await asyncio.sleep(0.05)
+                results = [json.loads(ln) for ln in (await c.get(b["results_url"])).text.splitlines()]
+                by = {x["custom_id"]: x["result"] for x in results}
+                self.assertEqual(by["fb"]["type"], "errored")
+                self.assertIn("fallbacks", by["fb"]["error"]["error"]["message"])
+                self.assertEqual(by["plain"]["type"], "succeeded")
+                hist = (await c.get("/_control/history")).json()["history"]
+                self.assertFalse(any(h["request"].get("custom_id") == "fb" for h in hist))
                 # request-count cap (checked before anything is registered)
                 huge = {"requests": [{"custom_id": f"c{i}", "params": {"messages": []}}
                                      for i in range(100_001)]}
                 r = await c.post("/v1/messages/batches", json=huge)
                 self.assertEqual(r.status_code, 400)
                 self.assertIn("maximum", r.json()["error"]["message"])
-                self.assertEqual((await c.get("/_control/batches")).json()["count"], 1)
+                # the accepted-alphabet batch and the fallbacks batch; nothing else was created
+                self.assertEqual((await c.get("/_control/batches")).json()["count"], 2)
         _run(run())
 
     def _park_collector(self) -> tuple[asyncio.Event, asyncio.Event]:
@@ -877,7 +916,7 @@ class TestBatchCreationRaces(unittest.TestCase):
         _run(run())
 
     def test_clear_during_creation_leaves_no_ghosts(self) -> None:
-        """clear racing the create loop: the create returns 503 and every pending it
+        """clear racing the create loop: the create returns 529 and every pending it
         registered (before AND after the clear) is swept."""
         async def run() -> None:
             gate, proceed = self._gate_second_registration()
@@ -890,8 +929,8 @@ class TestBatchCreationRaces(unittest.TestCase):
                 self.assertEqual(r.status_code, 200)
                 proceed.set()
                 resp = await create_task
-                self.assertEqual(resp.status_code, 503)
-                self.assertEqual(resp.json()["error"]["type"], "api_error")
+                self.assertEqual(resp.status_code, 529)
+                self.assertEqual(resp.json()["error"]["type"], "overloaded_error")
                 await self._wait_quiet(c)
                 self.assertEqual((await c.get("/_control/batches")).json()["count"], 0)
                 self.assertEqual((await c.get("/_control/pending")).json()["count"], 0)

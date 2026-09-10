@@ -103,8 +103,9 @@ Even when joining mid-stream, the context can be reconstructed by reading `messa
 ### 4. Stay faithful to the real API protocol
 
 - Mixing text blocks and tool_use blocks in a single response is fine (the real API does this routinely)
-- `stop_reason` is auto-determined server-side from whether a `tool_use` block is present. To simulate truncation etc., you can override it by adding `"stop_reason": "max_tokens"` to the `/_control/respond` body (mapped to `finish_reason: "length"` on the OpenAI route)
-- the pending snapshot also carries `params` (`tool_choice`, `response_format`, `temperature`, `stop_sequences`, …) — honor them like the real API would (e.g. a forced `tool_choice` means you MUST return that tool call)
+- `stop_reason` is auto-determined server-side from whether a `tool_use` block is present. To simulate truncation etc., you can override it by adding `"stop_reason": "max_tokens"` to the `/_control/respond` body (mapped to `finish_reason: "length"` on the OpenAI route). `"refusal"` makes the server attach a `stop_details` object (pass `"stop_details": {"category": "...", "explanation": "..."}` to fill it); `"stop_sequence"` fills `stop_sequence` from the request
+- current Claude models return `thinking` blocks before the first text block by default. You may inject `{"type": "thinking", "thinking": "...", "signature"?}` (and `{"type": "redacted_thinking", "data": "..."}`) blocks ahead of your text to reproduce that shape — the server keeps them, streams them, and expects the app to echo them back unchanged on the next turn. Leave them out for the OpenAI route (Chat Completions has no equivalent; they are dropped there)
+- the pending snapshot also carries `params` (`tool_choice`, `output_config` (effort / structured-output `format`), `thinking`, `cache_control`, `response_format`, `temperature`, `stop_sequences`, `inference_geo`, `anthropic_beta`, …) — honor them like the real API would (e.g. a forced `tool_choice` means you MUST return that tool call; a `output_config.format` JSON schema means your text MUST be that JSON)
 - Both streaming SSE / non-streaming JSON are format-converted by the server, so the responder only needs to pass **canonical content blocks**
 
 ### 5. Do not take shortcuts
@@ -118,7 +119,7 @@ When you return a `tool_use`, the caller executes the tool through the server �
 
 ### 7. Do not return `tool_result` blocks
 
-The responder may only return **`text` and `tool_use` blocks**.
+The responder returns **`text` / `tool_use` blocks**, plus `thinking` / `redacted_thinking` when reproducing a thinking model's response shape (see above). Anything else is dropped by the server.
 `tool_result` is built automatically by the server from the caller's tool execution result. Returning `{"type": "tool_result", ...}` by mistake errors on the SDK side.
 
 ### 8. Be mindful of multi-turn
@@ -235,6 +236,8 @@ Note: each pending carries `provider` (`anthropic` / `bedrock` / `openai`). Open
 normalized to the canonical form (system / messages / tools) before being held, so you read the same shape
 regardless of provider. The responder only passes provider-agnostic canonical content blocks; conversion to
 SSE / non-streaming JSON / Bedrock eventstream / OpenAI chat.completion is done server-side.
+Bedrock-route pendings have `model` already normalized to the Anthropic name (e.g. `claude-haiku-4-5-20251001`);
+the raw Bedrock id (`us.anthropic.claude-...-v1:0`) is in `bedrock_model_id` if you need it.
 
 Full spec: `../README.md`
 

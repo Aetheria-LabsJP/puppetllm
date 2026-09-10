@@ -40,5 +40,6 @@ services:
     command: ["python3", "-m", "unittest",
               "puppetllm.tests.test_fake_server",
               "puppetllm.tests.test_proxy_extensions",
-              "puppetllm.tests.test_batches", "-v"]
+              "puppetllm.tests.test_batches",
+              "puppetllm.tests.test_conformance", "-v"]
     restart: "no"

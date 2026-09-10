@@ -299,8 +299,9 @@ class TestAsyncHttpx(unittest.TestCase):
                 self.assertEqual(h["history"], [])
         _run(run())
 
-    def test_clear_during_pending_returns_503(self) -> None:
-        """When clear is called during a pending request, the main handler returns 503.
+    def test_clear_during_pending_returns_529(self) -> None:
+        """When clear is called during a pending request, the main handler returns 529
+        overloaded_error (the documented "temporarily unavailable, retry" shape).
 
         Previously the set_exception exception propagated as-is and became a 500 (fixed in H2).
         """
@@ -316,10 +317,12 @@ class TestAsyncHttpx(unittest.TestCase):
                     await asyncio.sleep(0.05)
                 await c.post("/_control/clear")
                 r = await t
-                self.assertEqual(r.status_code, 503)
-                # errors on the Anthropic path return in the official envelope
+                self.assertEqual(r.status_code, 529)
+                # errors on the Anthropic path return in the official envelope (+ request_id)
                 self.assertEqual(r.json()["type"], "error")
+                self.assertEqual(r.json()["error"]["type"], "overloaded_error")
                 self.assertIn("cleared", r.json()["error"]["message"])
+                self.assertEqual(r.json()["request_id"], r.headers["request-id"])
                 # state is emptied
                 p = await c.get("/_control/pending")
                 self.assertFalse(p.json()["has_pending"])

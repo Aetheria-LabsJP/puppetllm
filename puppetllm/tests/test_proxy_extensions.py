@@ -44,12 +44,43 @@ def _run(coro: Any) -> Any:
 
 class TestPricing(unittest.TestCase):
     def test_resolve_family(self) -> None:
-        self.assertEqual(pricing.resolve_family("claude-opus-4-20250514"), "opus")
+        self.assertEqual(pricing.resolve_family("claude-opus-5"), "opus")
+        self.assertEqual(pricing.resolve_family("claude-opus-4-8"), "opus")
+        # generation-specific keys win over the family word ($15/$75 Opus 4.x generations)
+        self.assertEqual(pricing.resolve_family("claude-opus-4-20250514"), "opus-4-20")
+        self.assertEqual(pricing.resolve_family("claude-opus-4-1-20250805"), "opus-4-1")
         self.assertEqual(pricing.resolve_family("anthropic.claude-3-5-sonnet-20241022-v2:0"), "sonnet")
+        self.assertEqual(pricing.resolve_family("claude-sonnet-4-6"), "sonnet")
+        self.assertEqual(pricing.resolve_family("claude-sonnet-5"), "sonnet-5")
         self.assertEqual(pricing.resolve_family("us.anthropic.claude-haiku-4-5"), "haiku")
+        self.assertEqual(pricing.resolve_family("claude-3-5-haiku-20241022"), "3-5-haiku")
+        self.assertEqual(pricing.resolve_family("claude-fable-5-1"), "fable-5-1")
+        self.assertEqual(pricing.resolve_family("claude-fable-5"), "fable")
+        self.assertEqual(pricing.resolve_family("claude-mythos-5-1"), "mythos-5-1")
         # unknown falls back to the default (sonnet)
         self.assertEqual(pricing.resolve_family("mystery-model"), "sonnet")
         self.assertEqual(pricing.resolve_family(None), "sonnet")
+
+    def test_claude_prices(self) -> None:
+        # official per-Mtok prices: input / output / cache read / 5m write / 1h write
+        cases = {
+            "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
+            "claude-fable-5": (10.0, 50.0, 1.0, 12.5, 20.0),
+            "claude-opus-5": (5.0, 25.0, 0.5, 6.25, 10.0),
+            "claude-opus-4-1": (15.0, 75.0, 1.5, 18.75, 30.0),
+            "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5, 4.0),
+            "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75, 6.0),
+            "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25, 2.0),
+            "claude-3-5-haiku-20241022": (0.8, 4.0, 0.08, 1.0, 1.6),
+        }
+        for model, (inp, out, read, w5, w1h) in cases.items():
+            p = pricing.price_for(model)
+            self.assertEqual((p.input, p.output, p.cache_read, p.cache_write, p.cache_write_1h),
+                             (inp, out, read, w5, w1h), model)
+        # 1h writes are billed at their own (2x) rate
+        c = pricing.compute_cost("claude-opus-5", cache_write_tokens=1_000_000,
+                                 cache_write_1h_tokens=1_000_000)
+        self.assertAlmostEqual(c["cache_write_usd"], 6.25 + 10.0, places=6)
 
     def test_resolve_family_openai(self) -> None:
         self.assertEqual(pricing.resolve_family("gpt-5.4-2026-03-01"), "gpt-5.4")
@@ -57,11 +88,22 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(pricing.resolve_family("gpt-5.5-pro"), "gpt-5.5-pro")
         self.assertEqual(pricing.resolve_family("gpt-5.3-codex"), "codex")
         self.assertEqual(pricing.resolve_family("gpt-5-mini-2025-08-07"), "gpt-5-mini")
-        # legacy generations (plain/5.1/5.2) are absorbed into gpt-5
-        self.assertEqual(pricing.resolve_family("gpt-5.2"), "gpt-5")
+        # gpt-5.1 is absorbed into gpt-5 (same price); gpt-5.2 / pro tiers have their own rows
+        self.assertEqual(pricing.resolve_family("gpt-5.1"), "gpt-5")
+        self.assertEqual(pricing.resolve_family("gpt-5.2"), "gpt-5.2")
+        self.assertEqual(pricing.resolve_family("gpt-5.2-pro"), "gpt-5.2-pro")
+        self.assertEqual(pricing.resolve_family("gpt-5-pro"), "gpt-5-pro")
+        self.assertEqual(pricing.resolve_family("gpt-6-astra"), "gpt-6")
+        self.assertEqual(pricing.resolve_family("gpt-5.6-luna"), "gpt-5.6-luna")
+        self.assertEqual(pricing.resolve_family("gpt-5.6"), "gpt-5.6")
+        self.assertEqual(pricing.resolve_family("chat-latest"), "chat-latest")
         self.assertEqual(pricing.resolve_family("gpt-4o-mini"), "gpt-4o-mini")
         self.assertEqual(pricing.resolve_family("o4-mini"), "o4-mini")
         self.assertEqual(pricing.resolve_family("o3-2025-04-16"), "o3")
+        self.assertEqual(pricing.resolve_family("o3-pro"), "o3-pro")
+        self.assertEqual(pricing.resolve_family("o1-2024-12-17"), "o1")
+        # o-series keys only match on token boundaries (no "o1" inside "gpt-4o1-x")
+        self.assertEqual(pricing.resolve_family("gpt-4o1-x"), "gpt-4o")
         # unknown but containing gpt → current mid tier (gpt-5.4); otherwise sonnet as before
         self.assertEqual(pricing.resolve_family("gpt-9-experimental"), "gpt-5.4")
         self.assertEqual(pricing.resolve_family("mystery-model"), "sonnet")
@@ -217,16 +259,20 @@ class TestCacheSimulator(unittest.TestCase):
         self.assertEqual(sim.observe(rc, "opus", now=2.0)["status"], "hit")     # same model → hit
 
     def test_max_breakpoints_cap(self) -> None:
-        # 6 cache_control markers → only the deepest 4 are written, per the real-hardware limit.
+        # More than 4 explicit cache_control markers is a 400 on the real API → CacheControlError.
+        from puppetllm.cache_sim import CacheControlError
         sim = CacheSimulator(min_cacheable_tokens=0)
         msgs = [{"role": "user", "content": [{"type": "text", "text": f"m{i} " * 3,
                                               "cache_control": {"type": "ephemeral"}}]} for i in range(5)]
-        rc = analyze_request(
-            system=[{"type": "text", "text": "S " * 3, "cache_control": {"type": "ephemeral"}}],
-            messages=msgs)
-        self.assertEqual(len(rc.breakpoints), 6)
+        with self.assertRaises(CacheControlError):
+            analyze_request(
+                system=[{"type": "text", "text": "S " * 3, "cache_control": {"type": "ephemeral"}}],
+                messages=msgs)
+        # exactly 4 is the limit and all 4 are written
+        rc = analyze_request(messages=msgs[:4])
+        self.assertEqual(len(rc.breakpoints), 4)
         sim.observe(rc, "m", now=0.0)
-        self.assertEqual(len(sim.index), 4)   # only the deepest 4 (the shallowest 2 are dropped)
+        self.assertEqual(len(sim.index), 4)
 
     def test_incremental_multibreakpoint_prefix_match(self) -> None:
         """★core★ With a system anchor(BP1) + moving tail(BP2), turn2 prefix-matches and reads
@@ -542,6 +588,7 @@ class TestBedrockHttp(unittest.TestCase):
             transport=httpx.ASGITransport(app=self.mod.app), base_url="http://test")
 
     MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    CANONICAL = "claude-3-5-sonnet-20241022"
 
     def test_invoke_non_stream(self) -> None:
         async def run() -> None:
@@ -558,15 +605,24 @@ class TestBedrockHttp(unittest.TestCase):
                     await asyncio.sleep(0.05)
                 else:
                     self.fail("never became pending")
-                # provider is bedrock, model comes from the URL
+                # provider is bedrock, model comes from the URL and is normalized to the
+                # Anthropic-side name; the raw Bedrock id is kept alongside
                 self.assertEqual(p["pending"][0]["request"]["provider"], "bedrock")
-                self.assertEqual(p["pending"][0]["request"]["model"], self.MODEL)
+                self.assertEqual(p["pending"][0]["request"]["model"], self.CANONICAL)
+                self.assertEqual(p["pending"][0]["request"]["bedrock_model_id"], self.MODEL)
                 await c.post("/_control/auto", json={"text": "bedrock-reply"})
                 r = await t
                 self.assertEqual(r.status_code, 200)
                 body = r.json()
                 self.assertEqual(body["content"], [{"type": "text", "text": "bedrock-reply"}])
-                self.assertEqual(body["model"], self.MODEL)
+                self.assertEqual(body["model"], self.CANONICAL)
+                # Bedrock-compatible response headers
+                for h in ("X-Amzn-Bedrock-Input-Token-Count",
+                          "X-Amzn-Bedrock-Output-Token-Count",
+                          "X-Amzn-Bedrock-Invocation-Latency"):
+                    self.assertIn(h, r.headers)
+                    self.assertGreaterEqual(int(r.headers[h]), 0)
+                self.assertGreaterEqual(int(r.headers["X-Amzn-Bedrock-Output-Token-Count"]), 1)
         _run(run())
 
     def test_invoke_with_response_stream(self) -> None:
@@ -652,6 +708,173 @@ class TestBedrockHttp(unittest.TestCase):
                 self.assertEqual(r1.json()["content"][0]["text"], "reply-AA")
                 self.assertEqual(r2.json()["content"][0]["text"], "reply-BB")
         _run(run())
+
+    async def _pending(self, c, path: str, body: dict) -> Any:
+        t = asyncio.create_task(c.post(path, json=body, timeout=10))
+        for _ in range(50):
+            if (await c.get("/_control/pending")).json().get("has_pending"):
+                return t
+            await asyncio.sleep(0.05)
+        self.fail("never became pending")
+
+    @staticmethod
+    def _body(text: str = "hi", **over: Any) -> dict:
+        b = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 10,
+             "messages": [{"role": "user", "content": text}]}
+        b.update(over)
+        return b
+
+    # #2: percent-encoded `:` in the path and cross-region prefixes normalize to one
+    # canonical model, so cost aggregation merges them into a single by_model row
+    def test_model_id_normalization_merges_stats(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                enc = "anthropic.claude-haiku-4-5-20251001-v1%3A0"
+                t1 = await self._pending(c, f"/model/{enc}/invoke", self._body("a"))
+                p = (await c.get("/_control/pending")).json()
+                self.assertEqual(p["pending"][0]["request"]["model"], "claude-haiku-4-5-20251001")
+                self.assertEqual(p["pending"][0]["request"]["bedrock_model_id"],
+                                 "anthropic.claude-haiku-4-5-20251001-v1:0")
+                await c.post("/_control/auto", json={"text": "ok"})
+                self.assertEqual((await t1).json()["model"], "claude-haiku-4-5-20251001")
+
+                for prefix in ("us.", "eu.", "apac."):
+                    t = await self._pending(
+                        c, f"/model/{prefix}anthropic.claude-haiku-4-5-20251001-v1:0/invoke",
+                        self._body("b"))
+                    await c.post("/_control/auto", json={"text": "ok"})
+                    self.assertEqual((await t).json()["model"], "claude-haiku-4-5-20251001")
+
+                st = (await c.get("/_control/stats")).json()
+                self.assertEqual(list(st["by_model"]), ["claude-haiku-4-5-20251001"])
+                self.assertEqual(st["by_model"]["claude-haiku-4-5-20251001"]["requests"], 4)
+                # pricing resolved through the canonical name (haiku family)
+                hist = (await c.get("/_control/history")).json()["history"]
+                self.assertTrue(all(h["provider"] == "bedrock" for h in hist))
+                self.assertTrue(all(h["request"]["bedrock_model_id"].endswith("-v1:0") for h in hist))
+        _run(run())
+
+    # an id without the `anthropic.` segment passes through unchanged
+    def test_unknown_model_id_passthrough(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                t = await self._pending(c, "/model/some-other-model/invoke", self._body())
+                p = (await c.get("/_control/pending")).json()
+                self.assertEqual(p["pending"][0]["request"]["model"], "some-other-model")
+                await c.post("/_control/auto", json={"text": "ok"})
+                self.assertEqual((await t).json()["model"], "some-other-model")
+        _run(run())
+
+    # #5: Anthropic-style (or absent) error types are mapped to AWS exception names by status;
+    # explicit AWS names pass through
+    def test_error_status_mapped_to_aws_exception(self) -> None:
+        cases = [
+            ({"status": 429, "type": "rate_limit_error"}, "ThrottlingException"),
+            ({"status": 400, "type": "invalid_request_error"}, "ValidationException"),
+            ({"status": 503}, "ServiceUnavailableException"),
+            ({"status": 408, "type": "timeout"}, "ModelTimeoutException"),
+            ({"status": 500, "type": "api_error"}, "InternalServerException"),
+            ({"status": 502, "type": "api_error"}, "InternalServerException"),
+            ({"status": 418, "type": "teapot"}, "ValidationException"),
+            ({"status": 424, "type": "ModelErrorException"}, "ModelErrorException"),
+            ({"status": 429, "type": "ModelNotReadyException"}, "ModelNotReadyException"),
+        ]
+        async def run() -> None:
+            async with await self._client() as c:
+                for inject, expected in cases:
+                    t = await self._pending(c, f"/model/{self.MODEL}/invoke", self._body())
+                    await c.post("/_control/error", json={"message": "boom", **inject})
+                    r = await t
+                    self.assertEqual(r.status_code, inject["status"], inject)
+                    self.assertEqual(r.headers.get("x-amzn-ErrorType"), expected, inject)
+                    self.assertEqual(r.json(), {"message": "boom", "__type": expected}, inject)
+                    self.assertIn("x-amzn-requestid", r.headers)
+        _run(run())
+
+    # #9: anthropic_version is validated up front (no pending is created)
+    def test_anthropic_version_validation(self) -> None:
+        async def run() -> None:
+            async with await self._client() as c:
+                for path in (f"/model/{self.MODEL}/invoke",
+                             f"/model/{self.MODEL}/invoke-with-response-stream"):
+                    missing = self._body()
+                    del missing["anthropic_version"]
+                    r = await c.post(path, json=missing)
+                    self.assertEqual(r.status_code, 400)
+                    self.assertEqual(r.headers.get("x-amzn-ErrorType"), "ValidationException")
+                    self.assertEqual(r.json()["__type"], "ValidationException")
+                    self.assertIn("anthropic_version", r.json()["message"])
+
+                    r = await c.post(path, json=self._body(anthropic_version="2023-06-01"))
+                    self.assertEqual(r.status_code, 400)
+                    self.assertEqual(r.json()["__type"], "ValidationException")
+                    self.assertIn("bedrock-2023-05-31", r.json()["message"])
+
+                    r = await c.post(path, json=self._body(anthropic_version=None))
+                    self.assertEqual(r.status_code, 400)
+
+                self.assertFalse((await c.get("/_control/pending")).json()["has_pending"])
+                self.assertEqual((await c.get("/_control/health")).json()["turn_count"], 0)
+                self.assertEqual((await c.get("/_control/history")).json()["history"], [])
+        _run(run())
+
+    # #10: each Bedrock receipt (and each rejection) is logged to stderr with a [bedrock] tag
+    def test_receipt_logged_to_stderr(self) -> None:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        async def run() -> None:
+            async with await self._client() as c:
+                t = await self._pending(c, f"/model/us.{self.MODEL}/invoke-with-response-stream",
+                                        self._body())
+                pid = (await c.get("/_control/pending")).json()["pending"][0]["pending_id"]
+                await c.post("/_control/auto", json={"text": "ok"})
+                await t
+                bad = self._body()
+                del bad["anthropic_version"]
+                await c.post(f"/model/{self.MODEL}/invoke", json=bad)
+                return pid
+        with contextlib.redirect_stderr(buf):
+            pid = _run(run())
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.startswith("[bedrock] ")]
+        self.assertEqual(len(lines), 2, buf.getvalue())
+        self.assertIn("invoke-with-response-stream", lines[0])
+        self.assertIn(f"model=us.{self.MODEL} -> {self.CANONICAL}", lines[0])
+        self.assertIn(f"pending={pid}", lines[0])
+        self.assertIn("rejected", lines[1])
+        self.assertIn("anthropic_version", lines[1])
+
+
+# ── Bedrock model id normalization (pure) ────────────────────────────
+
+
+class TestBedrockModelId(unittest.TestCase):
+    def test_normalize(self) -> None:
+        _import_fresh()  # bedrock is only importable once fake_server has been loaded
+        from puppetllm.providers.bedrock import normalize_model_id, exception_name_for
+        cases = {
+            "anthropic.claude-3-5-sonnet-20241022-v2:0": ("claude-3-5-sonnet-20241022", None),
+            "anthropic.claude-haiku-4-5-20251001-v1:0": ("claude-haiku-4-5-20251001", None),
+            "us.anthropic.claude-opus-4-1-20250805-v1:0": ("claude-opus-4-1-20250805", "us"),
+            "eu.anthropic.claude-sonnet-4-5-20250929-v1:0": ("claude-sonnet-4-5-20250929", "eu"),
+            "apac.anthropic.claude-3-haiku-20240307-v1:0": ("claude-3-haiku-20240307", "apac"),
+            "us-gov.anthropic.claude-3-5-sonnet-20240620-v1:0": ("claude-3-5-sonnet-20240620", "us-gov"),
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0": ("claude-sonnet-4-5-20250929", "global"),
+            "anthropic.claude-v2:1": ("claude", None),
+            "anthropic.claude-instant-v1": ("claude-instant", None),
+            # not a Bedrock Anthropic id → unchanged
+            "claude-sonnet-4-5": ("claude-sonnet-4-5", None),
+            "meta.llama3-70b-instruct-v1:0": ("meta.llama3-70b-instruct-v1:0", None),
+        }
+        for raw, (canonical, region) in cases.items():
+            m = normalize_model_id(raw)
+            self.assertEqual((m.raw, m.canonical, m.region), (raw, canonical, region), raw)
+            self.assertEqual(pricing.resolve_family(m.canonical), pricing.resolve_family(raw), raw)
+        self.assertEqual(exception_name_for(429, "rate_limit_error"), "ThrottlingException")
+        self.assertEqual(exception_name_for(429, None), "ThrottlingException")
+        self.assertEqual(exception_name_for(499, "x"), "ValidationException")
+        self.assertEqual(exception_name_for(599, "x"), "InternalServerException")
+        self.assertEqual(exception_name_for(200, "CustomException"), "CustomException")
 
 
 # ── HTTP: OpenAI path ────────────────────────────────────────────────
@@ -957,12 +1180,23 @@ class TestRegressions(unittest.TestCase):
     # B1: skipping an unknown block leaves a gap in the stream index and crashes the real SDK
     def test_stream_index_contiguous_with_unknown_blocks(self) -> None:
         events = self.mod.stream_event_dicts("m", "c", [
-            {"type": "thinking", "thinking": "hidden"},
+            {"type": "mystery_block", "data": "hidden"},
             {"type": "text", "text": "visible"},
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
         ])
         starts = [d for n, d in events if n == "content_block_start"]
-        self.assertEqual([d["index"] for d in starts], [0, 1])  # no gaps (thinking is skipped)
+        self.assertEqual([d["index"] for d in starts], [0, 1])  # no gaps (unknown block is skipped)
+        # thinking IS modeled: it takes an index and streams thinking_delta + signature_delta
+        events = self.mod.stream_event_dicts("m", "c", [
+            {"type": "thinking", "thinking": "hidden", "signature": "sig"},
+            {"type": "text", "text": "visible"},
+        ])
+        starts = [d for n, d in events if n == "content_block_start"]
+        self.assertEqual([(d["index"], d["content_block"]["type"]) for d in starts],
+                         [(0, "thinking"), (1, "text")])
+        deltas = [d["delta"] for n, d in events if n == "content_block_delta" and d["index"] == 0]
+        self.assertEqual([d["type"] for d in deltas], ["thinking_delta", "signature_delta"])
+        self.assertEqual(deltas[-1]["signature"], "sig")
 
     # B1 continued: ping appears in the SSE (right after message_start, like the real API)
     def test_sse_stream_has_ping(self) -> None:
@@ -1217,19 +1451,37 @@ class TestRegressions(unittest.TestCase):
                     {"type": "text", "text": "visible"}]})
                 base_out = (await t0).json()["usage"]["output_tokens"]
 
-                # thinking + text: thinking must be dropped from content, usage, and history
+                # unknown + text: the unknown block must be dropped from content, usage, and history
                 t = await self._make_pending(c, "/v1/messages", {
                     "model": "claude-x", "messages": [{"role": "user", "content": "b"}]})
                 await c.post("/_control/respond", json={"content": [
-                    {"type": "thinking", "thinking": "X" * 400},
+                    {"type": "mystery_block", "data": "X" * 400},
                     {"type": "text", "text": "visible"}]})
                 j = (await t).json()
                 self.assertEqual([b["type"] for b in j["content"]], ["text"])
-                # usage must NOT count the dropped thinking block (was the real regression)
+                # usage must NOT count the dropped block (was the real regression)
                 self.assertEqual(j["usage"]["output_tokens"], base_out)
                 # history must record the same filtered blocks the caller received
                 h = (await c.get("/_control/history")).json()["history"][-1]
                 self.assertEqual([b["type"] for b in h["response_blocks"]], ["text"])
+
+                # thinking + text: thinking is modeled — kept in content (with a signature),
+                # counted in output_tokens_details.thinking_tokens, and recorded in history
+                t = await self._make_pending(c, "/v1/messages", {
+                    "model": "claude-opus-5", "messages": [{"role": "user", "content": "c"}]})
+                await c.post("/_control/respond", json={"content": [
+                    {"type": "thinking", "thinking": "X" * 400},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "visible"}]})
+                j = (await t).json()
+                self.assertEqual([b["type"] for b in j["content"]],
+                                 ["thinking", "redacted_thinking", "text"])
+                self.assertTrue(j["content"][0]["signature"])
+                self.assertGreater(j["usage"]["output_tokens"], base_out)
+                self.assertGreater(j["usage"]["output_tokens_details"]["thinking_tokens"], 0)
+                h = (await c.get("/_control/history")).json()["history"][-1]
+                self.assertEqual([b["type"] for b in h["response_blocks"]],
+                                 ["thinking", "redacted_thinking", "text"])
         _run(run())
 
     # #2b: an OpenAI call_ id we minted (toolu_→call_) round-trips through normalization
@@ -1362,8 +1614,8 @@ class TestUsageOverride(unittest.TestCase):
                 self.assertEqual(u["cache_read_input_tokens"], 500)
                 h = (await c.get("/_control/history")).json()["history"][-1]
                 self.assertTrue(h.get("usage_overridden"))
-                # cost is recomputed from the overridden numbers (opus: in $5 + out $25 + read $0.5 /Mtok)
-                expected = (1000 * 5.0 + 250 * 25.0 + 500 * 0.50) / 1_000_000
+                # cost is recomputed from the overridden numbers (opus 4.1: in $15 + out $75 + read $1.5 /Mtok)
+                expected = (1000 * 15.0 + 250 * 75.0 + 500 * 1.50) / 1_000_000
                 self.assertAlmostEqual(h["cost"]["total_usd"], expected, places=9)
                 s = (await c.get("/_control/stats")).json()
                 self.assertEqual(s["totals"]["input_tokens"], 1000)
@@ -1545,7 +1797,17 @@ class TestRelayUnit(unittest.TestCase):
         self.assertEqual(body["tools"][0]["name"], "wx")
         self.assertEqual(body["tool_choice"], {"type": "any"})       # required -> any
         self.assertEqual(body["stop_sequences"], ["END"])            # str wrapped in list
-        self.assertNotIn("thinking", body)                          # dropped (server strips)
+        self.assertEqual(body["thinking"], {"type": "enabled"})     # forwarded (server keeps thinking blocks)
+        # OpenAI-inbound structured output / effort → output_config
+        body = relay.to_anthropic_request({
+            "messages": [{"role": "user", "content": "x"}],
+            "params": {"reasoning_effort": "minimal",
+                       "response_format": {"type": "json_schema", "json_schema": {
+                           "name": "s", "schema": {"type": "object"}}}}},
+            "claude-opus-5")
+        self.assertEqual(body["output_config"],
+                         {"format": {"type": "json_schema", "schema": {"type": "object"}},
+                          "effort": "low"})
 
     def test_tool_choice_to_anthropic(self) -> None:
         from puppetllm.relay import _tool_choice_to_anthropic as f
@@ -2122,6 +2384,32 @@ class TestRelayE2E(unittest.TestCase):
         self.assertEqual(body["system"], "sys")
         self.assertEqual(body["model"], "mock-1")
         self.assertEqual(body["max_tokens"], 32)
+
+    def test_anthropic_upstream_gets_beta_header_and_speed(self) -> None:
+        # An Anthropic-SDK app using a beta feature (fast mode) through the relay: the
+        # anthropic-beta header and the `speed` body field must reach the upstream.
+        import anthropic
+        self.upstream.queue[:] = [(200, {
+            "id": "msg_x", "type": "message", "role": "assistant", "model": "mock-1",
+            "content": [{"type": "text", "text": "fast"}], "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 3, "output_tokens": 1, "speed": "fast",
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}})]
+        self.upstream.seen.clear()
+        self.upstream.seen_headers.clear()
+        th = self._run_relay(max_requests=1, kind="anthropic")
+        client = anthropic.Anthropic(api_key="sk-mock", base_url=f"http://127.0.0.1:{self.FRONT}",
+                                     max_retries=0, timeout=8)
+        msg = client.messages.create(model="claude-opus-5", max_tokens=16,
+                                     messages=[{"role": "user", "content": "x"}],
+                                     extra_headers={"anthropic-beta": "fast-mode-2026-02-01"},
+                                     extra_body={"speed": "fast"})
+        th.join(timeout=10)
+        self.assertEqual(msg.content[0].text, "fast")
+        self.assertEqual(msg.usage.speed, "fast")
+        hdr = self.upstream.seen_headers[0]
+        self.assertEqual(hdr.get("anthropic-beta"), "fast-mode-2026-02-01")
+        self.assertEqual(self.upstream.seen[0]["speed"], "fast")
 
 
 if __name__ == "__main__":

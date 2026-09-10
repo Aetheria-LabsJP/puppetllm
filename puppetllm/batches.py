@@ -250,10 +250,12 @@ def _rollback_creation(batch: dict[str, Any]) -> None:
 
 
 def _errored_result(etype: str, message: str) -> dict[str, Any]:
-    """The `errored` result shape (the official error envelope nested under `error`)."""
+    """The `errored` result shape (the official error envelope nested under `error`,
+    including the `request_id` the real envelope carries)."""
     return {
         "type": "errored",
-        "error": {"type": "error", "error": {"type": etype, "message": message}},
+        "error": {"type": "error", "error": {"type": etype, "message": message},
+                  "request_id": fs._new_request_id()},
     }
 
 
@@ -274,7 +276,8 @@ async def _resolve_result(snapshot: dict[str, Any],
     model_out = snapshot.get("model") or "claude-sonnet-mock"
     message = fs._build_non_stream_response(
         res["message_id"], model_out, res["content_blocks"], res["usage"],
-        res.get("stop_reason"),
+        res.get("stop_reason"), res.get("stop_sequence"), res.get("stop_details"),
+        snapshot.get("params"),
     )
     return {"type": "succeeded", "message": message}
 
@@ -398,10 +401,21 @@ def build_router() -> APIRouter:
             if not isinstance(params, dict):
                 return fs._anthropic_error(400, "invalid_request_error",
                                            f"requests[{i}].params must be an object")
+            # Parameters the real API rejects at create time ("Including any of these
+            # returns a validation error"): stream, speed (fast mode), max_tokens: 0
+            # (cache pre-warm), and fallbacks (not available on Batches).
             if params.get("stream"):
                 return fs._anthropic_error(
                     400, "invalid_request_error",
                     f"requests[{i}].params.stream: streaming is not supported in batches")
+            if "speed" in params:
+                return fs._anthropic_error(
+                    400, "invalid_request_error",
+                    f"requests[{i}].params.speed: fast mode is not supported in batches")
+            if params.get("max_tokens") == 0:
+                return fs._anthropic_error(
+                    400, "invalid_request_error",
+                    f"requests[{i}].params.max_tokens: must be at least 1 in batches")
 
         now = time.time()
         batch_id = f"msgbatch_{uuid.uuid4().hex[:24]}"
@@ -427,6 +441,16 @@ def build_router() -> APIRouter:
             for i, item in enumerate(requests_in):
                 cid = item["custom_id"]
                 params = item["params"]
+                if "fallbacks" in params:
+                    # Not a create-time validation error on the real API: the batch is
+                    # accepted and this item alone comes back as `errored`. No pending is
+                    # created and nothing is billed / recorded.
+                    batch["entries"][cid] = {
+                        "pending_id": None, "task": None,
+                        "result": _errored_result(
+                            "invalid_request_error",
+                            "fallbacks: not available in the Message Batches API")}
+                    continue
                 try:
                     snapshot, fut = await fs.register_request(
                         "anthropic", params.get("model"), params, is_stream=False,
@@ -459,10 +483,10 @@ def build_router() -> APIRouter:
                 # /_control/clear wiped the registry while entries were still being
                 # registered. Sweep the pendings this loop created after the clear (and
                 # any history they already produced) so nothing survives the clear, then
-                # tell the caller — same 503 shape as a cleared /v1/messages request.
+                # tell the caller — same 529 shape as a cleared /v1/messages request.
                 _sweep_pendings(batch)
                 _purge_history(batch_id)
-                return fs._anthropic_error(503, "api_error",
+                return fs._anthropic_error(529, "overloaded_error",
                                            "request cleared: batch cleared during creation")
             batch["creating"] = False
             # A fast responder may have answered every entry while registration was
@@ -484,9 +508,9 @@ def build_router() -> APIRouter:
         # Out-of-range values are rejected rather than clamped, and unknown cursors
         # rejected rather than ignored: silently accepting what the real API refuses
         # would let a paginating app pass here and fail in production.
-        if not (1 <= limit <= 100):
+        if not (1 <= limit <= 1000):
             return fs._anthropic_error(400, "invalid_request_error",
-                                       "limit must be in [1, 100]")
+                                       "limit must be in [1, 1000]")
         after_id = qp.get("after_id")
         before_id = qp.get("before_id")
         async with fs.state.lock:

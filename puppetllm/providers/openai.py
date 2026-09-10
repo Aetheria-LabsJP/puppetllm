@@ -40,6 +40,10 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ..openai_wire import (image_url_to_canonical as _image_url_to_canonical,
+                           openai_call_id as _openai_call_id,
+                           tool_call_from_canonical, tool_call_to_canonical)
+
 # canonical core. WARNING: circular import (same constraint as providers/bedrock.py):
 # fake_server imports this module at its end and calls build_router(). Here we hold
 # only a module reference; attributes like `fs.register_request` must always be
@@ -56,17 +60,40 @@ _TEXT_CHUNK = 80
 def _content_text(content: Any) -> str:
     """Extract and concatenate text from OpenAI message content (str | parts list).
 
-    Parts other than text (image_url etc.) are not stringified (and do not count
-    toward approximate tokens).
+    `text` and assistant `refusal` parts are included; other parts (image_url etc.) are
+    not stringified (and do not count toward approximate tokens).
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         return "".join(
-            str(p.get("text", "")) for p in content
-            if isinstance(p, dict) and p.get("type") == "text"
+            str(p.get("text", "")) if p.get("type") == "text" else str(p.get("refusal", ""))
+            for p in content
+            if isinstance(p, dict) and p.get("type") in ("text", "refusal")
         )
     return "" if content is None else str(content)
+
+
+def _user_content_to_canonical(content: Any) -> Any:
+    """User content: str passes through; a parts list is converted part by part
+    (`text` → text, `image_url` → image; `input_audio` / `file` are kept verbatim so the
+    responder can still see them)."""
+    if not isinstance(content, list):
+        return content
+    out: list[Any] = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        if t == "text":
+            out.append({"type": "text", "text": str(p.get("text", ""))})
+        elif t == "image_url":
+            blk = _image_url_to_canonical(p)
+            if blk is not None:
+                out.append(blk)
+        else:
+            out.append(p)
+    return out
 
 
 def normalize_chat_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -107,33 +134,51 @@ def normalize_chat_body(body: dict[str, Any]) -> dict[str, Any]:
             text = _content_text(m.get("content"))
             if text:
                 blocks.append({"type": "text", "text": text})
+            if not text and isinstance(m.get("refusal"), str) and m["refusal"]:
+                blocks.append({"type": "text", "text": m["refusal"]})
             for tc in m.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                fn = tc.get("function")
-                fn = fn if isinstance(fn, dict) else {}
-                raw = fn.get("arguments")
-                try:
-                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                except ValueError:
-                    args = {"_raw": raw}  # don't swallow broken arguments; expose them as-is
-                blocks.append({"type": "tool_use", "id": str(tc.get("id") or ""),
-                               "name": str(fn.get("name") or ""), "input": args})
+                blk = tool_call_to_canonical(tc)
+                if blk is not None:
+                    blocks.append(blk)
             messages.append({"role": "assistant", "content": blocks or text})
         else:
-            # user (or unknown role): pass content through as-is, whether str or parts list.
-            # OpenAI's text part `{type:"text", text}` has the same shape as canonical, so it's compatible.
-            messages.append({"role": str(role or "user"), "content": m.get("content")})
+            # user (or unknown role): str passes through; a parts list is converted
+            # (OpenAI's text part `{type:"text", text}` has the same shape as canonical;
+            # `image_url` becomes a canonical image block).
+            messages.append({"role": str(role or "user"),
+                             "content": _user_content_to_canonical(m.get("content"))})
     tools = []
     for t in body.get("tools") or []:
-        if isinstance(t, dict) and t.get("type") == "function":
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function":
             fn = t.get("function")
             if not isinstance(fn, dict):
                 continue  # skip malformed tool definitions (don't 500)
-            tools.append({
+            tool: dict[str, Any] = {
                 "name": fn.get("name"),
                 "description": fn.get("description"),
                 "input_schema": fn.get("parameters") or {},
+            }
+            if fn.get("strict") is not None:
+                tool["strict"] = bool(fn["strict"])
+            tools.append(tool)
+        elif t.get("type") == "custom":
+            # OpenAI custom (free-form) tools take a raw string. Represent them canonically
+            # as a tool with a single string `input` and tag the origin so the OpenAI
+            # encoder / relay can emit them as `custom` calls again.
+            cu = t.get("custom")
+            if not isinstance(cu, dict):
+                continue
+            tools.append({
+                "name": cu.get("name"),
+                "description": cu.get("description"),
+                "input_schema": {"type": "object", "properties": {"input": {"type": "string"}},
+                                 "required": ["input"]},
+                "_openai_custom": True,
+                **({"format": cu["format"]} if cu.get("format") is not None else {}),
             })
     max_tokens = body.get("max_completion_tokens")
     if max_tokens is None:
@@ -156,38 +201,39 @@ def normalize_chat_body(body: dict[str, Any]) -> dict[str, Any]:
 # ── response conversion (canonical blocks → OpenAI chat form) ───────────────
 
 # canonical (Anthropic vocabulary) stop_reason → OpenAI finish_reason.
-# Unknown values pass through as-is (the responder can directly specify OpenAI
-# vocabulary such as "content_filter").
+# OpenAI's own vocabulary passes through (the responder can directly specify
+# "content_filter" etc.); any other unknown value falls back to "stop" so a non-standard
+# string never reaches the app's SDK as a bogus finish_reason.
 _FINISH_REASON_MAP = {
     "end_turn": "stop",
     "tool_use": "tool_calls",
     "max_tokens": "length",
     "stop_sequence": "stop",
-    "refusal": "content_filter",
+    # A model refusal is an ordinary `stop` whose text lives in `message.refusal`
+    # (OpenAI's shape); `content_filter` is reserved for omitted-by-filter and can still
+    # be requested verbatim by a responder.
+    "refusal": "stop",
+    "pause_turn": "stop",
+    "model_context_window_exceeded": "length",
 }
+_OPENAI_FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "function_call")
 
 
-def _openai_call_id(raw: Any) -> str:
-    """Map a canonical tool_use id to the OpenAI `call_...` id form.
-
-    The canonical (Anthropic-style) core assigns `toolu_...` ids to tool_use blocks
-    that lack one, so by the time this runs the id is almost always present. Rewrite the
-    `toolu_` prefix to `call_` (deterministic, so the same block yields the same id in
-    both the non-stream and stream encoders); ids the responder set explicitly are kept
-    as-is; a truly empty id falls back to a fresh `call_...`.
-    """
-    s = str(raw or "")
-    if s.startswith("toolu_"):
-        return "call_" + s[len("toolu_"):]
-    return s or f"call_{uuid.uuid4().hex[:24]}"
+def finish_reason_for(stop_reason: str) -> str:
+    if stop_reason in _OPENAI_FINISH_REASONS:
+        return stop_reason
+    return _FINISH_REASON_MAP.get(stop_reason, "stop")
 
 
-def _to_chat_message(content_blocks: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+def _to_chat_message(content_blocks: list[dict[str, Any]],
+                     refusal: bool = False) -> tuple[dict[str, Any], str]:
     """canonical content blocks → (assistant message, finish_reason).
 
     The tool_use input is converted back to a JSON **string** (arguments) to match
     the OpenAI form. finish_reason is auto-determined by the presence of tool_calls
-    (handled the same as the Anthropic route's stop_reason).
+    (handled the same as the Anthropic route's stop_reason). A refusal (canonical
+    `stop_reason: "refusal"`) takes OpenAI's refusal shape: the text goes to
+    `message.refusal`, `content` is null, and finish_reason is `"stop"`.
     """
     texts = [str(b.get("text", "")) for b in content_blocks
              if isinstance(b, dict) and b.get("type") == "text"]
@@ -195,19 +241,18 @@ def _to_chat_message(content_blocks: list[dict[str, Any]]) -> tuple[dict[str, An
     for b in content_blocks:
         if not (isinstance(b, dict) and b.get("type") == "tool_use"):
             continue
-        tool_calls.append({
-            "id": _openai_call_id(b.get("id")),
-            "type": "function",
-            "function": {
-                "name": str(b.get("name", "")),
-                "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False),
-            },
-        })
+        tool_calls.append(tool_call_from_canonical(b))
+    joined = "".join(texts) if texts else None
     message: dict[str, Any] = {"role": "assistant",
-                               "content": "".join(texts) if texts else None}
+                               "content": None if refusal else joined,
+                               "refusal": (joined or "") if refusal else None,
+                               "annotations": []}
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message, ("tool_calls" if tool_calls else "stop")
+
+
+
 
 
 def _usage_out(usage: dict[str, Any]) -> dict[str, Any]:
@@ -215,22 +260,33 @@ def _usage_out(usage: dict[str, Any]) -> dict[str, Any]:
 
     prompt_tokens is the total input (= uncached + cache read + creation). The OpenAI
     route has no cache observation, so read/creation are effectively 0, but the
-    conversion is written in the general form.
+    conversion is written in the general form. `n` choices are already folded into the
+    canonical usage by the core (so wire, history and stats agree).
     """
     read = int(usage.get("cache_read_input_tokens", 0))
     prompt = (int(usage.get("input_tokens", 0)) + read
               + int(usage.get("cache_creation_input_tokens", 0)))
     completion = int(usage.get("output_tokens", 0))
+    otd = usage.get("output_tokens_details")
+    reasoning = int(otd.get("thinking_tokens") or 0) if isinstance(otd, dict) else 0
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
-        # The real API always includes details (even at 0). Prevents AttributeError on the reader side.
-        "prompt_tokens_details": {"cached_tokens": read, "audio_tokens": 0},
-        "completion_tokens_details": {"reasoning_tokens": 0, "audio_tokens": 0,
+        # The real API always includes details (even at 0). Prevents AttributeError on the
+        # reader side. Only fields the current SDK / API define are emitted.
+        "prompt_tokens_details": {"cached_tokens": read, "audio_tokens": 0,
+                                  "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0))},
+        "completion_tokens_details": {"reasoning_tokens": reasoning, "audio_tokens": 0,
                                       "accepted_prediction_tokens": 0,
                                       "rejected_prediction_tokens": 0},
     }
+
+
+def service_tier_out(requested: Any) -> str:
+    """The tier the response reports: echo an explicit request tier, else `default`
+    (the real API resolves `auto` to the tier actually used)."""
+    return requested if isinstance(requested, str) and requested not in ("", "auto") else "default"
 
 
 def build_non_stream_response(
@@ -241,10 +297,11 @@ def build_non_stream_response(
     created: int,
     stop_reason: str | None = None,
     n: int = 1,
+    service_tier: Any = None,
 ) -> dict[str, Any]:
-    message, finish = _to_chat_message(content_blocks)
+    message, finish = _to_chat_message(content_blocks, refusal=(stop_reason == "refusal"))
     if stop_reason is not None:
-        finish = _FINISH_REASON_MAP.get(stop_reason, stop_reason)
+        finish = finish_reason_for(stop_reason)
     # n>1: the real API returns n independent samples, but the fake duplicates the same
     # injected content (for index compatibility with apps that read choices[i]; it does
     # not simulate content diversity).
@@ -257,6 +314,8 @@ def build_non_stream_response(
                      "logprobs": None, "finish_reason": finish}
                     for i in range(max(1, n))],
         "usage": _usage_out(usage),
+        "service_tier": service_tier_out(service_tier),
+        "system_fingerprint": None,
     }
 
 
@@ -268,6 +327,8 @@ def stream_chunk_dicts(
     created: int,
     include_usage: bool,
     stop_reason: str | None = None,
+    n: int = 1,
+    service_tier: Any = None,
 ) -> list[dict[str, Any]]:
     """Build the sequence of chunk dicts for the OpenAI streaming protocol.
 
@@ -275,20 +336,26 @@ def stream_chunk_dicts(
     delta, a tool call is "leading delta of id+name → following delta of arguments",
     and the terminating delta is empty + finish_reason. When include_usage is set,
     every chunk carries `usage: null`, and after termination a usage-only chunk (empty
-    choices) is sent (per the real API spec).
+    choices) is sent (per the real API spec). With n>1 the same delta sequence is
+    emitted once per choice index (interleaved), mirroring the non-stream duplication.
     """
-    def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
+    tier = service_tier_out(service_tier)
+    refusal = stop_reason == "refusal"
+
+    def chunk(delta: dict[str, Any], finish: str | None = None, index: int = 0) -> dict[str, Any]:
         c = {
             "id": completion_id, "object": "chat.completion.chunk",
             "created": created, "model": model,
-            "choices": [{"index": 0, "delta": delta,
+            "service_tier": tier, "system_fingerprint": None,
+            "choices": [{"index": index, "delta": delta,
                          "logprobs": None, "finish_reason": finish}],
         }
         if include_usage:
             c["usage"] = None
         return c
 
-    out = [chunk({"role": "assistant", "content": ""})]
+    # Build the per-choice delta sequence once, then fan it out over the n indices.
+    deltas: list[dict[str, Any]] = [{"role": "assistant", "content": "", "refusal": None}]
     finish = "stop"
     tc_index = 0
     for b in content_blocks:
@@ -298,31 +365,82 @@ def stream_chunk_dicts(
             pieces = [text[i:i + _TEXT_CHUNK]
                       for i in range(0, len(text), _TEXT_CHUNK)] or [""]
             for p in pieces:
-                out.append(chunk({"content": p}))
+                # a refusal streams as `delta.refusal` (OpenAI's shape), never as content
+                deltas.append({"refusal": p} if refusal else {"content": p})
         elif btype == "tool_use":
             finish = "tool_calls"
-            tool_id = _openai_call_id(b.get("id"))
-            out.append(chunk({"tool_calls": [{
-                "index": tc_index, "id": tool_id, "type": "function",
-                "function": {"name": str(b.get("name", "")), "arguments": ""},
-            }]}))
-            out.append(chunk({"tool_calls": [{
-                "index": tc_index,
-                "function": {"arguments": json.dumps(b.get("input") or {},
-                                                     ensure_ascii=False)},
-            }]}))
+            call = tool_call_from_canonical(b)
+            if call["type"] == "custom":
+                deltas.append({"tool_calls": [{
+                    "index": tc_index, "id": call["id"], "type": "custom",
+                    "custom": {"name": call["custom"]["name"], "input": ""}}]})
+                deltas.append({"tool_calls": [{
+                    "index": tc_index, "custom": {"input": call["custom"]["input"]}}]})
+            else:
+                deltas.append({"tool_calls": [{
+                    "index": tc_index, "id": call["id"], "type": "function",
+                    "function": {"name": call["function"]["name"], "arguments": ""},
+                }]})
+                deltas.append({"tool_calls": [{
+                    "index": tc_index,
+                    "function": {"arguments": call["function"]["arguments"]},
+                }]})
             tc_index += 1
-        # Skip unknown blocks (anything other than text/tool_use) (same as the Anthropic route).
+        # Skip other blocks (thinking etc. have no Chat Completions representation).
     if stop_reason is not None:
-        finish = _FINISH_REASON_MAP.get(stop_reason, stop_reason)
-    out.append(chunk({}, finish=finish))
+        finish = finish_reason_for(stop_reason)
+    n = max(1, n)
+    out: list[dict[str, Any]] = []
+    for d in deltas:
+        for i in range(n):
+            out.append(chunk(d, index=i))
+    for i in range(n):
+        out.append(chunk({}, finish=finish, index=i))
     if include_usage:
         out.append({
             "id": completion_id, "object": "chat.completion.chunk",
             "created": created, "model": model,
+            "service_tier": tier, "system_fingerprint": None,
             "choices": [], "usage": _usage_out(usage),
         })
     return out
+
+
+# Anthropic-vocabulary error types → OpenAI vocabulary (used when an injector passed an
+# Anthropic name or the default `api_error` to the OpenAI route).
+_ERROR_TYPE_MAP = {
+    "invalid_request_error": "invalid_request_error",
+    "authentication_error": "authentication_error",
+    "permission_error": "permission_error",
+    "not_found_error": "not_found_error",
+    "rate_limit_error": "rate_limit_error",
+    "overloaded_error": "server_error",
+    "api_error": None,  # resolve by status
+    "timeout_error": "server_error",
+    "billing_error": "insufficient_quota",
+    "request_too_large": "invalid_request_error",
+}
+
+
+def error_type_for(status: int, etype: str | None) -> str:
+    if etype and etype not in _ERROR_TYPE_MAP:
+        return etype  # already OpenAI-style (or caller-chosen) — pass through
+    mapped = _ERROR_TYPE_MAP.get(etype or "api_error")
+    if mapped:
+        return mapped
+    if status == 429:
+        return "rate_limit_error"
+    if status == 503:
+        return "service_unavailable_error"
+    if status >= 500:
+        return "server_error"
+    if status in (401,):
+        return "authentication_error"
+    if status in (403,):
+        return "permission_error"
+    if status == 404:
+        return "not_found_error"
+    return "invalid_request_error"
 
 
 def _openai_error_response(status: int, etype: str, message: str,
@@ -331,10 +449,12 @@ def _openai_error_response(status: int, etype: str, message: str,
     """OpenAI-style error response. The SDK determines the exception kind by HTTP status.
 
     code/param are passed through from the same-named fields of /_control/error
-    (e.g. code="rate_limit_exceeded" — for testing apps that branch on code).
+    (e.g. code="rate_limit_exceeded" — for testing apps that branch on code). The error
+    `type` is translated to OpenAI vocabulary when the injector used an Anthropic name.
     """
     return JSONResponse(
-        {"error": {"message": message, "type": etype, "param": param, "code": code}},
+        {"error": {"message": message, "type": error_type_for(status, etype),
+                   "param": param, "code": code}},
         status_code=status, headers=headers,
     )
 
@@ -344,7 +464,14 @@ def build_router() -> APIRouter:
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
-        headers = {"x-request-id": f"req_{uuid.uuid4().hex[:24]}"}
+        started = time.time()
+        headers = {"x-request-id": f"req_{uuid.uuid4().hex[:24]}",
+                   "openai-version": "2020-10-01", "openai-processing-ms": "0"}
+
+        def _finish_headers() -> dict[str, str]:
+            headers["openai-processing-ms"] = str(max(0, int((time.time() - started) * 1000)))
+            return headers
+
         body, errmsg = await fs._parse_json_body(request)
         if errmsg is not None:
             return _openai_error_response(400, "invalid_request_error", errmsg,
@@ -353,18 +480,28 @@ def build_router() -> APIRouter:
         model = body.get("model")
         canonical = normalize_chat_body(body)
 
-        snapshot, fut = await fs.register_request(
-            "openai", model, canonical, is_stream, simulate_cache=False)
+        try:
+            n = max(1, min(int(body.get("n") or 1), 16))
+        except (TypeError, ValueError):
+            n = 1
+        try:
+            snapshot, fut = await fs.register_request(
+                "openai", model, canonical, is_stream, simulate_cache=False,
+                extra={"choices": n} if n > 1 else None)
+        except fs.RequestValidationError as e:
+            return _openai_error_response(400, "invalid_request_error", str(e),
+                                          headers=_finish_headers())
         result = await fs.await_resolution(snapshot, fut)
 
         if result["kind"] == "cleared":
             return _openai_error_response(
-                503, "service_unavailable", f"request cleared: {result['detail']}",
-                headers=headers)
+                503, "service_unavailable_error", f"request cleared: {result['detail']}",
+                headers=_finish_headers())
         if result["kind"] == "error":
             return _openai_error_response(
                 result["status"], result["type"], result["message"],
-                code=result.get("code"), param=result.get("param"), headers=headers)
+                code=result.get("code"), param=result.get("param"),
+                headers={**_finish_headers(), **fs._error_headers(result)})
 
         model_out = model or "gpt-mock"
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -374,12 +511,12 @@ def build_router() -> APIRouter:
         if is_stream:
             so = body.get("stream_options")
             include_usage = isinstance(so, dict) and bool(so.get("include_usage"))
-            # note: n>1 in streaming is unsupported (rarely used in practice, so choice 0 only).
             payloads = [
                 f"data: {json.dumps(c, ensure_ascii=False)}\n\n".encode("utf-8")
                 for c in stream_chunk_dicts(
                     completion_id, model_out, result["content_blocks"],
-                    result["usage"], created, include_usage, stop_reason)
+                    result["usage"], created, include_usage, stop_reason, n,
+                    body.get("service_tier"))
             ]
             payloads.append(b"data: [DONE]\n\n")
 
@@ -389,13 +526,10 @@ def build_router() -> APIRouter:
                     await asyncio.sleep(0)
 
             return StreamingResponse(gen(), media_type="text/event-stream",
-                                     headers=headers)
-        try:
-            n = max(1, min(int(body.get("n") or 1), 16))
-        except (TypeError, ValueError):
-            n = 1
+                                     headers=_finish_headers())
         return JSONResponse(build_non_stream_response(
             completion_id, model_out, result["content_blocks"],
-            result["usage"], created, stop_reason, n), headers=headers)
+            result["usage"], created, stop_reason, n, body.get("service_tier")),
+            headers=_finish_headers())
 
     return router
