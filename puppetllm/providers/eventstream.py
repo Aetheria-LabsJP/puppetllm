@@ -75,15 +75,31 @@ def encode_chunk(event_data: dict[str, Any]) -> bytes:
     return encode_message(headers, payload)
 
 
-def encode_exception(exception_type: str, message: str) -> bytes:
-    """Wrap an error as an event stream exception message (for mid-stream errors).
+def encode_event(event_type: str, payload: dict[str, Any]) -> bytes:
+    """Wrap a raw-JSON event (ConverseStream style: `messageStart`, `contentBlockDelta`, …)
+    into an event stream frame. Unlike InvokeModel's `chunk`, the payload is the event's
+    JSON body itself, not a base64 `bytes` wrapper."""
+    headers = {
+        ":event-type": event_type,
+        ":content-type": "application/json",
+        ":message-type": "event",
+    }
+    return encode_message(headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
-    NOTE: Currently unused. bedrock.py resolves error injection **before** the stream
-    starts, so it returns via HTTP status (the SDK maps exceptions by status). This is
-    provided as a utility for when mid-stream error injection is implemented in the
-    future (e.g. verifying throttling triggered after N chunks are emitted).
+
+def encode_exception(exception_type: str, message: str,
+                     extra: dict[str, Any] | None = None) -> bytes:
+    """Wrap an error as an event stream exception message (mid-stream errors).
+
+    `exception_type` is the stream's member name in lowerCamel (`throttlingException`,
+    `validationException`, `modelStreamErrorException`, `internalServerException`,
+    `serviceUnavailableException`, `modelTimeoutException`); botocore resolves it through
+    the `:exception-type` header and raises `EventStreamError`.
     """
-    payload = json.dumps({"message": message}).encode("utf-8")
+    body: dict[str, Any] = {"message": message}
+    if extra:
+        body.update(extra)
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {
         ":exception-type": exception_type,
         ":content-type": "application/json",
@@ -92,13 +108,27 @@ def encode_exception(exception_type: str, message: str) -> bytes:
     return encode_message(headers, payload)
 
 
-def decode_messages(data: bytes) -> list[dict[str, Any]]:
-    """For testing/verification: parse an encoded byte sequence and extract event dicts.
+def _decode_headers(raw: bytes) -> dict[str, str]:
+    out: dict[str, str] = {}
+    off = 0
+    while off < len(raw):
+        name_len = raw[off]
+        name = raw[off + 1:off + 1 + name_len].decode("utf-8")
+        off += 1 + name_len
+        vtype = raw[off]
+        off += 1
+        if vtype != _HEADER_TYPE_STRING:
+            raise ValueError(f"unsupported header value type {vtype}")
+        vlen = struct.unpack(">H", raw[off:off + 2])[0]
+        out[name] = raw[off + 2:off + 2 + vlen].decode("utf-8")
+        off += 2 + vlen
+    return out
 
-    Only chunk messages are targeted (payload.bytes base64 decode → JSON).
-    CRC is verified (ValueError if corrupted).
-    """
-    out: list[dict[str, Any]] = []
+
+def decode_frames(data: bytes) -> list[tuple[dict[str, str], bytes]]:
+    """Parse an encoded byte sequence into (headers, payload) frames. CRCs are verified
+    (ValueError if corrupted)."""
+    out: list[tuple[dict[str, str], bytes]] = []
     off = 0
     n = len(data)
     while off < n:
@@ -114,13 +144,38 @@ def decode_messages(data: bytes) -> list[dict[str, Any]]:
         body_crc = struct.unpack(">I", msg[-4:])[0]
         if (zlib.crc32(msg[:-4]) & 0xFFFFFFFF) != body_crc:
             raise ValueError("message CRC mismatch")
-        payload = msg[12 + headers_len:-4]
-        try:
-            wrapper = json.loads(payload)
-            inner = base64.b64decode(wrapper["bytes"])
-            out.append(json.loads(inner))
-        except (KeyError, ValueError):
-            # For non-chunk messages (exception etc.), store the raw payload
-            out.append({"_raw": payload.decode("utf-8", errors="replace")})
+        out.append((_decode_headers(msg[12:12 + headers_len]), msg[12 + headers_len:-4]))
         off += total_len
+    return out
+
+
+def decode_messages(data: bytes) -> list[dict[str, Any]]:
+    """For testing/verification: parse an encoded byte sequence and extract event dicts.
+
+    InvokeModel `chunk` frames are unwrapped (payload.bytes base64 → JSON); raw-JSON
+    event frames (ConverseStream) are returned as their JSON with `_event` set to the
+    `:event-type`; exception frames as `{"_exception": <type>, "message": ...}`.
+    """
+    out: list[dict[str, Any]] = []
+    for headers, payload in decode_frames(data):
+        if headers.get(":message-type") == "exception":
+            body = json.loads(payload) if payload else {}
+            out.append({"_exception": headers.get(":exception-type"), **body})
+            continue
+        etype = headers.get(":event-type")
+        if etype == "chunk":
+            try:
+                wrapper = json.loads(payload)
+                out.append(json.loads(base64.b64decode(wrapper["bytes"])))
+                continue
+            except (KeyError, ValueError):
+                out.append({"_raw": payload.decode("utf-8", errors="replace")})
+                continue
+        try:
+            body = json.loads(payload)
+        except ValueError:
+            body = {"_raw": payload.decode("utf-8", errors="replace")}
+        if isinstance(body, dict):
+            body = {"_event": etype, **body}
+        out.append(body)
     return out

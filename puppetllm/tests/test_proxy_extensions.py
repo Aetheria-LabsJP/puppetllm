@@ -787,7 +787,13 @@ class TestBedrockHttp(unittest.TestCase):
                     r = await t
                     self.assertEqual(r.status_code, inject["status"], inject)
                     self.assertEqual(r.headers.get("x-amzn-ErrorType"), expected, inject)
-                    self.assertEqual(r.json(), {"message": "boom", "__type": expected}, inject)
+                    body = {"message": "boom", "__type": expected}
+                    if expected == "ModelErrorException":
+                        # modeled as {message, originalStatusCode, resourceName}
+                        body.update(originalStatusCode=inject["status"], resourceName=self.MODEL)
+                    elif expected == "ModelStreamErrorException":
+                        body.update(originalStatusCode=inject["status"], originalMessage="boom")
+                    self.assertEqual(r.json(), body, inject)
                     self.assertIn("x-amzn-requestid", r.headers)
         _run(run())
 
@@ -1471,7 +1477,7 @@ class TestRegressions(unittest.TestCase):
                     "model": "claude-opus-5", "messages": [{"role": "user", "content": "c"}]})
                 await c.post("/_control/respond", json={"content": [
                     {"type": "thinking", "thinking": "X" * 400},
-                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "redacted_thinking", "data": "b3BhcXVl"},  # base64, as on every wire
                     {"type": "text", "text": "visible"}]})
                 j = (await t).json()
                 self.assertEqual([b["type"] for b in j["content"]],

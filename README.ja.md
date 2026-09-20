@@ -2,7 +2,7 @@
 
 # puppetllm — LLM API debug proxy (fake Anthropic / Bedrock / OpenAI server)
 
-Anthropic Messages API / Bedrock / OpenAI Chat Completions 互換の **fake server**。`ANTHROPIC_BASE_URL`（または `AnthropicBedrock` / `OpenAI` の base_url）をこのサーバに向けるだけで、**アプリ / SDK のコードを 1 行も変えずに** LLM 呼び出しを横取りし、人間 or 別エージェントが応答を供給できる（human-in-the-loop / AI-in-the-loop）。
+Anthropic Messages API / Bedrock（InvokeModel・Converse・バッチ推論）/ OpenAI Chat Completions 互換の **fake server**。`ANTHROPIC_BASE_URL`（または `AnthropicBedrock` / `OpenAI` の base_url）をこのサーバに向けるだけで、**アプリ / SDK のコードを 1 行も変えずに** LLM 呼び出しを横取りし、人間 or 別エージェントが応答を供給できる（human-in-the-loop / AI-in-the-loop）。
 
 用途:
 
@@ -22,6 +22,8 @@ provider 非依存の canonical core + アダプタ:
 
 - `puppetllm/fake_server.py` — canonical core（正規化 snapshot 管理 + `/_control/*` + cost/cache 計算）。Anthropic 経路 `POST /v1/messages` を内蔵
 - `puppetllm/providers/bedrock.py` — Bedrock 経路 `POST /model/{id}/invoke[-with-response-stream]`（モデル ID 正規化・`anthropic_version` 検証・AWS 形式のエラー / ヘッダ。AWS event stream フレーミングは `providers/eventstream.py`）
+- `puppetllm/providers/converse.py` — Bedrock Converse 経路 `POST /model/{id}/converse[-stream]`（Converse の JSON スキーマと canonical の相互変換）
+- `puppetllm/providers/bedrock_batch.py` + `puppetllm/providers/s3.py` — Bedrock バッチ推論（`/model-invocation-job*`）と、同梱のディレクトリ実装 S3 エミュレーション
 - `puppetllm/providers/openai.py` — OpenAI 経路 `POST /v1/chat/completions`（リクエストは canonical（Anthropic 風）に正規化し、レスポンスは `chat.completion` JSON / SSE chunk に変換）
 - `puppetllm/batches.py` — Anthropic Message Batches 経路 `/v1/messages/batches*`（各 custom_id を通常の pending として保持。バッチのライフサイクルは `/_control/batch/*` から注入可能）
 - `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + トップレベル `cache_control` の自動キャッシュ + 前方一致 + 世代別最小閾値 + 5m / 1h TTL + 20-block lookback + effort / thinking / tool_choice による無効化）
@@ -106,9 +108,70 @@ Bedrock 経路固有の挙動（すべて URL パスから判定。モード切�
 - **モデル ID の正規化**: `anthropic.claude-haiku-4-5-20251001-v1:0`、サフィックスなしの現行 ID（`anthropic.claude-opus-5`）、クロスリージョン推論プロファイル（`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … プレフィックス）、foundation-model / inference-profile の ARN（`aws` / `aws-cn` / `aws-us-gov` の全パーティション）を Anthropic 側の名前（`claude-haiku-4-5-20251001`）にマップする。pending snapshot の `model`・応答の `model` フィールド・`/_control/stats` の `by_model` はこの正規名を使うので、同じモデルの Bedrock 経由と Anthropic 直の呼び出しが 1 行に合流し、relay の `--model-map` / `--only` の glob も `claude-*` でマッチする。生の ID は snapshot / history エントリの `bedrock_model_id` に保持する。`anthropic.` セグメントを含まない ID はそのまま素通しする。
 - **`anthropic_version` を検証する**（Anthropic モデル ID のみ）: 欠落、または `bedrock-2023-05-31` 以外の値は受付時点で `400 ValidationException` として弾く（pending は作られない）— 自前実装クライアントのミスを早期に検出する。他ベンダーの ID（`meta.llama…`、`amazon.titan…`）はボディ形式が異なるため検証せず素通しする。不正な `cache_control` 配置（§5 参照）も同じ形で弾く。
 - **SigV4 は検証しない**: `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` は無視する。
-- **レスポンスヘッダ**: 非ストリーミング応答には `X-Amzn-Bedrock-Input-Token-Count`（Converse の `inputTokens` と同様、非キャッシュ分のみ）/ `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency`（+ `x-amzn-requestid`、`X-Amzn-Bedrock-Service-Tier`）を付与する。ストリーミングは実 Bedrock と同様に最終チャンクの `amazon-bedrock-invocationMetrics`（`cacheReadInputTokenCount` / `cacheWriteInputTokenCount` 込み）に載せ、`X-Amzn-Bedrock-Content-Type` を付ける。
+- **レスポンスヘッダ**: 非ストリーミング応答には `X-Amzn-Bedrock-Input-Token-Count`（Converse の `inputTokens` と同様、非キャッシュ分のみ）/ `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency`（+ `x-amzn-requestid`）を付与する。ストリーミングは実 Bedrock と同様に最終チャンクの `amazon-bedrock-invocationMetrics`（`cacheReadInputTokenCount` / `cacheWriteInputTokenCount` 込み）に載せ、`X-Amzn-Bedrock-Content-Type` を付ける。boto3 が**リクエストヘッダ**で送るオプション — `serviceTier=`（`X-Amzn-Bedrock-Service-Tier`、`priority | default | flex | reserved`）と `performanceConfigLatency=`（`X-Amzn-Bedrock-PerformanceConfig-Latency`）— は検証した上で両経路の応答ヘッダにそのまま echo し（ティア未指定なら `default`）、ティアは responder に canonical の `service_tier` として見える（`priority` / `flex` → `auto`、`default` / `reserved` → `standard_only`。relay と同じ語彙）。
 - **`AnthropicBedrockMantle` 向け Messages API エイリアス**: `POST /anthropic/v1/messages`（`bedrock-runtime` / `bedrock-mantle` ホストが提供するパス）は Bedrock モデル ID 正規化付きの Anthropic ハンドラで、さらに素の `/v1/messages` 経路も `model` が Bedrock 形式（`[region.]anthropic.…` / ARN）なら同じハンドラに渡すため、`AnthropicBedrockMantle(base_url="http://localhost:8765")` はルート直下でも `/anthropic` 付きでも動く（SSE ストリーミング、Anthropic エラー形式、`anthropic-version` ヘッダ、ボディに `anthropic_version` なし）。Batches / count_tokens はこのエイリアスでは提供しない（Bedrock と同じ）。
 - **受信ログ**: Bedrock 経路のリクエスト（および拒否）は 1 件ごとに stderr へ `[bedrock] invoke model=<raw> -> <canonical> pending=<id> …` の 1 行を出すので、他経路との区別が一目でつく。
+
+**boto3 (`bedrock-runtime`) — Converse 含む:**
+
+```python
+import boto3
+from botocore.config import Config
+
+rt = boto3.client("bedrock-runtime", region_name="us-east-1",
+                  aws_access_key_id="dummy", aws_secret_access_key="dummy",
+                  endpoint_url="http://localhost:8765")
+
+rt.converse(modelId="anthropic.claude-opus-5",
+            messages=[{"role": "user", "content": [{"text": "hello"}]}],
+            inferenceConfig={"maxTokens": 1024})
+
+for event in rt.converse_stream(modelId="anthropic.claude-opus-5",
+                                messages=[{"role": "user", "content": [{"text": "hello"}]}])["stream"]:
+    print(event)          # messageStart / contentBlockDelta / … / metadata
+```
+
+`POST /model/{id}/converse` と `/converse-stream` は Converse の JSON スキーマを話し、他経路と
+**同じ canonical な pending** に正規化される。responder はいつもどおり `/_control/respond` に
+content blocks を注入するだけで、経路の違いを意識しなくてよい:
+
+| Converse | canonical |
+|---|---|
+| `{"text": …}` | `{"type": "text", …}` |
+| `{"image": {"format", "source": {"bytes" \| "s3Location"}}}` / `{"document": …}` | `{"type": "image" \| "document", "source": {…}}` |
+| `{"toolUse": {"toolUseId", "name", "input"}}` | `{"type": "tool_use", "id", "name", "input"}` |
+| `{"toolResult": {"toolUseId", "content", "status"}}` | `{"type": "tool_result", "tool_use_id", "content", "is_error"}` |
+| `{"reasoningContent": {"reasoningText": {"text", "signature"}}}` / `{"redactedContent"}` | `{"type": "thinking", …}` / `{"type": "redacted_thinking", "data"}` |
+| `{"cachePoint": {"type": "default", "ttl"?}}` | **直前の**ブロック / ツールへの `cache_control`（擬似キャッシュの実ブレークポイントになる） |
+| `inferenceConfig.{maxTokens,temperature,topP,stopSequences}` | `max_tokens` / `temperature` / `top_p` / `stop_sequences` |
+| `toolConfig.tools[].toolSpec` / `toolChoice {auto\|any\|tool}` | `tools[]` / `tool_choice` |
+| `additionalModelRequestFields` | canonical ボディにマージ（`thinking`、`top_k`、`anthropic_beta` など）。Converse 自身が持つキー（`system`、`tools`、`max_tokens`、`temperature` …）は `ValidationException` — スキーマの抜け道にはならない |
+| `outputConfig.effort` / `outputConfig.textFormat` | `output_config.effort`（`low` … `xhigh` / `max`）/ `output_config.format`（`{type: json_schema, schema, name?}` — `textFormat.structure.jsonSchema.schema` は API 定義どおり JSON **文字列**で、ここでスキーマオブジェクトにデコードする）。native 側が `additionalModelRequestFields` の同名キーより優先され、そこに非オブジェクトの `output_config` があれば `ValidationException` |
+| `promptVariables`（モデル ID がプロンプト管理の ARN） | responder 向けに `converse.promptVariables` に保持。その場合 `messages` は実 API 同様省略可 — 保存済みプロンプトが供給するので responder には `messages: []` として見える。通常のモデル ID では `messages` は必須のまま |
+| `serviceTier.type` | `service_tier`（`priority` / `flex` → `auto`、`default` / `reserved` → `standard_only`） |
+
+応答は assistant ターンが実際に持ちうるブロック種別だけを戻す（`text` / `toolUse` /
+`reasoningContent`。responder のブロックはエンコーダに渡る前に text / tool_use / thinking /
+redacted_thinking に正規化される）: `output.message`、Converse 語彙の `stopReason`（canonical の `refusal` は
+`content_filtered`、`pause_turn` は `end_turn`）、`inputTokens` がキャッシュ分を除いた
+`usage`（+ `cacheReadInputTokens` / `cacheWriteInputTokens` / `cacheDetails`）、`metrics.latencyMs`。
+`additionalModelResponseFieldPaths`（JSON ポインタ、最大 10 件）はネイティブの Messages API 応答に対して
+解決し、ストリームでは `messageStop` にも載せる。リクエストはスキーマの「形」を検証する（制約すべてではない）: content block・
+source・`reasoningContent`・`toolChoice`・`system` の各要素は**ユニオン**（メンバーはちょうど 1 つ。`text` と
+`cachePoint` を同時に持つブロックはテキストを黙って捨てずに `ValidationException`。ユニオンの未知の
+メンバーや、リクエスト最上位の未知のキーも同様）で、各ユニオンは自分の
+メンバーしか受け付けない（`ImageSource` / `VideoSource` は `bytes | s3Location` のみ。`text | content` を
+取るのは `DocumentSource` だけ）。必須フィールドと enum
+（`image.format`、`video.format`、`document.name`、`toolUse.input`、`toolResult.content`、`cachePoint.type` / `ttl`、
+`inferenceConfig` の範囲、`serviceTier.type`、`requestMetadata` の 1〜16 件、`guardContent.image` が `bytes` 由来の
+`png` / `jpeg` であること）も検証し、2 つの `cachePoint` が同じブロックを指すことも拒否する。検証しないもの（本番なら弾かれるリクエストが通りうる）:
+デコード後のメディアサイズと妥当性、ブロック間の配置ルール、`audio` / `searchResult` の内部構造
+（「オブジェクトであること」だけ）、user / assistant の交互性（botocore のモデルどおり `role: "system"`
+も受け付ける）、`guardrailConfig` / `promptVariables` /
+プロンプト ARN の条件付き制約。
+ストリームは `messageStart` → ブロックごとに `contentBlockStart`（tool use）/ `contentBlockDelta` /
+`contentBlockStop` → `messageStop` → `metadata` を、生 JSON の event stream フレームとして流す
+（InvokeModel 経路の `chunk` + base64 ラッパーとは異なる）。
 
 **OpenAI SDK (`openai`):**
 
@@ -178,7 +241,39 @@ responder は次の 3 択で、どれも同じ制御 API を使うため**自由
 
 分岐テスト用に、任意の HTTP エラーを pending に返させられる（Anthropic / Bedrock / OpenAI の 3 経路すべてで各 provider のエラー形式に変換される）。任意の `code` / `param` フィールドは OpenAI 経路で素通しされる（例 `"code": "rate_limit_exceeded"`）:
 
-Bedrock 経路ではボディが `{"message": "...", "__type": "<AwsException>"}` になり、`x-amzn-ErrorType` ヘッダが付く。`type` がすでに AWS の例外名（`Exception` で終わる）ならそのまま使い、そうでなければ `status` から導出する: 400 → `ValidationException`、401 → `UnrecognizedClientException`、403 → `AccessDeniedException`、404 → `ResourceNotFoundException`、408/504 → `ModelTimeoutException`、413 → `RequestEntityTooLargeException`、424 → `ModelErrorException`、429 → `ThrottlingException`、500 → `InternalServerException`、503 → `ServiceUnavailableException`、529 → `overloaded_error`（Bedrock は Anthropic の 529 をそのまま通す）— その他 4xx → `ValidationException`、その他 5xx → `InternalServerException`。それ以外は AWS の例外名を明示する（`ServiceQuotaExceededException` 400、`ModelNotReadyException` 429、`ModelStreamErrorException` 424）。つまり同じ `{"status": 429, "type": "rate_limit_error"}` の注入が、Bedrock クライアントには `ThrottlingException`、Anthropic クライアントには `rate_limit_error` として届く。
+Bedrock 経路ではボディが `{"message": "...", "__type": "<AwsException>"}` になり、`x-amzn-ErrorType` ヘッダが付く（2 つの 424 は上流の失敗を包むもので、その status を `originalStatusCode` に載せる — HTTP status と違えたい場合（424 が 429 を包む等）は `/_control/error` に `original_status` を渡す。botocore のモデルどおり `ModelErrorException` は `resourceName`、`ModelStreamErrorException` は `originalMessage` を持つ）。`type` を省略した場合は Anthropic 経路も status から導出する（429 → `rate_limit_error`、529 → `overloaded_error`、400 → `invalid_request_error` …）ので、`anthropic` SDK は固有のクラスを投げる。`type` がすでに AWS の例外名（`Exception` で終わる）ならそのまま使い、そうでなければ `status` から導出する: 400 → `ValidationException`、401 → `UnrecognizedClientException`、403 → `AccessDeniedException`、404 → `ResourceNotFoundException`、408/504 → `ModelTimeoutException`、413 → `RequestEntityTooLargeException`、424 → `ModelErrorException`、429 → `ThrottlingException`、500 → `InternalServerException`、503 → `ServiceUnavailableException`、529 → `overloaded_error`（そのまま通す。実サービスが上流の 529 を包み直すかどうかは未検証）— その他 4xx → `ValidationException`、その他 5xx → `InternalServerException`。それ以外は AWS の例外名を明示する（`ServiceQuotaExceededException` 400、`ModelNotReadyException` 429、`ModelStreamErrorException` 424）。つまり同じ `{"status": 429, "type": "rate_limit_error"}` の注入が、Bedrock クライアントには `ThrottlingException`、Anthropic クライアントには `rate_limit_error` として届く。
+
+**ストリーミング**リクエストなら、実 API と同じように途中で失敗させることもできる。
+`after_events`（と、先に流す `content`）を足すと、応答は通常の 200 ストリームとして始まり、
+その数だけイベントを流してから provider のエラーイベントで終わる: Anthropic 経路は `event: error`、
+Bedrock 系経路は event stream の**例外フレーム**になる。SDK が投げるもの: 純正 `anthropic` クライアントは
+SSE の `error` イベントから通常どおり `APIStatusError`、boto3 は `Error.Code` にフレームのメンバー名
+（`throttlingException` など）を持つ `botocore.exceptions.EventStreamError`、`AnthropicBedrock` は
+ストリームデコーダから素の `ValueError`（`anthropic.APIError` ではない）を投げるので、それに合わせて
+捕捉すること。フレームのメンバーは操作ごとの union に限られる（`internalServer` / `modelStreamError` /
+`validation` / `throttling` / `serviceUnavailable`、InvokeModel のみ `modelTimeout` も）。union 外の
+名前はステータス階級を保つ — 429 系の `ModelNotReadyException` は `throttlingException`、408/504 は
+InvokeModel では `modelTimeoutException` のまま、timeout メンバーを持たない ConverseStream では
+`originalStatusCode` 付きの `modelStreamErrorException` になり、黙って internal error に落ちることはない。
+`after_events` は経路ごとの自前のイベントを数えるので、同じ数でも経路によって届く内容は違う
+（InvokeModel ストリームと SSE には `content_block_start` があり、ConverseStream はテキストブロックを
+最初のデルタで始める）
+（anthropic SDK は反復中に surface する）:
+
+```bash
+curl -s -X POST localhost:8765/_control/error \
+  -d '{"status": 429, "type": "ThrottlingException", "message": "slow down",
+       "after_events": 3, "content": [{"type": "text", "text": "partial answer"}]}'
+```
+
+イベント数は終端イベントを含まないようにクランプするので、途中で失敗したストリームが同時に
+「正常終了した」ようにも見えることはない。数えるのはプロトコルイベントだけで、SSE 経路が
+`message_start` の直後に流す `ping` はカウントに含まない。history エントリには `after_events` と併せて
+`injected_error.partial_content`（部分ストリーム用に responder が渡した content）が載る — 実際にワイヤに
+流れたストリーミングリクエストの場合だけ。`respond` / `error` の `content` に入れる `redacted_thinking` の
+`data` は base64 でなければならない（Bedrock の SDK はクライアント側でデコードするので、素のテキストだと
+呼び手が `binascii.Error` で落ちる）。`/_control/*` は理由を添えた 400 で拒否する。非ストリーミングのリクエストは `after_events` を無視して通常の HTTP エラーに
+なる（OpenAI 経路は常に通常のエラー）。
 
 ```bash
 # 429 → SDK が自動 retry する
@@ -273,6 +368,144 @@ curl -s -X POST localhost:8765/_control/batch/end \
 - 各リクエストの `params` は浅い検証のみ（params がオブジェクトであること。`stream: true`・`speed`（fast mode）・`max_tokens: 0` は実 API 同様に作成時点で拒否。`fallbacks` を含む項目は受理したうえでその項目だけ `errored` 結果になり、pending にはならない — これも実 API と同じ）。ただし外側の形式は実 API と同じ厳しさで検証する（`custom_id` は `^[a-zA-Z0-9_-]{1,64}$` かつ一意、リクエストは 100,000 件まで、list の `limit` は `[1, 1000]`、カーソルも検証）— 本番なら弾かれるアプリがここでは通ってしまう、という事態を防ぐため。浅い検証を通過しても処理段階で失敗する params（例: `messages` が list でない）は、作成全体をロールバックして 400 を返す — バッチも pending も history も残らない。
 - `results_url` は受信リクエストの Host から組み立てる。リバースプロキシ越しで使う場合は uvicorn を `--proxy-headers`（+ 適切な `FORWARDED_ALLOW_IPS`）付きで起動すること。
 
+### 7. Bedrock バッチ推論（S3 エミュレーション同梱）
+
+コントロールプレーンのバッチ API も、ディレクトリ実装の **S3 エミュレーション**の上に載せて提供する。
+素の `boto3` S3 クライアントで入力を置き、結果を読める:
+
+```python
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client("s3", region_name="us-east-1", aws_access_key_id="d", aws_secret_access_key="d",
+                  endpoint_url="http://localhost:8765",
+                  config=Config(s3={"addressing_style": "path"}))     # path-style 必須
+bedrock = boto3.client("bedrock", region_name="us-east-1", aws_access_key_id="d",
+                       aws_secret_access_key="d", endpoint_url="http://localhost:8765")
+
+s3.create_bucket(Bucket="batch-in"); s3.create_bucket(Bucket="batch-out")
+s3.put_object(Bucket="batch-in", Key="jobs/input.jsonl", Body=b'''{"recordId": "r1", "modelInput": {...}}\n''')
+
+job = bedrock.create_model_invocation_job(
+    jobName="myjob", modelId="anthropic.claude-opus-5",
+    roleArn="arn:aws:iam::123456789012:role/BatchRole",
+    inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://batch-in/jobs/input.jsonl"}},
+    outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://batch-out/results/"}})
+```
+
+`{"recordId", "modelInput"}` の各行が通常の **pending**（provider は `bedrock`、snapshot に
+`job_arn` / `job_id` / `record_id` が付く）になるので、responder は同じ `/_control/respond` /
+`auto` / `error` で答える。全レコードの結果が揃うと、ジョブは
+`<出力プレフィックス>/<jobId>/<入力ファイル名>.out` と `manifest.json.out` を書き、`Completed` で終わる。
+出力ファイル名は入力プレフィックスからの相対パスを保つので、`a/data.jsonl` と `b/data.jsonl` は衝突しない。
+出力の各行は次の形:
+
+```json
+{"recordId": "r1", "modelInput": { … 送信したもの … },
+ "modelOutput": { … }}                                  // 失敗した場合は:
+{"recordId": "r2", "modelInput": { … },
+ "error": {"errorCode": 400, "errorMessage": "…"}}
+```
+
+結果に順序保証はないので `recordId` が唯一の対応付けキー。manifest は次の形:
+
+```json
+{"totalRecordCount": 3, "processedRecordCount": 3, "successRecordCount": 2,
+ "errorRecordCount": 1, "inputTokenCount": 120, "outputTokenCount": 48}
+```
+
+`modelInput` は InvokeModel のボディ（既定）か、`modelInvocationType: "Converse"` なら Converse の
+ボディで、`modelOutput` はそれぞれ対応する応答形式になる。InvokeModel のボディはモデル固有なので
+その場合は Anthropic の `modelId` が必要。`Converse` はモデル非依存のスキーマなので任意のモデルを取れる。同梱ストアが守れないものは echo せず拒否する：
+`s3EncryptionKeyId`（出力は素のファイル）は `ValidationException`、`s3BucketOwner` はストアのバケットと
+ジョブ ARN が属する唯一のアカウント `123456789012` でなければならない。`get_model_invocation_job` /
+`list_model_invocation_jobs` / `stop_model_invocation_job` も通常どおり使える
+（`GET /_control/bedrock_jobs` でレジストリと未解決の recordId を確認できる）。
+
+`Stop` は同期的に確定する — 呼び出しが返った時点でステータスは終端になっている — ただし入力の読み込み中や
+出力の書き出しが既に進行中の場合だけは、ジョブを `Stopping` のまま `200` を返し、終端ステータスは後から
+付く。ジョブは実サービスが `StopModelInvocationJob` に対して返す終端ステータス `Stopped` で終わる。注入が進行中だったレコードはそのまま完了するが、未処理のまま中断されたレコードは
+`totalRecordCount` にだけ残り、`processedRecordCount` にも `errorRecordCount` にも数えず、出力行も書かない
+（`/_control/bedrock_jobs` の `cancelled` に並ぶ）。Stop はジョブがまだ `Submitted` または登録中の間も受理され
+（未登録だった分は処理されない。そのジョブの入力がその後の検証 — 読み込み時でも登録時でも — で落ちた場合は、
+止めた側の目の前から消えるのではなく理由付きの `Failed` で終わる）、`Stopping` / `Stopped` になった後は冪等（botocore は
+応答を取りこぼした Stop をリトライする）、`Completed` / `Failed` のジョブには `ConflictException`、
+出力の書き出し中に受理されたものも終端ステータスを決める。出力が書けなかった場合
+（ジョブ実行中の出力バケット削除、ディスクエラー）はジョブが **`Failed`** で終わり `message` に理由が入る —
+失敗前に書けた分は残る — ので、ポーリングする側は `Completed` / `Stopped` / `Failed` を終端の集合として
+扱うこと。`modelInput` が不正な
+レコードは実サービス同様ジョブを失敗させずに `error` レコードになるが、JSONL 行自体が壊れている場合、
+`recordId` が文字列でない / 重複している場合、入力 / 出力バケットが存在しない場合、レコードが 1 件もない
+場合は作成全体をロールバックして `ValidationException` を返す。AWS がバッチで非対応としている機能は `errorCode 400` のレコードとして
+返す: ツール呼び出し、構造化出力、そしてプロンプトキャッシュ（レコード内のどこかにある
+`cache_control` / `cachePoint`）。
+
+その他の意図的な差分（忠実さより決定性）: `Validating` / `Scheduled` のフェーズはない
+（レコードが pending になった時点で `InProgress`）。最小レコード数は「1 件以上」だけで、
+時計による expire もない。入力 JSONL は全量をメモリに読むので、実用上のジョブサイズは AWS の
+1 GB / 50,000 レコードではなく RAM で決まる。`/_control/clear` はジョブレジストリを捨てるが
+S3 ストアには意図的に触れないので、クリア前に書き終えた出力はそのまま読める。その瞬間に進行中だった
+create — 入力読み込み中、登録中、同一トークンの双子を待機中、インラインで確定中のいずれでも — は
+`400 ConflictException` を返す（あえてリトライ可能な 5xx にしない — botocore が、人が消したばかりの
+ジョブを作り直してしまうため）。出力のレイアウト（`<prefix>/<jobId>/<file>.out` がストアの
+255 バイト・セグメント制限に収まること、prefix とその祖先のどれも既存オブジェクトでないこと）は作成時に
+検査するので、全レコード処理後にそれで `Failed` になることはない。`recordId` を付ける場合は空でない
+文字列でなければならない（空文字列を生成 ID で黙って置き換えることはしない）。
+
+S3 エミュレーションはこのフローに必要な範囲だけ — バケットの `PUT`/`HEAD`、オブジェクトの
+`PUT` / `GET` / `HEAD` / `DELETE`、`GET /`（バケット一覧）、バケットの `DELETE`（空でなければ
+`409 BucketNotEmpty`）、レンジ `GET`（`Range` → `206` + `Content-Range`、範囲外は
+`416 InvalidRange`）、条件付きリクエスト（`If-Match` / `If-None-Match` は読みで `304`、書きと削除で
+`412 PreconditionFailed`、存在しないキーへの `If-Match` 付き書き・削除は実サービス同様 `404 NoSuchKey` —
+アトミックなので `If-None-Match: *` の 16 並列書き込みは勝者がちょうど 1 つ。`If-*-Since` 形式は読みのみ）、
+条件付き削除（`delete_object(IfMatch=…)`、`*` は「存在すれば」。弱い `W/` タグは書き・削除を決して許可しない。
+size / last-modified 形式はディレクトリバケット向けなので `501`）、`ExpectedBucketOwner` の強制（全バケットは
+`123456789012` の所有。クエリでも `x-amz-` ヘッダでも、誤った値があれば `403 AccessDenied`）、リクエストチェックサムの検証（`400 BadDigest`、`x-amz-decoded-content-length` が
+食い違えば `IncompleteBody`、終端チャンクの無い `aws-chunked` は `InvalidRequest`）、そして
+2 種類のリスト（`GET ?list-type=2` と
+`marker` を使う V1 の `GET`）で、いずれも `prefix` / `delimiter`（`CommonPrefixes`）/
+`max-keys`（1000 超は拒否せずクランプ）/ `encoding-type=url` に対応（path-style、認証なし、
+`aws-chunked` ボディはデコードする）。
+
+このうち 2 つは実用上省けない。boto3 の `download_file` は `multipart_threshold`（8 MB）を
+超えるオブジェクトを並列のレンジ GET に分割するし、botocore はすべてのリストで
+`encoding-type=url` を要求する — 読み戻したキーを URL デコードするのはレスポンスが
+`EncodingType` を echo したときだけなので、この 2 つは必ずセットで切り替える必要がある。
+
+**それ以外は近似せず拒否する。** `CreateMultipartUpload`、`CopyObject`、オブジェクト /
+バケットの tagging・ACL・バージョニング・ポリシー、`ListObjectVersions`、`DeleteObjects`、
+その他のサブリソース、そしてこのストアが保存できない `put_object` のオプション（`Tagging`、
+`Metadata`、SSE、ACL / grant、object lock）は S3 のエラー封筒で `501 NotImplemented` を返す。
+`ContentType` などの素のエンティティヘッダは受け付けるが保存しない（読み戻すと
+`binary/octet-stream`）。これは見た目より重要で、
+`copy_object`・`put_object_tagging`・`put_object_acl` はいずれもオブジェクト自身のパスへの
+`PUT` として届くため、サブリソースを無視するストアはそれらのボディ（あるいは空ボディ）を
+オブジェクトに上書きして「成功」を返してしまう。presigned URL のクエリ認証はヘッダ認証と同様に
+無視する。マルチパートアップロードについては、
+置く入力を 8 MB 未満に収めるか `boto3.s3.transfer.TransferConfig` で下げること。拒否はボディを
+読んだ後に行うので、keep-alive 接続がずれることはない — botocore の `Expect: 100-continue` 付き
+PUT は、どんな応答よりも先に `100 Continue` を受け取る。ルータ自身が表現できないパス（キー中の
+制御文字）もルーティング前に同じ扱いで拒否する。`STANDARD` 以外の `StorageClass` も拒否し
+（ここにあるものは全部 STANDARD）、botocore が付けるリクエストチェックサム（`Content-MD5`、
+`x-amz-checksum-crc32` / `sha1` / `sha256`、ヘッダ形式でも `aws-chunked` のトレーラでも）を検証して
+不一致は `400 BadDigest` にするので、転送中に壊れたボディが黙って保存されることはない
+（`crc32c` / `crc64nvme` は未検証のまま受理）。
+
+オブジェクトは `PUPPETLLM_S3_ROOT`（既定: プロセスごとの一時ディレクトリ）配下に置き、
+その外には決して書けない: バケット名は `s3://` URI の中も含めてどこでも検証し、`.` / `..` を含むキーは拒否
+（キーの 1 セグメントはバックエンドのファイルシステムが受け付ける 255 バイトまで — S3 では合法な
+フラットな 1024 バイトのキーはここでは置けない）、
+書き込みには既存バケットが必要で、書き込みはバケットツリーの外の一時ディレクトリからの rename 経由なので
+並行リーダーが書きかけを見ることはなく（ストア全体のロックがバッチエミュレーションのワーカースレッドも
+覆うので、その出力書き込みが HTTP ハンドラの stat → 前提条件 → 書き込みの間に割り込むこともない。ハンドラは
+このロックをイベントループの外で取るので、スレッドがロックを持っていても他の経路が凍ることはない）、
+壊れた `aws-chunked` ボディは `400 InvalidRequest` になる。キー中の制御文字は拒否する
+（このストアはキーをそのままリスト XML に書き出すので、そこでは不正な文字になる）。キーを黙って
+書き換えることもしない — `PUT /bucket//a` は `a` への静かな書き込みではなく `400` になる。
+API のパスと衝突するバケット名（`model`、`v1`、`anthropic`、`_control`、`model-invocation-job[s]`、
+`docs`、`redoc`、`openapi.json`）は拒否し、それらのパスにメソッド違いでアクセスした場合は S3 の
+エラー XML ではなく API 本来の `405` + `Allow` を返す。
+
 ---
 
 ## relay モード（クロスプロバイダブリッジ）
@@ -315,14 +548,15 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | GET  | `/_control/wait_for_pending?timeout=N` | 次の pending を long-poll で待つ（既定 270s / 上限 600s。なければ `{"timeout":true}`） |
 | POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`）を注入。`content` のブロックは `text` / `tool_use` / `thinking` / `redacted_thinking`。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`"refusal"` なら `stop_details` を生成（`stop_details` で `category` / `explanation` を指定可。`recommended_model` などの追加フィールドは素通し）し、OpenAI 経路では OpenAI の refusal 形式（`message.refusal` / `delta.refusal`、`content: null`、`finish_reason: "stop"`）になる。`"stop_sequence"` なら `stop_sequence` を埋める。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int。加えて `cache_creation` / `output_tokens_details` / `server_tool_use` のオブジェクトと `service_tier` / `inference_geo` / `speed` の文字列も任意 — relay モードが使用） |
 | POST | `/_control/auto` | 簡易自動応答（`{"text":"...", "pending_id"?}`、text のみ） |
-| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?}`）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等） |
+| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"?, "content"?}` — 後ろ 2 つはストリーミングを途中で失敗させる。§4 参照）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等） |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴 |
 | GET  | `/_control/stats` | コスト目安・トークン・キャッシュの累計サマリ |
 | GET  | `/_control/cache` | 擬似プロンプトキャッシュ index |
-| POST | `/_control/clear` | pending / history / cache / batches を空に（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503） |
+| POST | `/_control/clear` | pending / history / cache / batches / Bedrock バッチジョブを空に（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503、作成中の Bedrock バッチジョブはリトライ不能な 400 `ConflictException`。S3 ストアには触れない） |
 | GET  | `/_control/batches` | バッチレジストリ（状態・request_counts・未解決 custom_id） |
 | POST | `/_control/batch/result` | 1 つの custom_id に `canceled` / `expired` を注入（`{"custom_id","type","batch_id"?}`） |
 | POST | `/_control/batch/end` | バッチを強制 `ended` に。未解決 custom_id は `expired`（既定）または `canceled` になる |
+| GET  | `/_control/bedrock_jobs` | Bedrock バッチ推論のジョブレジストリ（状態・レコード数・未解決 `recordId`） |
 
 `respond` / `auto` / `error` では、バッチのエントリを `pending_id` の代わりに `custom_id`（+ 任意で `batch_id`）で指定できる。
 
@@ -345,6 +579,10 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 - 既定の listen は `127.0.0.1`（localhost のみ）。別ホストから使うのは LAN / VPN / Tailscale 等の **trusted network 内に限る**。
 - `--host 0.0.0.0`（Docker は既定で `0.0.0.0` listen だが compose は `127.0.0.1:8765` に publish 制限）で公開する場合は firewall / network policy を必ず確認する。
 - **イメージを `docker run` で直接起動する場合**: コンテナは `0.0.0.0` で listen する（ポート転送に必須）ので、公開ポートは localhost に束ねる — `docker run -p 127.0.0.1:8765:8765 puppetllm` — こと。`-p 8765:8765` だと無認可の制御面が全ホストインターフェースに露出する。付属の `docker compose` は既にこの形になっている。
+- 同梱の **S3 エミュレーション**も同じ制御面の一部で、ポートに到達できるクライアントは
+  認証なしでバケットを作り、オブジェクトを読み書き削除できる。`PUPPETLLM_S3_ROOT`
+  （未設定ならプロセスごとの一時ディレクトリ）の外には決して出られないが、
+  `PUPPETLLM_S3_ROOT` は使い捨てのディレクトリに向けること。
 - あくまでローカルデバッグ用途。本番の前段に置くものではない。
 
 ---
@@ -355,6 +593,7 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 |---|---|---|
 | `PUPPETLLM_CACHE_TTL` | `300` | 5 分ブレークポイントの擬似キャッシュ TTL（秒） |
 | `PUPPETLLM_CACHE_TTL_1H` | `PUPPETLLM_CACHE_TTL` × 12 | `ttl: "1h"` ブレークポイントの TTL（秒）。未設定なら 3600 で、5m 側の TTL に連動する |
+| `PUPPETLLM_S3_ROOT` | プロセスごとの一時ディレクトリ | S3 エミュレーションがオブジェクトを置く場所（バッチ推論の入出力）。再起動をまたいで残したい場合や、Docker でホストから見たい場合に指定する（その場合は compose の override に環境変数と対応するボリュームを足すこと。同梱の `docker-compose.yml` はどちらも定義していない） |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` で TTL を無視（常に生存） |
 | `PUPPETLLM_CACHE_MIN_TOKENS` | （モデル別） | 最小キャッシュ閾値の上書き。`0` で無効（全 prefix キャッシュ）。未設定は世代別テーブル（Opus 5 / Fable 512、Opus 4.8 1024、Opus 4.7 2048、Opus 4.6 / 4.5 4096、Sonnet 1024、Haiku 4.5 4096 …） |
 
@@ -363,15 +602,25 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 ## テスト
 
 ```bash
-# Docker
+# Docker（test プロファイルは depends_on で `proxy` サービスも 127.0.0.1:8765 に起動するので、
+# そのポートが空いている必要がある）
 docker compose --profile test run --rm proxy-test
 
 # または直接
 pip install -r requirements.txt
-python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions puppetllm.tests.test_batches puppetllm.tests.test_conformance -v
+python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
+    puppetllm.tests.test_batches puppetllm.tests.test_conformance \
+    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_boto3_interop -v
 ```
 
 `puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。
+
+`test_boto3_interop.py` だけが**実物の** boto3 / botocore（`>= 1.43`。このテストが使う全フィールドを
+持つ最初のサービスモデル）を uvicorn インスタンスに向けて駆動する。他のテストは Bedrock の event stream を puppetllm 自身のコーデックで符号化・復号
+しているので、エンコーダとデコーダが揃って間違っていても素通りしてしまう。実行には `boto3`
+が要る（`requirements.txt` に入っている）。compose のテストプロファイルは
+`PUPPETLLM_REQUIRE_SDK_TESTS=1` を立てるので、import できない状態で走らせると
+SDK テストを全部スキップしたまま `OK` と黙って報告せず失敗する。
 
 ---
 
@@ -386,7 +635,8 @@ puppetllm/
 │   ├── pricing.py          # 概算トークン + 料金
 │   ├── relay.py            # relay responder (実 API へのクロスプロバイダ・ブリッジ)
 │   ├── openai_wire.py      # OpenAI ↔ canonical の純粋変換（アダプタと relay が共用）
-│   ├── providers/          # Bedrock / OpenAI アダプタ + AWS event stream
+│   ├── providers/          # Bedrock（invoke / converse / batch）/ OpenAI アダプタ、S3、AWS event stream
+│   │                       #   bedrock.py, converse.py, bedrock_batch.py, s3.py, openai.py, eventstream.py
 │   └── tests/              # 単体テスト
 ├── responder/              # responder (LLM のフリをするエージェント) 向け指示書
 │   ├── CLAUDE.md           #   Claude Code 用

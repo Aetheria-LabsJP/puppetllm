@@ -59,6 +59,88 @@ _EVENTSTREAM_MEDIA = "application/vnd.amazon.eventstream"
 # The only anthropic_version Bedrock's InvokeModel accepts for Anthropic models.
 ANTHROPIC_VERSION = "bedrock-2023-05-31"
 
+# Exception members each streaming operation's union actually defines. InvokeModel's stream
+# adds `modelTimeoutException`; ConverseStream does not have it.
+_INVOKE_STREAM_MEMBERS = frozenset((
+    "internalServerException", "modelStreamErrorException", "validationException",
+    "throttlingException", "modelTimeoutException", "serviceUnavailableException"))
+_CONVERSE_STREAM_MEMBERS = _INVOKE_STREAM_MEMBERS - {"modelTimeoutException"}
+
+
+def stream_exception_fields(member: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Members that model more than `message` (ModelStreamErrorException carries the
+    upstream's original status and message)."""
+    if member == "modelStreamErrorException":
+        return {"originalStatusCode": int(result.get("original_status") or result.get("status", 500)),
+                "originalMessage": str(result.get("message", ""))}
+    return {}
+
+
+_SERVICE_TIERS = ("priority", "default", "flex", "reserved")
+_LATENCIES = ("standard", "optimized")
+
+
+def _invoke_options(request: Request) -> tuple[dict[str, str], str | None]:
+    """The InvokeModel options boto3 sends as HEADERS (`serviceTier=` →
+    `X-Amzn-Bedrock-Service-Tier`, `performanceConfigLatency=` →
+    `X-Amzn-Bedrock-PerformanceConfig-Latency`). Returns (options, error)."""
+    out: dict[str, str] = {}
+    tier = request.headers.get("x-amzn-bedrock-service-tier")
+    if tier is not None:
+        if tier not in _SERVICE_TIERS:
+            return out, f"X-Amzn-Bedrock-Service-Tier: must be one of {list(_SERVICE_TIERS)}"
+        out["service_tier"] = tier
+    latency = request.headers.get("x-amzn-bedrock-performanceconfig-latency")
+    if latency is not None:
+        if latency not in _LATENCIES:
+            return out, f"X-Amzn-Bedrock-PerformanceConfig-Latency: must be one of {list(_LATENCIES)}"
+        out["latency"] = latency
+    return out, None
+
+
+def _option_headers(snapshot: dict[str, Any]) -> dict[str, str]:
+    """Echo the tier / latency the request asked for, as the real service does (the
+    response models both headers; the tier is `default` when none was requested)."""
+    opts = snapshot.get("bedrock_options") or {}
+    out = {"X-Amzn-Bedrock-Service-Tier": opts.get("service_tier") or "default"}
+    if opts.get("latency"):
+        out["X-Amzn-Bedrock-PerformanceConfig-Latency"] = opts["latency"]
+    return out
+
+
+def stream_exception_member(name: str, *, operation: str = "invoke",
+                            status: int | None = None) -> str:
+    """Event-stream exception member for an AWS exception name (`ThrottlingException` →
+    `throttlingException`), restricted to the members that operation's union defines.
+
+    Names outside it are reported through the closest documented member — a mid-stream
+    timeout on ConverseStream, for instance, becomes `modelStreamErrorException`.
+    """
+    members = _CONVERSE_STREAM_MEMBERS if operation == "converse" else _INVOKE_STREAM_MEMBERS
+    camel = name[:1].lower() + name[1:] if name else "internalServerException"
+    if camel in members:
+        return camel
+    by_name = {"modelErrorException": "modelStreamErrorException",
+               "modelTimeoutException": "modelStreamErrorException",
+               "accessDeniedException": "validationException",
+               "resourceNotFoundException": "validationException"}
+    if camel in by_name:
+        return by_name[camel]
+    # Anything else the union cannot carry (`ModelNotReadyException`,
+    # `ServiceQuotaExceededException`, a 529 …) keeps its STATUS CLASS: a 429-class
+    # injection must surface as a throttle, not as an internal error.
+    if status is not None:
+        if status == 429:
+            return "throttlingException"
+        if status == 503:
+            return "serviceUnavailableException"
+        if status in (408, 504, 424):
+            return "modelStreamErrorException"
+        if 400 <= status < 500:
+            return "validationException"
+    return "internalServerException"
+
+
 # HTTP status → AWS exception name (used when /_control/error is given an Anthropic-style
 # `type` such as `rate_limit_error`, or no type at all). Statuses not listed fall back to
 # InternalServerException (5xx) / ValidationException (4xx). A `type` that already ends
@@ -130,7 +212,9 @@ def _log(msg: str) -> None:
 
 def _bedrock_error_response(status: int, etype: str | None, message: str,
                             *, request_id: str | None = None,
-                            extra_headers: dict[str, str] | None = None) -> JSONResponse:
+                            extra_headers: dict[str, str] | None = None,
+                            resource_name: str | None = None,
+                            original_status: int | None = None) -> JSONResponse:
     """Bedrock-style error response (status + __type + x-amzn-ErrorType header)."""
     name = exception_name_for(status, etype)
     headers = {"x-amzn-ErrorType": name}
@@ -138,8 +222,19 @@ def _bedrock_error_response(status: int, etype: str | None, message: str,
         headers["x-amzn-requestid"] = request_id
     if extra_headers:
         headers.update(extra_headers)
-    return JSONResponse({"message": message, "__type": name}, status_code=status,
-                        headers=headers)
+    body: dict[str, Any] = {"message": message, "__type": name}
+    # The two 424s wrap an UPSTREAM failure and are modeled differently: ModelErrorException
+    # carries {originalStatusCode, resourceName}, ModelStreamErrorException
+    # {originalStatusCode, originalMessage}. `original_status` (from /_control/error) is
+    # that upstream status; without it the injected status is the best available value.
+    if name == "ModelErrorException":
+        body["originalStatusCode"] = original_status or status
+        if resource_name:
+            body["resourceName"] = resource_name
+    elif name == "ModelStreamErrorException":
+        body["originalStatusCode"] = original_status or status
+        body["originalMessage"] = message
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def _validate_version(body: dict[str, Any]) -> str | None:
@@ -192,14 +287,22 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
     # Titan, ...) have their own body shapes and pass through unchecked.
     if errmsg is None and model.canonical != model.raw:
         errmsg = _validate_version(body)
+    options: dict[str, str] = {}
+    if errmsg is None:
+        options, errmsg = _invoke_options(request)
     if errmsg is not None:
         _log(f"{op} model={model.raw} rejected: {errmsg}")
         return _bedrock_error_response(400, "ValidationException", errmsg, request_id=req_id)
+    if options.get("service_tier") and isinstance(body, dict):
+        # Make the requested tier visible to the responder in the canonical vocabulary
+        # (`priority | flex` → auto, `default | reserved` → standard_only), like Converse.
+        body.setdefault("service_tier",
+                        "auto" if options["service_tier"] in ("priority", "flex") else "standard_only")
 
     try:
         snapshot, fut = await fs.register_request(
             "bedrock", model.canonical, body, is_stream=is_stream,
-            extra={"bedrock_model_id": model.raw},
+            extra={"bedrock_model_id": model.raw, "bedrock_options": options},
         )
     except fs.RequestValidationError as e:
         _log(f"{op} model={model.raw} rejected: {e}")
@@ -235,6 +338,7 @@ def build_router() -> APIRouter:
         if result["kind"] == "error":
             return _bedrock_error_response(
                 result["status"], result["type"], result["message"], request_id=req_id,
+                resource_name=model.raw, original_status=result.get("original_status"),
                 extra_headers=fs._error_headers(result),
             )
 
@@ -249,7 +353,7 @@ def build_router() -> APIRouter:
                 result.get("stop_details"), snapshot.get("params"),
             ),
             headers={"x-amzn-requestid": req_id,
-                     "X-Amzn-Bedrock-Service-Tier": "default",
+                     **_option_headers(snapshot),
                      **_token_headers(usage, _latency_ms(snapshot))},
         )
 
@@ -267,9 +371,31 @@ def build_router() -> APIRouter:
                                            f"request cleared: {result['detail']}",
                                            request_id=req_id)
         if result["kind"] == "error":
+            if result.get("after_events") is not None:
+                # Mid-stream failure: a 200 event stream carrying some `chunk` frames and
+                # then an exception frame (boto3 raises EventStreamError; the anthropic
+                # SDK surfaces it while iterating).
+                partial = fs.partial_stream_events(result, model.canonical, snapshot)
+                frames = [eventstream.encode_chunk(data) for _n, data in partial]
+                member = stream_exception_member(
+                    exception_name_for(result["status"], result["type"]),
+                    status=result["status"])
+                frames.append(eventstream.encode_exception(
+                    member, result["message"], stream_exception_fields(member, result)))
+
+                async def gen_err():
+                    for frame in frames:
+                        yield frame
+                        await asyncio.sleep(0)
+
+                return StreamingResponse(gen_err(), media_type=_EVENTSTREAM_MEDIA,
+                                         headers={"x-amzn-requestid": req_id,
+                                                  **_option_headers(snapshot),
+                                                  "X-Amzn-Bedrock-Content-Type": "application/json"})
             # Errors before streaming starts are returned via HTTP status (the SDK maps exceptions by status).
             return _bedrock_error_response(
                 result["status"], result["type"], result["message"], request_id=req_id,
+                resource_name=model.raw, original_status=result.get("original_status"),
                 extra_headers=fs._error_headers(result),
             )
 
@@ -296,6 +422,7 @@ def build_router() -> APIRouter:
 
         return StreamingResponse(gen(), media_type=_EVENTSTREAM_MEDIA,
                                  headers={"x-amzn-requestid": req_id,
+                                          **_option_headers(snapshot),
                                           "X-Amzn-Bedrock-Content-Type": "application/json"})
 
     @router.post("/anthropic/v1/messages")

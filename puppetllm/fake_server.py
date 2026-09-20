@@ -18,8 +18,11 @@ Architecture (provider-independent canonical core + adapters):
 Implemented surface:
 - POST /v1/messages                  — Anthropic compatible (SSE / single JSON)
 - POST /model/{id}/invoke[...]        — Bedrock compatible (added by providers/bedrock.py)
+- POST /model/{id}/converse[-stream]  — Bedrock Converse compatible (added by providers/converse.py)
 - POST /v1/chat/completions          — OpenAI compatible (added by providers/openai.py)
 - /v1/messages/batches[...]           — Anthropic Message Batches compatible (added by batches.py)
+- /model-invocation-job[s][...]       — Bedrock batch inference (added by providers/bedrock_batch.py)
+- /{bucket}[/{key}]                   — S3 emulation for batch inference I/O (added by providers/s3.py)
 - GET  /_control/pending             — pending requests (including provider)
 - GET  /_control/wait_for_pending    — long-poll until the next pending arrives
 - POST /_control/respond             — inject a response into a pending request
@@ -28,9 +31,10 @@ Implemented surface:
 - GET  /_control/history             — (request, response, usage, cost, cache) history
 - GET  /_control/stats               — cumulative summary of estimated cost, tokens, and cache
 - GET  /_control/cache               — pseudo prompt-cache index
-- POST /_control/clear               — empty pending/history/cache/batches
+- POST /_control/clear               — empty pending/history/cache/batches/bedrock_jobs (not the S3 store)
 - GET  /_control/health              — health check
 - GET  /_control/batches, POST /_control/batch/{end,result} — batch injection (added by batches.py)
+- GET  /_control/bedrock_jobs        — Bedrock batch-inference job registry (added by providers/bedrock_batch.py)
 
 The control endpoints are localhost only (for debugging), with no authorization.
 """
@@ -38,6 +42,8 @@ The control endpoints are localhost only (for debugging), with no authorization.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import math
 import os
@@ -114,6 +120,11 @@ class _ServerState:
         # and so the control endpoints below can resolve custom_id → pending_id without
         # a circular import.
         self.batches: dict[str, dict[str, Any]] = {}
+        # Bedrock batch inference jobs (providers/bedrock_batch.py). job_id → job dict.
+        self.bedrock_jobs: dict[str, dict[str, Any]] = {}
+        # Bumped by /_control/clear: a request that started before a clear and would
+        # otherwise (re)create state afterwards checks this and gives up instead.
+        self.clear_generation: int = 0
         self.turn_count: int = 0
         self.lock = asyncio.Lock()
         # The futures currently waiting in /_control/wait_for_pending.
@@ -243,7 +254,10 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
                            "ephemeral_1h_input_tokens": creation_1h},
         "output_tokens_details": {"thinking_tokens": _thinking_tokens(content_blocks) * n},
         "server_tool_use": None,
-        "service_tier": "batch" if snapshot.get("batch_id") else "standard",
+        # Anthropic Message Batches carry `batch_id`; Bedrock batch inference carries
+        # `job_id`. Either way the request is batch traffic.
+        "service_tier": "batch" if (snapshot.get("batch_id") or snapshot.get("job_id"))
+                        else "standard",
         "inference_geo": geo or "global",
     }
     if speed == "fast":
@@ -301,6 +315,51 @@ def _usage_wire(usage: dict[str, Any] | None) -> dict[str, Any]:
     out.setdefault("output_tokens_details", {"thinking_tokens": 0})
     out.setdefault("server_tool_use", None)
     out.setdefault("service_tier", "standard")
+    return out
+
+
+def _block_payload_error(blocks: list[dict[str, Any]]) -> str | None:
+    """Payload constraints an SDK enforces client-side. `redacted_thinking.data` is base64
+    on every wire (botocore models it as a Blob and decodes it), so a responder that sends
+    plain text would crash the boto3 client with a `binascii.Error` — refuse it here, where
+    the message can say why."""
+    for i, b in enumerate(blocks):
+        if b.get("type") == "redacted_thinking":
+            data = b.get("data")
+            if data is None:
+                continue
+            try:
+                base64.b64decode(str(data), validate=True)
+            except (ValueError, binascii.Error):
+                return (f"content[{i}].data: redacted_thinking data must be base64 "
+                        f"(the Bedrock SDKs decode it client-side)")
+    return None
+
+
+_ANTHROPIC_ERROR_TYPE_BY_STATUS = {
+    400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+    404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+    500: "api_error", 529: "overloaded_error",
+}
+
+
+def _normalize_blocks(blocks: Any) -> list[dict[str, Any]]:
+    """Keep only the block types puppetllm models and fill in what the real API always
+    returns: an id on every tool_use, a signature and string body on thinking blocks.
+
+    This is the single source of truth, so history, usage and every encoder (stream and
+    non-stream, all providers) agree — including the partial content of a mid-stream error.
+    """
+    out = [b for b in blocks if isinstance(b, dict) and b.get("type") in _MODELED_BLOCK_TYPES]
+    for b in out:
+        if b.get("type") == "tool_use" and not b.get("id"):
+            b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
+        elif b.get("type") == "thinking":
+            b["thinking"] = "" if b.get("thinking") is None else str(b["thinking"])
+            if not b.get("signature"):
+                b["signature"] = _fake_signature()
+        elif b.get("type") == "redacted_thinking":
+            b["data"] = "" if b.get("data") is None else str(b["data"])
     return out
 
 
@@ -513,18 +572,32 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             return {"kind": "batch_override", "type": response_payload["_batch_override"]}
         if isinstance(response_payload, dict) and response_payload.get("_inject_error"):
             status = int(response_payload.get("status", 500))
-            etype = str(response_payload.get("type", "api_error"))
+            etype = str(response_payload.get("type") or "api_error")
             emsg = str(response_payload.get("message", "fake_server injected error"))
+            after_events = response_payload.get("after_events")
+            partial = _normalize_blocks(response_payload.get("content") or [])
+            err_entry = {"status": status, "type": etype, "message": emsg}
+            if after_events is not None and snapshot.get("stream"):
+                # Mid-stream failure: record the content the responder supplied for the
+                # partial stream (the wire carries the first `after_events` of its events).
+                # A non-streaming request gets the plain HTTP error, so its history entry
+                # must not claim a mid-stream failure that never went on the wire.
+                err_entry["after_events"] = after_events
+                err_entry["partial_content"] = partial
             await _record_and_reset(
-                snapshot, response_blocks=None,
-                injected_error={"status": status, "type": etype, "message": emsg},
-                batch=is_batch,
+                snapshot, response_blocks=None, injected_error=err_entry, batch=is_batch,
             )
             return {"kind": "error", "status": status, "type": etype, "message": emsg,
                     "code": response_payload.get("code"),
                     "param": response_payload.get("param"),
                     # Extra response headers requested by the injector (e.g. retry-after).
-                    "headers": response_payload.get("headers") or {}}
+                    "headers": response_payload.get("headers") or {},
+                    # Mid-stream injection: emit this many events of `content` first, then
+                    # the error event (streaming requests only; None = plain HTTP error).
+                    "after_events": response_payload.get("after_events"),
+                    "original_status": response_payload.get("original_status"),
+                    "content_blocks": partial,
+                    "message_id": f"msg_{uuid.uuid4().hex[:24]}"}
 
         content_blocks = response_payload.get("content") or []
         if not isinstance(content_blocks, list):
@@ -534,20 +607,7 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         # truth, so history, usage, and the encoded response (stream & non-stream, all
         # providers) all agree. (The encoders also skip unknown blocks defensively, but this
         # is what makes usage and /_control/history reflect exactly what the caller receives.)
-        content_blocks = [b for b in content_blocks
-                          if isinstance(b, dict) and b.get("type") in _MODELED_BLOCK_TYPES]
-        # Assign ids for any tool_use missing one, all in one place (so stream / non-stream /
-        # all providers use the same id). Thinking blocks get a signature if missing (the real
-        # API always returns one; the SDK round-trips it verbatim).
-        for b in content_blocks:
-            if b.get("type") == "tool_use" and not b.get("id"):
-                b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
-            elif b.get("type") == "thinking":
-                b["thinking"] = "" if b.get("thinking") is None else str(b["thinking"])
-                if not b.get("signature"):
-                    b["signature"] = _fake_signature()
-            elif b.get("type") == "redacted_thinking":
-                b["data"] = "" if b.get("data") is None else str(b["data"])
+        content_blocks = _normalize_blocks(content_blocks)
         usage, cost = _compute_usage(snapshot, content_blocks)
         # Optional usage override from /_control/respond (validated there): real token
         # counts, e.g. relayed from an upstream API. Partial overrides are allowed —
@@ -907,11 +967,36 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
         # 529 overloaded_error is the documented "temporarily unavailable, retry" shape.
         return _anthropic_error(529, "overloaded_error",
                                 f"request cleared: {result['detail']}", headers=headers)
+    model_out = model or "claude-sonnet-mock"
     if result["kind"] == "error":
+        if is_stream and result.get("after_events") is not None:
+            # Mid-stream failure, the way the real API reports it: a 200 SSE response that
+            # carries some events and then an `error` event (SDKs surface it from the
+            # stream; no HTTP status is involved).
+            partial = partial_stream_events(result, model_out, snapshot)
+            frames = [_sse_event(name, data) for name, data in partial]
+            if frames:
+                # The SSE path normally puts one `ping` right after `message_start`, so a
+                # truncated stream must carry it too or it would not look like a prefix of
+                # the stream this same server emits. It is not counted by `after_events`,
+                # which counts protocol events only.
+                frames.insert(1, _sse_event("ping", {"type": "ping"}))
+            frames.append(_sse_event("error", {
+                "type": "error",
+                "error": {"type": result["type"], "message": result["message"]},
+                "request_id": req_id}))
+
+            async def gen_err():
+                for frame in frames:
+                    yield frame
+                    await asyncio.sleep(0)
+
+            # No injected error headers here: the response itself is a 200 stream, and a
+            # `retry-after` on a 200 would be nonsense.
+            return StreamingResponse(gen_err(), media_type="text/event-stream", headers=headers)
         return _anthropic_error(result["status"], result["type"], result["message"],
                                 headers={**headers, **_error_headers(result)})
 
-    model_out = model or "claude-sonnet-mock"
     content_blocks = result["content_blocks"]
     usage = result["usage"]
     message_id = result["message_id"]
@@ -931,6 +1016,30 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
         _build_non_stream_response(message_id, model_out, content_blocks, usage, *stop_args),
         headers=headers,
     )
+
+
+def partial_stream_events(result: dict[str, Any], model: str,
+                          snapshot: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
+    """The first `after_events` events of the stream that `content_blocks` would have
+    produced (for a mid-stream error injection). `after_events: 0` yields nothing — the
+    error is the first thing on the wire.
+
+    The count is clamped so the terminal `message_delta` / `message_stop` pair is never
+    emitted: a stream that failed mid-flight must not also look like it completed.
+
+    `ping` is not one of these events (it has no equivalent on the Bedrock event stream);
+    the SSE caller re-inserts it after `message_start` so the bytes on the wire still form
+    a prefix of a normal stream.
+    """
+    n = int(result.get("after_events") or 0)
+    if n <= 0:
+        return []
+    snapshot = snapshot or {}
+    params = snapshot.get("params")
+    usage, _cost = _compute_usage({**snapshot, "model": model}, result["content_blocks"])
+    events = stream_event_dicts(result["message_id"], model, result["content_blocks"], usage,
+                                None, None, None, params)
+    return events[:min(n, max(0, len(events) - 2))]
 
 
 def _error_headers(result: dict[str, Any]) -> dict[str, str]:
@@ -1153,6 +1262,9 @@ async def respond(request: Request) -> Any:
         isinstance(b, dict) and isinstance(b.get("type"), str) for b in content
     ):
         return _plain_400("content must be a list of content-block objects with a string 'type'")
+    bad_payload = _block_payload_error(content)
+    if bad_payload is not None:
+        return _plain_400(bad_payload)
     stop_reason = body.get("stop_reason")
     if stop_reason is not None and not isinstance(stop_reason, str):
         return _plain_400("stop_reason must be a string")
@@ -1253,7 +1365,13 @@ async def inject_error(request: Request) -> Any:
     """Error injection: make a pending request return an HTTP error.
 
     Body: {"status": 429, "type": "rate_limit_error", "message": "...",
-           "code"?: "...", "param"?: "...", "headers"?: {"retry-after": "3"}}
+           "code"?: "...", "param"?: "...", "headers"?: {"retry-after": "3"},
+           "after_events"?: 3, "content"?: [...]}
+    `after_events` (streaming requests only) turns the injection into a MID-STREAM
+    failure: the response starts as a normal 200 stream, emits the first N events of
+    `content` (default: none), then the provider's error event (Anthropic `event: error`,
+    Bedrock / Converse event-stream exception frame). Non-streaming requests ignore it
+    and get the plain HTTP error.
     On any of the Anthropic / Bedrock / OpenAI paths, each provider converts status/type
     into its own path's error format (code/param are used only in the OpenAI format).
     `headers` (string → string) are attached to the error response verbatim — e.g.
@@ -1274,6 +1392,21 @@ async def inject_error(request: Request) -> Any:
         err_msg = _validate_inject_headers(hdrs)
         if err_msg is not None:
             return _plain_400(err_msg)
+    after_events = body.get("after_events")
+    if after_events is not None and not (type(after_events) is int and after_events >= 0):
+        return _plain_400("after_events must be a non-negative integer")
+    original_status = body.get("original_status")
+    if original_status is not None and not (type(original_status) is int
+                                            and 100 <= original_status <= 599):
+        return _plain_400("original_status must be an integer HTTP status (100-599)")
+    partial_content = body.get("content", [])
+    if not isinstance(partial_content, list) or not all(
+        isinstance(b, dict) and isinstance(b.get("type"), str) for b in partial_content
+    ):
+        return _plain_400("content must be a list of content-block objects with a string 'type'")
+    bad_payload = _block_payload_error(partial_content)
+    if bad_payload is not None:
+        return _plain_400(bad_payload)
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
@@ -1281,11 +1414,19 @@ async def inject_error(request: Request) -> Any:
     err = _safe_set_result(fut, {
         "_inject_error": True,
         "status": status,
-        "type": str(body.get("type", "api_error")),
+        # No `type` given: the Anthropic vocabulary for that status, so the SDK raises its
+        # specific class (RateLimitError for a 429) — the Bedrock and OpenAI routes already
+        # derive their own type from the status.
+        "type": str(body.get("type") or _ANTHROPIC_ERROR_TYPE_BY_STATUS.get(status, "api_error")),
         "message": str(body.get("message", "fake_server injected error")),
         "code": body.get("code"),
         "param": body.get("param"),
         "headers": {k: str(v) for k, v in (hdrs or {}).items()},
+        "after_events": after_events,
+        # Bedrock: the status of the UPSTREAM failure a ModelErrorException /
+        # ModelStreamErrorException reports as `originalStatusCode` (a 424 wrapping a 429).
+        "original_status": original_status,
+        "content": partial_content,
     })
     if err is not None:
         return err
@@ -1408,6 +1549,8 @@ async def clear() -> dict[str, Any]:
         # Batch registry too: the collector tasks awaiting the cancelled futures see
         # kind "cleared" and return without touching the (now gone) batch objects.
         state.batches.clear()
+        state.bedrock_jobs.clear()
+        state.clear_generation += 1
     return {"ok": True}
 
 
@@ -1419,10 +1562,20 @@ async def clear() -> dict[str, Any]:
 from .providers import bedrock as _bedrock  # noqa: E402
 from .providers import openai as _openai  # noqa: E402
 from . import batches as _batches  # noqa: E402
+from .providers import s3 as _s3  # noqa: E402
+from .providers import converse as _converse  # noqa: E402
+from .providers import bedrock_batch as _bedrock_batch  # noqa: E402
 
 app.include_router(_bedrock.build_router())
 app.include_router(_openai.build_router())
 app.include_router(_batches.build_router())
+app.include_router(_converse.build_router())
+app.include_router(_bedrock_batch.build_router())
+# The S3 emulation's `/{bucket}` / `/{bucket}/{key}` catch-alls go LAST so every API path
+# above keeps precedence (reserved segments are refused there as bucket names too).
+app.include_router(_s3.build_router())
+# Outside the router: settles request paths the router's own convertor mis-handles.
+app.add_middleware(_s3.ControlCharGuard)
 
 
 # ── Stand-alone startup ──────────────────────────────────────────────

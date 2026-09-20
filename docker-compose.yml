@@ -37,9 +37,14 @@ services:
     depends_on:
       - proxy   # share the build
     working_dir: /app
+    environment:
+      # Fail loudly if the image lacks boto3 instead of skipping the SDK-level tests.
+      PUPPETLLM_REQUIRE_SDK_TESTS: "1"
     command: ["python3", "-m", "unittest",
               "puppetllm.tests.test_fake_server",
               "puppetllm.tests.test_proxy_extensions",
               "puppetllm.tests.test_batches",
-              "puppetllm.tests.test_conformance", "-v"]
+              "puppetllm.tests.test_conformance",
+              "puppetllm.tests.test_bedrock_extras",
+              "puppetllm.tests.test_boto3_interop", "-v"]
     restart: "no"

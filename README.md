@@ -2,7 +2,7 @@
 
 # puppetllm — LLM API debug proxy (fake Anthropic / Bedrock / OpenAI server)
 
-A **fake server** compatible with the Anthropic Messages API / Bedrock / OpenAI Chat Completions. Just point `ANTHROPIC_BASE_URL` (or the `AnthropicBedrock` / `OpenAI` `base_url`) at this server and it intercepts LLM calls **without changing a single line of your app / SDK code**, letting a human or another agent supply the responses (human-in-the-loop / AI-in-the-loop).
+A **fake server** compatible with the Anthropic Messages API / Bedrock (InvokeModel, Converse, batch inference) / OpenAI Chat Completions. Just point `ANTHROPIC_BASE_URL` (or the `AnthropicBedrock` / `OpenAI` `base_url`) at this server and it intercepts LLM calls **without changing a single line of your app / SDK code**, letting a human or another agent supply the responses (human-in-the-loop / AI-in-the-loop).
 
 Use cases:
 
@@ -22,6 +22,8 @@ A provider-agnostic canonical core + adapters:
 
 - `puppetllm/fake_server.py` — canonical core (normalized snapshot management + `/_control/*` + cost/cache computation). The Anthropic route `POST /v1/messages` is built in.
 - `puppetllm/providers/bedrock.py` — Bedrock route `POST /model/{id}/invoke[-with-response-stream]` (model-id normalization, `anthropic_version` validation, AWS-style errors / headers; AWS event stream framing lives in `providers/eventstream.py`).
+- `puppetllm/providers/converse.py` — Bedrock Converse route `POST /model/{id}/converse[-stream]` (the Converse JSON schema translated to and from the canonical form).
+- `puppetllm/providers/bedrock_batch.py` + `puppetllm/providers/s3.py` — Bedrock batch inference (`/model-invocation-job*`) over a bundled directory-backed S3 emulation.
 - `puppetllm/providers/openai.py` — OpenAI route `POST /v1/chat/completions` (requests are normalized to the canonical Anthropic-style form; responses are converted back to `chat.completion` JSON / SSE chunks).
 - `puppetllm/batches.py` — Anthropic Message Batches route `/v1/messages/batches*` (each custom_id is held as an ordinary pending; batch lifecycle is injectable via `/_control/batch/*`).
 - `puppetllm/cache_sim.py` — pseudo prompt cache (multi-breakpoint + top-level automatic `cache_control` + prefix match + generation-aware minimum threshold + 5m / 1h TTLs + 20-block lookback + effort / thinking / tool_choice invalidation).
@@ -106,9 +108,73 @@ Bedrock-route specifics (all decided from the URL path, no mode switch):
 - **Model-id normalization**: `anthropic.claude-haiku-4-5-20251001-v1:0`, suffix-less current ids (`anthropic.claude-opus-5`), cross-region inference profiles (`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … prefixes) and foundation-model / inference-profile ARNs (any partition: `aws`, `aws-cn`, `aws-us-gov`) are mapped to the Anthropic-side name (`claude-haiku-4-5-20251001`), which is what the pending snapshot's `model`, the response `model` field and `/_control/stats` `by_model` use — so Bedrock and direct-Anthropic traffic for the same model aggregate into one row, and relay's `--model-map` / `--only` globs match `claude-*`. The raw id is kept on the snapshot / history entry as `bedrock_model_id`. Ids without an `anthropic.` segment pass through unchanged.
 - **`anthropic_version` is validated** for Anthropic model ids: missing or anything other than `bedrock-2023-05-31` is rejected up front with `400 ValidationException` (no pending is created) — catches hand-rolled clients early. Other vendors' ids (`meta.llama…`, `amazon.titan…`) have their own body shapes and pass through unchecked. Malformed `cache_control` layouts (see § 5) are rejected the same way.
 - **SigV4 is not verified**: `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` are ignored.
-- **Response headers**: non-stream responses carry `X-Amzn-Bedrock-Input-Token-Count` (non-cached input only, like Converse's `inputTokens`) / `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency` (+ `x-amzn-requestid`, `X-Amzn-Bedrock-Service-Tier`); streams carry `amazon-bedrock-invocationMetrics` (incl. `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`) on the final chunk and `X-Amzn-Bedrock-Content-Type`, as real Bedrock does.
+- **Response headers**: non-stream responses carry `X-Amzn-Bedrock-Input-Token-Count` (non-cached input only, like Converse's `inputTokens`) / `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency` (+ `x-amzn-requestid`); streams carry `amazon-bedrock-invocationMetrics` (incl. `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`) on the final chunk and `X-Amzn-Bedrock-Content-Type`, as real Bedrock does. The options boto3 sends as **request headers** — `serviceTier=` (`X-Amzn-Bedrock-Service-Tier`, `priority | default | flex | reserved`) and `performanceConfigLatency=` (`X-Amzn-Bedrock-PerformanceConfig-Latency`) — are validated, echoed back in the same response headers on both routes (`default` when no tier was asked for), and the tier is made visible to the responder as canonical `service_tier` (`priority` / `flex` → `auto`, `default` / `reserved` → `standard_only`, the relay's vocabulary).
 - **Messages-API alias for `AnthropicBedrockMantle`**: `POST /anthropic/v1/messages` (the path served by the `bedrock-runtime` / `bedrock-mantle` hosts) is the plain Anthropic handler with Bedrock model-id normalization, and the plain `/v1/messages` route hands any request whose `model` is a Bedrock id (`[region.]anthropic.…` / ARN) to the same handler — so `AnthropicBedrockMantle(base_url="http://localhost:8765")` works whether it posts to the root or to `/anthropic` (SSE streaming, Anthropic error envelope, `anthropic-version` header, no `anthropic_version` body field). Batches / count_tokens are not served on this alias, matching Bedrock.
 - **Receipt log**: every Bedrock request (and every rejection) is logged to stderr as one `[bedrock] invoke model=<raw> -> <canonical> pending=<id> …` line, so Bedrock traffic is distinguishable from the other routes at a glance.
+
+**boto3 (`bedrock-runtime`), including Converse:**
+
+```python
+import boto3
+from botocore.config import Config
+
+rt = boto3.client("bedrock-runtime", region_name="us-east-1",
+                  aws_access_key_id="dummy", aws_secret_access_key="dummy",
+                  endpoint_url="http://localhost:8765")
+
+rt.converse(modelId="anthropic.claude-opus-5",
+            messages=[{"role": "user", "content": [{"text": "hello"}]}],
+            inferenceConfig={"maxTokens": 1024})
+
+for event in rt.converse_stream(modelId="anthropic.claude-opus-5",
+                                messages=[{"role": "user", "content": [{"text": "hello"}]}])["stream"]:
+    print(event)          # messageStart / contentBlockDelta / … / metadata
+```
+
+`POST /model/{id}/converse` and `/converse-stream` speak the Converse JSON schema and are
+normalized to the **same canonical pending** as every other route, so a responder answers
+them with the usual `/_control/respond` content blocks and never sees the difference:
+
+| Converse | canonical |
+|---|---|
+| `{"text": …}` | `{"type": "text", …}` |
+| `{"image": {"format", "source": {"bytes" \| "s3Location"}}}` / `{"document": …}` | `{"type": "image" \| "document", "source": {…}}` |
+| `{"toolUse": {"toolUseId", "name", "input"}}` | `{"type": "tool_use", "id", "name", "input"}` |
+| `{"toolResult": {"toolUseId", "content", "status"}}` | `{"type": "tool_result", "tool_use_id", "content", "is_error"}` |
+| `{"reasoningContent": {"reasoningText": {"text", "signature"}}}` / `{"redactedContent"}` | `{"type": "thinking", …}` / `{"type": "redacted_thinking", "data"}` |
+| `{"cachePoint": {"type": "default", "ttl"?}}` | `cache_control` on the **preceding** block / tool (a real breakpoint for the pseudo cache) |
+| `inferenceConfig.{maxTokens,temperature,topP,stopSequences}` | `max_tokens` / `temperature` / `top_p` / `stop_sequences` |
+| `toolConfig.tools[].toolSpec` / `toolChoice {auto\|any\|tool}` | `tools[]` / `tool_choice` |
+| `additionalModelRequestFields` | merged into the canonical body (`thinking`, `top_k`, `anthropic_beta`, …); a key Converse models itself (`system`, `tools`, `max_tokens`, `temperature`, …) is a `ValidationException`, never a back door around the schema |
+| `outputConfig.effort` / `outputConfig.textFormat` | `output_config.effort` (`low` … `xhigh` / `max`) / `output_config.format` (`{type: json_schema, schema, name?}` — `textFormat.structure.jsonSchema.schema` is the JSON **string** the API defines, decoded here into the schema object); the native fields win over the same keys sent through `additionalModelRequestFields`, and a non-object `output_config` there is a `ValidationException` |
+| `promptVariables` (prompt-management ARN as the model id) | kept for the responder under `converse.promptVariables`; `messages` may then be absent, as on the real API — the stored prompt supplies them, so the responder sees `messages: []`; with an ordinary model id `messages` stays required |
+| `serviceTier.type` | `service_tier` (`priority` / `flex` → `auto`, `default` / `reserved` → `standard_only`) |
+
+Responses are encoded back from the block types an assistant turn can actually hold
+(`text` / `toolUse` / `reasoningContent` — a responder's blocks are normalized to
+text / tool_use / thinking / redacted_thinking before any encoder sees them):
+`output.message`, `stopReason` in the Converse vocabulary (a canonical `refusal` becomes `content_filtered`, `pause_turn` becomes
+`end_turn`), `usage` with `inputTokens` excluding cached tokens plus
+`cacheReadInputTokens` / `cacheWriteInputTokens` / `cacheDetails`, and `metrics.latencyMs`.
+`additionalModelResponseFieldPaths` (JSON pointers, ≤ 10) are resolved against the native
+Messages-API response and also ride on `messageStop` in the stream. Requests are validated against the
+shapes of the schema — not its every constraint: each content block, source,
+`reasoningContent`, `toolChoice` and `system` entry is a **union** (exactly one member — a block carrying both
+`text` and `cachePoint` is a `ValidationException`, not a silently dropped text; so is an
+unknown member on a union object or an unknown top-level request member), and each
+union takes only its own members (an `ImageSource` / `VideoSource` is `bytes | s3Location`;
+only a `DocumentSource` also takes `text | content`). Required fields and enums
+(`image.format`, `video.format`, `document.name`, `toolUse.input`, `toolResult.content`,
+`cachePoint.type` / `ttl`, `inferenceConfig` ranges, `serviceTier.type`, `requestMetadata`
+1–16 entries, a `guardContent.image` being `png` / `jpeg` from `bytes`) are enforced, and
+two `cachePoint`s cannot address the same block. Not checked (a request production would
+reject can still pass here): decoded media size and validity, cross-block placement rules,
+the inner shape of `audio` / `searchResult` (only "must be an object"), user / assistant
+alternation (and `role: "system"` is accepted, as the botocore model allows), and the
+`guardrailConfig` / `promptVariables` / prompt-ARN conditionals. The stream emits `messageStart` → per block
+`contentBlockStart` (tool use) / `contentBlockDelta` / `contentBlockStop` → `messageStop`
+→ `metadata`, as raw-JSON event-stream frames (not the `chunk` + base64 wrapper the
+InvokeModel route uses).
 
 **OpenAI SDK (`openai`):**
 
@@ -178,7 +244,42 @@ The responder can be any of three things — they all use the same control plane
 
 For branch testing, you can make a pending request return any HTTP error (converted to the provider's native error format on all three routes — Anthropic / Bedrock / OpenAI). Optional `code` / `param` fields are passed through on the OpenAI route (e.g. `"code": "rate_limit_exceeded"`):
 
-On the Bedrock route the body becomes `{"message": "...", "__type": "<AwsException>"}` with an `x-amzn-ErrorType` header. If `type` is already an AWS exception name (ends in `Exception`) it is used as-is; otherwise it is derived from `status`: 400 → `ValidationException`, 401 → `UnrecognizedClientException`, 403 → `AccessDeniedException`, 404 → `ResourceNotFoundException`, 408/504 → `ModelTimeoutException`, 413 → `RequestEntityTooLargeException`, 424 → `ModelErrorException`, 429 → `ThrottlingException`, 500 → `InternalServerException`, 503 → `ServiceUnavailableException`, 529 → `overloaded_error` (Bedrock passes Anthropic's 529 through) — other 4xx → `ValidationException`, other 5xx → `InternalServerException`. Pass an AWS name explicitly for the rest (`ServiceQuotaExceededException` 400, `ModelNotReadyException` 429, `ModelStreamErrorException` 424). So the same `{"status": 429, "type": "rate_limit_error"}` injection yields a `ThrottlingException` for a Bedrock client and a `rate_limit_error` for an Anthropic client.
+On the Bedrock route the body becomes `{"message": "...", "__type": "<AwsException>"}` with an `x-amzn-ErrorType` header (the two 424s wrap an upstream failure and carry its status as `originalStatusCode` — pass `original_status` to `/_control/error` to make it differ from the HTTP status, e.g. a 424 wrapping a 429; `ModelErrorException` adds `resourceName`, `ModelStreamErrorException` adds `originalMessage`, as botocore models them). When no `type` is given, the Anthropic route derives it from the status too (429 → `rate_limit_error`, 529 → `overloaded_error`, 400 → `invalid_request_error`, …), so the `anthropic` SDK raises its specific class. If `type` is already an AWS exception name (ends in `Exception`) it is used as-is; otherwise it is derived from `status`: 400 → `ValidationException`, 401 → `UnrecognizedClientException`, 403 → `AccessDeniedException`, 404 → `ResourceNotFoundException`, 408/504 → `ModelTimeoutException`, 413 → `RequestEntityTooLargeException`, 424 → `ModelErrorException`, 429 → `ThrottlingException`, 500 → `InternalServerException`, 503 → `ServiceUnavailableException`, 529 → `overloaded_error` (kept as-is; whether the live service wraps an upstream 529 instead is unverified) — other 4xx → `ValidationException`, other 5xx → `InternalServerException`. Pass an AWS name explicitly for the rest (`ServiceQuotaExceededException` 400, `ModelNotReadyException` 429, `ModelStreamErrorException` 424). So the same `{"status": 429, "type": "rate_limit_error"}` injection yields a `ThrottlingException` for a Bedrock client and a `rate_limit_error` for an Anthropic client.
+
+For a **streaming** request you can also fail mid-stream, the way the real APIs do — add
+`after_events` (and optionally the `content` to emit first). The response then starts as a
+normal 200 stream, emits that many events, and ends with the provider's error event:
+`event: error` on the Anthropic route, an event-stream **exception frame** on the Bedrock
+routes. What the SDKs raise: the first-party `anthropic` client raises its usual
+`APIStatusError` from the SSE `error` event; boto3 raises `botocore.exceptions.EventStreamError`
+whose `Error.Code` is the frame's member name (`throttlingException`, …); `AnthropicBedrock`
+raises a bare `ValueError` from its stream decoder — not an `anthropic.APIError` — so catch
+accordingly. The frame's member is restricted to the operation's union
+(`internalServer` / `modelStreamError` / `validation` / `throttling` / `serviceUnavailable`,
+plus `modelTimeout` on InvokeModel only): a name outside it keeps its status class (a
+429-class `ModelNotReadyException` becomes `throttlingException`; 408/504 stay
+`modelTimeoutException` on InvokeModel and become `modelStreamErrorException` with
+`originalStatusCode` on ConverseStream, whose union has no timeout member), never a silent
+internal error. `after_events` counts each route's own events, so the same number
+delivers different content per route (the InvokeModel stream and SSE have a
+`content_block_start`, ConverseStream starts a text block with its first delta):
+
+```bash
+curl -s -X POST localhost:8765/_control/error \
+  -d '{"status": 429, "type": "ThrottlingException", "message": "slow down",
+       "after_events": 3, "content": [{"type": "text", "text": "partial answer"}]}'
+```
+
+The count is clamped so the terminal events are never emitted — a stream that failed
+mid-flight never also looks like it completed. It counts protocol events only: the SSE
+route still sends its usual `ping` after `message_start`, and that `ping` is not counted.
+The history entry carries
+`injected_error.partial_content` (the content the responder supplied for the partial
+stream) alongside `after_events` — only for a streaming request, since only there did it go
+on the wire. A `redacted_thinking` block's `data` must be base64 in a `respond` / `error`
+`content` (the Bedrock SDKs decode it client-side; plain text would crash the caller with a
+`binascii.Error`), so `/_control/*` refuses it with a 400 that says so. Non-streaming requests ignore `after_events` and get the plain
+HTTP error (the OpenAI route always does).
 
 ```bash
 # 429 → the SDK retries automatically
@@ -273,6 +374,159 @@ Deliberate divergences from the real API (determinism over fidelity):
 - Per-request `params` are only shallow-validated (params being an object; `stream: true`, `speed` (fast mode) and `max_tokens: 0` are rejected at create time as on the real API, while an item carrying `fallbacks` is accepted and comes back as an `errored` result without ever becoming a pending — also as on the real API); the envelope is checked as strictly as the real API (`custom_id` matching `^[a-zA-Z0-9_-]{1,64}$` and unique, ≤ 100,000 requests, `limit` in `[1, 1000]` / cursors on list) so an app that production would reject is rejected here too. Params that later fail processing (e.g. a non-list `messages`) roll the whole create back with a 400 — no batch, no pendings, no history left behind.
 - `results_url` is built from the incoming request's Host. Behind a reverse proxy, run uvicorn with `--proxy-headers` (and a matching `FORWARDED_ALLOW_IPS`) so it reflects the external URL.
 
+### 7. Bedrock batch inference (with a bundled S3)
+
+The control-plane batch API is emulated too, over a directory-backed **S3 emulation** so a
+plain `boto3` S3 client can stage the input and read the results:
+
+```python
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client("s3", region_name="us-east-1", aws_access_key_id="d", aws_secret_access_key="d",
+                  endpoint_url="http://localhost:8765",
+                  config=Config(s3={"addressing_style": "path"}))     # path-style is required
+bedrock = boto3.client("bedrock", region_name="us-east-1", aws_access_key_id="d",
+                       aws_secret_access_key="d", endpoint_url="http://localhost:8765")
+
+s3.create_bucket(Bucket="batch-in"); s3.create_bucket(Bucket="batch-out")
+s3.put_object(Bucket="batch-in", Key="jobs/input.jsonl", Body=b'''{"recordId": "r1", "modelInput": {...}}\n''')
+
+job = bedrock.create_model_invocation_job(
+    jobName="myjob", modelId="anthropic.claude-opus-5",
+    roleArn="arn:aws:iam::123456789012:role/BatchRole",
+    inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://batch-in/jobs/input.jsonl"}},
+    outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://batch-out/results/"}})
+```
+
+Every `{"recordId", "modelInput"}` line becomes an ordinary **pending** (provider
+`bedrock`, snapshot tagged `job_arn` / `job_id` / `record_id`), so the responder answers
+them with the same `/_control/respond` / `auto` / `error`. Once every record has an outcome
+the job writes `<output prefix>/<jobId>/<input file>.out` and `manifest.json.out`, and
+ends `Completed`. The output file name keeps the key's path relative to the input prefix,
+so `a/data.jsonl` and `b/data.jsonl` do not collide. Each output line is
+
+```json
+{"recordId": "r1", "modelInput": { … as submitted … },
+ "modelOutput": { … }}                                  // or, on failure:
+{"recordId": "r2", "modelInput": { … },
+ "error": {"errorCode": 400, "errorMessage": "…"}}
+```
+
+`recordId` is the only correlation key (results are not ordered), and the manifest is
+
+```json
+{"totalRecordCount": 3, "processedRecordCount": 3, "successRecordCount": 2,
+ "errorRecordCount": 1, "inputTokenCount": 120, "outputTokenCount": 48}
+```
+
+`modelInput` is an InvokeModel body (default) or a Converse body with
+`modelInvocationType: "Converse"`; `modelOutput` is the matching response shape.
+An `InvokeModel` body is model-specific, so those jobs need an Anthropic `modelId`;
+`Converse` is a model-independent schema, so a `Converse` job takes any model. What the
+bundled store cannot honour is refused rather than echoed: `s3EncryptionKeyId` (outputs are
+plain files) is a `ValidationException`, and `s3BucketOwner` must be `123456789012`, the
+one account the store's buckets and the job ARNs belong to.
+`get_model_invocation_job` / `list_model_invocation_jobs` / `stop_model_invocation_job`
+work as usual (`GET /_control/bedrock_jobs` shows the registry with unresolved record ids).
+
+`Stop` finalizes synchronously — the status is already terminal when the call returns —
+except while the input is still being read or an output write is already in flight, when it
+returns `200` with the job in `Stopping` and the terminal status follows; the job ends
+`Stopped`, the terminal status the real service reports for `StopModelInvocationJob` — an injection already in flight still
+completes, but records that were never processed stay in `totalRecordCount` only, are counted
+in neither `processedRecordCount` nor `errorRecordCount`, and are written to no output line
+(they are listed under `cancelled` in `/_control/bedrock_jobs`). A stop is accepted while the
+job is still `Submitted` or registering (whatever was not yet registered is never processed —
+and if that job's input then fails validation, in the read or in the registration, it ends
+`Failed` with the reason rather than vanishing from under the caller who stopped it), is
+idempotent once the job is `Stopping` / `Stopped`
+(botocore retries a Stop whose response it lost), a `Completed` / `Failed` job answers
+`ConflictException`, and a stop accepted while the outputs are being written still decides
+the terminal status. If the
+outputs cannot be written (output bucket deleted mid-job, disk error) the job ends **`Failed`**
+with the reason in `message` — whatever was written before the failure stays — so a poller
+must treat `Completed` / `Stopped` / `Failed` as the terminal set. A record whose `modelInput`
+is invalid becomes an `error` record instead of failing the job, like the real service; a
+malformed JSONL line, a non-string or duplicate `recordId`, a missing input / output bucket or
+an input with no records rolls the whole create back with a `ValidationException`. Features AWS documents as unavailable in batch come back as
+`errorCode 400` records: tool calling, structured output, and prompt caching
+(`cache_control` / `cachePoint` anywhere in the record).
+
+Other intentional differences (determinism over fidelity): no `Validating` / `Scheduled`
+phases (a job is `InProgress` as soon as its records are pending), no minimum record count
+beyond "at least one", and no clock-based expiry. Input JSONL is read and held in memory, so
+a job's practical size is bounded by RAM rather than by AWS's 1 GB / 50,000-record limits.
+`/_control/clear` drops the job registry but deliberately leaves the S3 store alone, so
+outputs a cleared job had already written stay readable; a create still in flight at that
+moment — reading its input, registering, waiting on an idempotent twin, or finalizing
+inline — answers `400 ConflictException` (deliberately not a retryable 5xx — botocore would
+otherwise re-create the job the human had just cleared). The output layout is checked at
+create time (`<prefix>/<jobId>/<file>.out` must fit the store's 255-byte segment limit and
+neither the prefix nor any ancestor of it may be an existing object), so a job never ends
+`Failed` on that after every record was processed. A `recordId` must be a non-empty string
+when present (an empty one is not silently replaced by a generated id).
+
+The S3 emulation covers exactly what that flow needs — `PUT`/`HEAD` bucket, `PUT` / `GET` /
+`HEAD` / `DELETE` object, `GET /` (list buckets), `DELETE` bucket (`409 BucketNotEmpty`
+unless empty), ranged `GET` (`Range` → `206` + `Content-Range`, `416 InvalidRange` past the
+end), conditional requests (`If-Match` / `If-None-Match` → `304` on a read, `412 PreconditionFailed` on a write or a
+delete, and `404 NoSuchKey` for an `If-Match` write or delete on a key that does not exist,
+as the real service answers — atomically, so sixteen concurrent `If-None-Match: *` writers
+get exactly one winner; the `If-*-Since` forms on reads only), conditional deletes
+(`delete_object(IfMatch=…)`, `*` for "only if it exists"; a weak `W/` tag never authorizes a
+write or a delete; the size / last-modified forms are directory-bucket features and answer
+`501`), `ExpectedBucketOwner` enforcement (every bucket belongs to `123456789012`; a wrong
+value in either the query or the `x-amz-` header is `403 AccessDenied`), request-checksum
+verification (`400 BadDigest`, `IncompleteBody` when `x-amz-decoded-content-length`
+disagrees, `InvalidRequest` for an `aws-chunked` body without its terminating chunk) and
+both listings:
+`GET ?list-type=2` and the V1 `GET` with `marker`, each with `prefix`, `delimiter`
+(`CommonPrefixes`), `max-keys` (clamped to 1000 rather than refused) and `encoding-type=url`
+(path-style, no auth, `aws-chunked` bodies decoded).
+
+Two of those are not optional in practice: boto3's `download_file` splits anything over
+`multipart_threshold` (8 MB) into concurrent ranged GETs, and botocore asks for
+`encoding-type=url` on every listing — it URL-decodes the keys it reads back only when the
+response echoes `EncodingType`, so the two have to be switched together.
+
+**Everything else is refused, not approximated.** `CreateMultipartUpload`, `CopyObject`,
+object and bucket tagging / ACL / versioning / policy, `ListObjectVersions`, `DeleteObjects`,
+the other sub-resources, and the `put_object` options this store cannot store
+(`Tagging`, `Metadata`, SSE, ACL / grants, object lock) answer `501 NotImplemented` in an S3
+envelope; `ContentType` and the other plain entity headers are accepted but not stored
+(objects read back as `binary/octet-stream`). This matters more than it sounds:
+`copy_object`, `put_object_tagging` and `put_object_acl` all arrive as a `PUT` on the
+object's own path, so a store that ignored the sub-resource would write their body — or
+their empty body — over the object and report success. Presigned-URL query auth is ignored
+like header auth. For multipart upload specifically, keep staged inputs under that 8 MB
+threshold or lower it in `boto3.s3.transfer.TransferConfig`. Because the body is read
+**before** any refusal is sent, a refusal never leaves the keep-alive connection out of
+sync: botocore's `Expect: 100-continue` PUTs get their `100 Continue` before any answer —
+and that holds for a path the router itself cannot represent (a control character in a
+key, which is refused before routing). A non-`STANDARD` `StorageClass` is refused too
+(everything here is STANDARD), and the request checksums botocore attaches
+(`Content-MD5`, `x-amz-checksum-crc32` / `sha1` / `sha256`, header or `aws-chunked`
+trailer) are verified — `400 BadDigest` on a mismatch — so a body corrupted in transit is
+never stored quietly (`crc32c` / `crc64nvme` are accepted unverified).
+
+Objects live under `PUPPETLLM_S3_ROOT` (default: a per-process temp directory) and can never
+be written outside it: bucket names are validated everywhere (including inside `s3://` URIs),
+keys with `.` / `..` segments are refused (and a single key segment is limited to 255 bytes,
+what the backing filesystem accepts — a flat 1024-byte key is legal on S3 but not here), a
+write needs an existing bucket, writes land through a rename from a temp directory outside
+the bucket tree so a concurrent reader never sees a half-written object (one store-wide
+lock also covers the batch emulation's worker thread, so its output writes cannot
+interleave inside an HTTP handler's stat → precondition → write either; the handlers take
+that lock off the event loop, so a thread holding it never freezes the other routes), and a malformed
+`aws-chunked` body is a `400 InvalidRequest`. Control characters in a key are refused (this
+store renders keys straight into the listing XML, where they would be illegal), and a key is
+never silently rewritten — `PUT /bucket//a` is a `400` rather than a quiet write to `a`.
+Bucket names that collide with an API path (`model`, `v1`, `anthropic`, `_control`,
+`model-invocation-job[s]`, `docs`, `redoc`, `openapi.json`) are refused, and a request to one
+of those paths with the wrong method gets the API's own `405` + `Allow`, never an S3 error
+envelope.
+
 ---
 
 ## Relay mode (cross-provider bridge)
@@ -315,14 +569,15 @@ Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
 | POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`) into a pending request. `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode) |
 | POST | `/_control/auto` | Simple auto-response (`{"text":"...", "pending_id"?}`, text only) |
-| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?}`). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
+| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"?, "content"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) history |
 | GET  | `/_control/stats` | Cumulative summary of cost estimates, tokens, cache |
 | GET  | `/_control/cache` | Pseudo prompt-cache index |
-| POST | `/_control/clear` | Empty pending / history / cache / batches (in-flight requests are released with a retryable error: 529 `overloaded_error` on the Anthropic route, 503 on Bedrock / OpenAI) |
+| POST | `/_control/clear` | Empty pending / history / cache / batches / Bedrock batch jobs (in-flight requests are released with a retryable error: 529 `overloaded_error` on the Anthropic route, 503 on Bedrock / OpenAI; a Bedrock batch job still being created gets a non-retryable 400 `ConflictException`; the S3 store is left alone) |
 | GET  | `/_control/batches` | Batch registry (status, request_counts, unresolved custom_ids) |
 | POST | `/_control/batch/result` | Inject `canceled` / `expired` for one custom_id (`{"custom_id","type","batch_id"?}`) |
 | POST | `/_control/batch/end` | Force a batch to `ended`; unresolved custom_ids become `expired` (default) or `canceled` |
+| GET  | `/_control/bedrock_jobs` | Bedrock batch-inference job registry (status, record counts, unresolved `recordId`s) |
 
 On `respond` / `auto` / `error`, batch entries can be addressed with `custom_id` (+ optional `batch_id`) instead of `pending_id`.
 
@@ -345,6 +600,11 @@ How to build injection payloads (especially avoiding escape accidents with non-A
 - The default listen address is `127.0.0.1` (localhost only). Access from another host only **within a trusted network** such as LAN / VPN / Tailscale.
 - If you expose it with `--host 0.0.0.0` (Docker listens on `0.0.0.0` by default, but compose restricts publishing to `127.0.0.1:8765`), always check your firewall / network policy.
 - **Running the image directly with `docker run`**: the container listens on `0.0.0.0` (required for port mapping), so bind the published port to localhost — `docker run -p 127.0.0.1:8765:8765 puppetllm` — **not** `-p 8765:8765`, which would expose the unauthenticated control plane on every host interface. The provided `docker compose` already does this for you.
+- The bundled **S3 emulation** is part of that control plane: any client that can reach the
+  port can create buckets and read, write and delete objects without credentials. It is
+  confined to `PUPPETLLM_S3_ROOT` (a per-process temp directory unless you set it), and
+  nothing outside that directory is reachable — but point `PUPPETLLM_S3_ROOT` at a scratch
+  directory, not at anything you care about.
 - This is strictly a local debugging tool. It is not meant to sit in front of production.
 
 ---
@@ -355,6 +615,7 @@ How to build injection payloads (especially avoiding escape accidents with non-A
 |---|---|---|
 | `PUPPETLLM_CACHE_TTL` | `300` | Pseudo-cache TTL for 5-minute breakpoints (seconds) |
 | `PUPPETLLM_CACHE_TTL_1H` | 12 × `PUPPETLLM_CACHE_TTL` | TTL for `ttl: "1h"` breakpoints (seconds); defaults to 3600 and scales with the 5m TTL when unset |
+| `PUPPETLLM_S3_ROOT` | a per-process temp dir | Where the S3 emulation stores objects (batch inference I/O). Set it to keep them across restarts, or to see them from the host under Docker (add the variable and a matching volume to your compose override; the shipped `docker-compose.yml` defines neither) |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` ignores the TTL (entries live forever) |
 | `PUPPETLLM_CACHE_MIN_TOKENS` | (per-model) | Override the minimum cache threshold. `0` disables it (cache every prefix). Unset = the generation-aware table (Opus 5 / Fable 512, Opus 4.8 1024, Opus 4.7 2048, Opus 4.6 / 4.5 4096, Sonnet 1024, Haiku 4.5 4096, …) |
 
@@ -363,15 +624,25 @@ How to build injection payloads (especially avoiding escape accidents with non-A
 ## Tests
 
 ```bash
-# Docker
+# Docker (the test profile also starts the `proxy` service on 127.0.0.1:8765 via
+# depends_on, so that port must be free)
 docker compose --profile test run --rm proxy-test
 
 # Or directly
 pip install -r requirements.txt
-python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions puppetllm.tests.test_batches puppetllm.tests.test_conformance -v
+python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
+    puppetllm.tests.test_batches puppetllm.tests.test_conformance \
+    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_boto3_interop -v
 ```
 
 `puppetllm/tests/test_fake_server.py` is an executable specification of the expected behavior.
+
+`test_boto3_interop.py` is the only module that drives **real** boto3 / botocore (`>= 1.43`,
+the first service model with every field it exercises) against a running uvicorn instance — every other test encodes and decodes the Bedrock event stream
+with puppetllm's own codec, so a matching encoder/decoder mistake would pass unnoticed
+there. It needs `boto3` (in `requirements.txt`); the compose test profile sets
+`PUPPETLLM_REQUIRE_SDK_TESTS=1` so a run that cannot import it fails instead of quietly
+reporting `OK` with every SDK test skipped.
 
 ---
 
@@ -386,7 +657,8 @@ puppetllm/
 │   ├── pricing.py          # approximate tokens + pricing
 │   ├── relay.py            # relay responder (cross-provider bridge to a real API)
 │   ├── openai_wire.py      # pure OpenAI ↔ canonical conversions shared by the adapter and the relay
-│   ├── providers/          # Bedrock / OpenAI adapters + AWS event stream
+│   ├── providers/          # Bedrock (invoke / converse / batch) + OpenAI adapters, S3, AWS event stream
+│   │                       #   bedrock.py, converse.py, bedrock_batch.py, s3.py, openai.py, eventstream.py
 │   └── tests/              # unit tests
 ├── responder/              # instruction docs for the responder (the agent that "plays the LLM")
 │   ├── CLAUDE.md           #   for Claude Code
