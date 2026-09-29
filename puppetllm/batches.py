@@ -65,6 +65,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # fake_server imports this module at its end and calls build_router(). Here we hold
 # only a module reference; attributes like `fs.register_request` must always be
 # resolved at call-time.
+from . import control_models as _cm
 from . import fake_server as fs
 
 # Real-API display value only — nothing in this server expires by the clock.
@@ -437,6 +438,19 @@ def build_router() -> APIRouter:
         # instant a pending appears, and the collector must be able to find the batch.
         async with fs.state.lock:
             fs.state.batches[batch_id] = batch
+        # Every entry is validated before any is registered: a create that fails on a
+        # later entry must not have consumed scenario steps for the earlier ones.
+        for i, item in enumerate(requests_in):
+            if "fallbacks" in item["params"]:
+                continue
+            try:
+                fs.validate_request_body(item["params"], item["params"].get("model"))
+            except Exception as e:
+                _rollback_creation(batch)
+                return fs._anthropic_error(
+                    400, "invalid_request_error",
+                    f"requests[{i}].params could not be processed: "
+                    f"{type(e).__name__}: {str(e)[:200]}")
         try:
             for i, item in enumerate(requests_in):
                 cid = item["custom_id"]
@@ -646,7 +660,7 @@ def build_router() -> APIRouter:
                 })
         return {"count": len(out), "batches": out}
 
-    @router.post("/_control/batch/end")
+    @router.post("/_control/batch/end", openapi_extra=_cm.schema_of(_cm.BatchEndBody))
     async def control_batch_end(request: Request) -> Any:
         """Force a batch to `ended` now.
 
@@ -680,7 +694,7 @@ def build_router() -> APIRouter:
         return {"ok": True, "batch_id": batch["id"], "finalized": n,
                 "unresolved_as": rtype, "ended": ended, "in_flight": in_flight}
 
-    @router.post("/_control/batch/result")
+    @router.post("/_control/batch/result", openapi_extra=_cm.schema_of(_cm.BatchResultBody))
     async def control_batch_result(request: Request) -> Any:
         """Inject a `canceled` / `expired` result for one custom_id.
 

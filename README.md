@@ -8,6 +8,7 @@ Use cases:
 
 - **Zero-cost debugging**: reproduce and inspect agent / orchestration behavior without hitting the real API.
 - **Deterministic testing**: inject arbitrary responses (text / tool_use, errors) to reproduce branches.
+- **Scripted test harness ([§8](#8-test-harness-scenario-rules-timeouts-latency-rate-limits-fake-clock))**: match requests to canned answers with rules, script sequences such as 429 → tool_use → final text, simulate latency and rate limits, and assert what your app sent — from CI with no responder present (`puppetllm.testing`, a pytest fixture).
 - **Cross-provider bridge ([relay mode](#relay-mode-cross-provider-bridge))**: run an app written for one SDK against a *different* real provider (e.g. an Anthropic-SDK agent on Grok / GPT, or an OpenAI-SDK app on Claude) — without changing a line of app code.
 - **Cost estimates**: aggregate approximate tokens / pricing per request (`/_control/stats`).
 - **Pseudo prompt-cache observation**: verify by hash whether your app structures requests so `cache_control` actually takes effect (`/_control/cache`).
@@ -27,7 +28,9 @@ A provider-agnostic canonical core + adapters:
 - `puppetllm/providers/openai.py` — OpenAI route `POST /v1/chat/completions` (requests are normalized to the canonical Anthropic-style form; responses are converted back to `chat.completion` JSON / SSE chunks).
 - `puppetllm/batches.py` — Anthropic Message Batches route `/v1/messages/batches*` (each custom_id is held as an ordinary pending; batch lifecycle is injectable via `/_control/batch/*`).
 - `puppetllm/cache_sim.py` — pseudo prompt cache (multi-breakpoint + top-level automatic `cache_control` + prefix match + generation-aware minimum threshold + 5m / 1h TTLs + 20-block lookback + effort / thinking / tool_choice invalidation).
-- `puppetllm/pricing.py` — approximate tokens + price table (Claude generations incl. Fable / Mythos / Sonnet 5 / Opus 4.1, and GPT / o-series families, per the official pricing pages).
+- `puppetllm/pricing.py` — approximate tokens + price table (Claude generations incl. Fable / Mythos / Sonnet 5 / Opus 4.1, and GPT / o-series families, per the official pricing pages) and the `/v1/models` catalogue.
+- `puppetllm/harness.py` — test-harness layer: scenario rules, unmatched policy, pending timeout, latency / jitter, rate-limit window, fake clock. `puppetllm/control_models.py` holds the typed `/_control/*` request bodies published in `/openapi.json`.
+- `puppetllm/testing.py` + `puppetllm/pytest_plugin.py` — the test-side client (`Puppet`, `serve()`) and the `puppet` pytest fixture.
 
 Providers are auto-selected by URL path — no mode switch or configuration. Response content blocks / control API are common across providers (injection is always the same `/_control/respond`).
 
@@ -54,9 +57,12 @@ Think of it as **three actors**:
 docker compose up -d
 curl localhost:8765/_control/health        # → {"ok":true,"turn_count":0}
 
-# B) Directly (Python 3.12+) — runs in foreground with a startup banner
+# B) Directly (Python 3.10+) — runs in foreground with a startup banner
 pip install -r requirements.txt
 python3 -m puppetllm --host 127.0.0.1 --port 8765
+#   (or `pip install .` and use the `puppetllm` command: `puppetllm serve --port 8765`,
+#    `puppetllm relay ...`, `puppetllm wait` (block until the server is healthy),
+#    `puppetllm --version`; `pip install ".[test]"` adds the anthropic / openai / boto3 SDKs)
 #   [puppetllm] starting on http://127.0.0.1:8765
 #   [puppetllm] Anthropic: set ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 #   [puppetllm] Bedrock:   point AnthropicBedrock base_url to http://127.0.0.1:8765
@@ -67,6 +73,8 @@ python3 -m uvicorn puppetllm.fake_server:app --host 127.0.0.1 --port 8765
 ```
 
 `--host` defaults to `127.0.0.1` (localhost only). Use `0.0.0.0` only when accessing over LAN/VPN (see [Security](#security)).
+
+`serve` also takes the harness settings of [§8](#8-test-harness-scenario-rules-timeouts-latency-rate-limits-fake-clock): `--pending-timeout SECONDS`, `--default-response TEXT_OR_JSON`, `--on-unmatched pending|default|error`, `--seed N`, `--config FILE`, `--rules FILE` (the same settings are available as environment variables for Docker).
 
 ### 2. Point your app / SDK at the proxy
 
@@ -88,6 +96,8 @@ print(msg.usage)            # → approximate input/output tokens + cache
 ```
 
 The API key can be a dummy (the proxy does not validate it). Instead of `base_url`, setting the env var `ANTHROPIC_BASE_URL=http://localhost:8765` works identically (intercept without touching code). `stream=True` SSE works as-is too.
+
+A pending waits as long as the responder takes, so raise the SDK's `timeout` (the Anthropic SDK defaults to 10 minutes, the OpenAI SDK too, but a 30 s `httpx` timeout in your own code will fire first). When you inject errors, remember that the SDKs retry 429 / 5xx twice by default with backoff — pass `max_retries=0` to see every injected error exactly once, or keep the retries to exercise them (each retry is a new pending).
 
 **Bedrock SDK (`AnthropicBedrock`):**
 
@@ -529,6 +539,129 @@ envelope.
 
 ---
 
+### 8. Test harness: scenario rules, timeouts, latency, rate limits, fake clock
+
+Everything above needs a responder. The harness answers requests **by itself** from a
+script, so the same server runs in CI with nothing attached — and history / stats /
+cache work exactly as with a human responder.
+
+**Rules** match a request and answer it; each rule holds an ordered list of steps that
+are consumed one per matching request (the last step repeats when `repeat: true`; an
+exhausted rule stops matching and lets the next rule — or the unmatched policy — take
+over). A step is a `/_control/respond` body (`{"text": ...}` shorthand allowed) or a
+`/_control/error` body, plus optional latency keys:
+
+```bash
+curl -s -X PUT localhost:8765/_control/rules -H 'content-type: application/json' -d '{
+  "rules": [
+    {"id": "throttle-once", "match": {"provider": "anthropic"},
+     "steps": [{"error": {"status": 429, "headers": {"retry-after": "1"}}}]},
+    {"id": "weather", "match": {"tools": ["get_weather"], "has_tool_result": false},
+     "steps": [{"respond": {"content": [{"type": "tool_use", "id": "toolu_1",
+                                        "name": "get_weather", "input": {"city": "Tokyo"}}]}}]},
+    {"id": "final", "match": {"has_tool_result": true, "last_user_text": "sunny"},
+     "steps": [{"respond": {"text": "It is sunny in Tokyo."}, "ttfb_ms": 200}]}
+  ]}'
+curl -s localhost:8765/_control/rules | jq '.all_consumed, .unconsumed'
+```
+
+Match keys (all optional, all must hold): `provider` (`anthropic` / `bedrock` / `openai`),
+`model` (glob), `tools` (every listed tool name must be offered), `has_tool_result` (the
+last user turn carries `tool_result` blocks), `last_user_text` (regex over the last user
+turn's text, `tool_result` text included), `turn`, `stream`. Rules are tried in order;
+the first live match wins. `GET /_control/rules` reports per-rule `matched` /
+`remaining` counters, `unconsumed` (rules that still hold steps nobody asked for) and
+`all_consumed` — a test's "every scripted call happened" assertion. `POST` appends,
+`PUT` replaces the list, `PUT /_control/rules/{id}` replaces one rule in place,
+`DELETE /_control/rules[/{id}]` removes. History entries answered by the harness carry
+`harness: {"source": "rule", "rule_id": ...}` (`default` / `unmatched` / `rate_limit` /
+`timeout` for the other sources).
+
+**Unmatched policy and pending timeout** (`/_control/config`, kept across
+`/_control/clear`): `on_unmatched` is `pending` (the interactive default: wait for a
+responder), `default` (answer with `default_response`, a `/_control/respond` body or a
+plain string) or `error` (answer with `unmatched_error`, a `/_control/error` body; default
+500 `api_error`). `pending_timeout_s` makes the server answer a pending nobody has answered
+with `timeout_error` (default 504 `api_error`; batch entries are exempt). The deadline is
+fixed when the request arrives (a later config change applies to new requests only) and is
+shown in `/_control/pending` (`deadline`, `timeout_in_seconds`). A client that hangs up
+while pending has its pending dropped, so a responder never sees a request nobody is
+waiting for; an answer that was already injected (a relay may have paid for it) is still
+recorded even if the client hangs up during its `delay_ms`.
+
+```bash
+curl -s -X POST localhost:8765/_control/config -d '{"pending_timeout_s": 30,
+  "on_unmatched": "default", "default_response": "canned answer",
+  "latency": {"delay_ms": 100, "jitter_ms": 50}, "rate_limit": {"rpm": 60}, "seed": 1}'
+```
+
+**Latency**: `delay_ms` (before the response), `ttfb_ms` (before the first stream frame),
+`chunk_delay_ms` (between frames) and `jitter_ms` (a random 0..N ms added to `delay_ms`,
+drawn from a generator seeded by `seed` — reproducible) can be set on any injection
+(`/_control/respond` / `auto` / `error`), on any rule step, and as defaults in
+`config.latency`. A `/_control/clear` during the `delay_ms` wait wins (the request returns
+the "cleared" error and is not recorded); a stream that has already started keeps its
+`ttfb_ms` / `chunk_delay_ms` pacing to the end.
+
+**Rate limit**: `config.rate_limit` = `{"rpm", "itpm", "otpm"}` (any subset) over a
+sliding 60-second window. A request beyond the budget gets a 429 with `retry-after` and
+the vendor's quota headers (`anthropic-ratelimit-*` on the Anthropic route,
+`x-ratelimit-*` on the OpenAI route, a `ThrottlingException` on Bedrock) before any rule
+is consulted. A refused request consumes no budget (though it takes a turn number and
+lands in history as an error), so waiting `retry-after` seconds succeeds for any request
+that fits the budget at all and meets no competing traffic; the quota headers carry the
+remaining capacity and reset time of each configured dimension (Anthropic also gets the
+combined `anthropic-ratelimit-tokens-*`). Input tokens are counted before the cache is
+consulted, cached prefixes included. Batch entries are neither throttled nor charged.
+`GET /_control/config` shows the current window.
+
+**Fake clock**: `POST /_control/clock/advance {"seconds": N}` moves the server's clock
+forward — pseudo prompt-cache TTLs, rate-limit windows and pending deadlines elapse
+accordingly, without sleeping (`GET /_control/clock` shows the offset; `/_control/clear`
+resets it).
+
+**Token counting and model catalogue** (no pending is created, nothing is recorded):
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/messages/count_tokens` | Anthropic `count_tokens`: `{"input_tokens": N}`, the same estimate `/v1/messages` bills for the request as a whole (`usage.input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`) |
+| POST | `/model/{modelId}/count-tokens` | Bedrock `CountTokens` (`{"input": {"invokeModel": {"body": <blob>}}}` — the Messages request, base64 on the wire as boto3 sends it, raw JSON accepted too — or `{"input": {"converse": {...}}}` → `{"inputTokens": N}`) |
+| GET  | `/v1/models`, `/v1/models/{id}` | The catalogue (`pricing.KNOWN_MODELS`), in the Anthropic shape (`x-api-key` or `anthropic-version` present, or no auth header; pages with `limit` / `after_id` / `before_id`) or the OpenAI shape (bare `Authorization: Bearer`). Informational: any model id is accepted by the request routes, and an unlisted id is synthesized rather than refused |
+
+**From Python tests** — `puppetllm.testing` wraps the control plane; `serve()` runs the
+server in-process on a free port:
+
+```python
+import anthropic
+from puppetllm.testing import serve
+
+with serve() as puppet:                       # or Puppet("http://127.0.0.1:8765") for a running server
+    puppet.expect(tools=["get_weather"], has_tool_result=False).respond(
+        content=[{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Tokyo"}}])
+    puppet.expect(has_tool_result=True).error(429, headers={"retry-after": "0"}).respond(text="sunny")
+    client = anthropic.Anthropic(base_url=puppet.url, api_key="test", max_retries=0)
+    ...run the code under test...
+    puppet.assert_consumed()                  # every scripted step was used
+    puppet.assert_sent(model="claude-*", contains="Tokyo", tool="get_weather")
+    puppet.assert_no_pending()
+```
+
+`Puppet` also exposes the interactive surface (`wait_pending`, `respond`, `error`,
+`pending`, `history`, `stats`, `cache`, `config`, `advance_clock`, `clear`;
+`clear(config=True)` also restores the defaults, `reset(baseline)` re-applies a saved
+`baseline()` — configuration plus rules). With `pip install .` the `puppet` pytest fixture
+(one server per session; before and after every test the state is cleared and the
+configuration and rules are put back to what the server started with, so `PUPPETLLM_*`
+settings and a `--config` file's rules stay in force while one test's `puppet.config(...)`
+or `puppet.expect(...)` never leaks into the next; `PUPPETLLM_URL` points it at an
+external server instead) is registered
+automatically; `pip install ".[test]"` adds the SDKs. A startup script can come from a
+file — `puppetllm serve --config scenario.json` with
+`{"config": {...}, "rules": [...]}` — or from environment variables (see
+[Environment variables](#environment-variables)) for Docker.
+
+---
+
 ## Relay mode (cross-provider bridge)
 
 `python -m puppetllm.relay` is a bundled **automatic responder** that forwards every pending request to a **real** upstream API and injects the response back — turning puppetllm into a transparent cross-provider bridge. Your app keeps speaking its own SDK; the actual model behind it becomes swappable:
@@ -565,23 +698,29 @@ Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE
 | Method | Path | Description |
 |---|---|---|
 | GET  | `/_control/health` | Health check (`{"ok","turn_count"}`) |
-| GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`) |
+| GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`; `deadline` / `timeout_in_seconds` when a pending timeout is configured) |
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
 | POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`) into a pending request. `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode) |
 | POST | `/_control/auto` | Simple auto-response (`{"text":"...", "pending_id"?}`, text only) |
+| POST | `/_control/config` (also PUT) / GET | Harness configuration (§8): `pending_timeout_s`, `on_unmatched`, `default_response`, `unmatched_error`, `timeout_error`, `latency`, `rate_limit`, `seed`. Partial updates; `null` restores a default; kept across `clear` |
+| GET / PUT / POST / DELETE | `/_control/rules` | Scenario rules (§8): list with counters (`unconsumed`, `all_consumed`), replace, append, remove all. `PUT` / `DELETE /_control/rules/{id}` act on one rule (a `PUT` that only appends steps under the same match keeps the rule's consumption counters) |
+| GET | `/_control/clock` | The fake clock (`now`, `clock_offset_seconds`) |
+| POST | `/_control/clock/advance` | `{"seconds": N}` — advance the fake clock (cache TTLs, rate-limit window, pending deadlines) |
 | POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"?, "content"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) history |
 | GET  | `/_control/stats` | Cumulative summary of cost estimates, tokens, cache |
 | GET  | `/_control/cache` | Pseudo prompt-cache index |
-| POST | `/_control/clear` | Empty pending / history / cache / batches / Bedrock batch jobs (in-flight requests are released with a retryable error: 529 `overloaded_error` on the Anthropic route, 503 on Bedrock / OpenAI; a Bedrock batch job still being created gets a non-retryable 400 `ConflictException`; the S3 store is left alone) |
+| POST | `/_control/clear` | Empty pending / history / cache / batches / Bedrock batch jobs / rules / rate-limit window / clock offset — the configuration too with body `{"config": true}` (in-flight requests are released with a retryable error: 529 `overloaded_error` on the Anthropic route, 503 on Bedrock / OpenAI; a Bedrock batch job still being created gets a non-retryable 400 `ConflictException`; the S3 store is left alone) |
 | GET  | `/_control/batches` | Batch registry (status, request_counts, unresolved custom_ids) |
 | POST | `/_control/batch/result` | Inject `canceled` / `expired` for one custom_id (`{"custom_id","type","batch_id"?}`) |
 | POST | `/_control/batch/end` | Force a batch to `ended`; unresolved custom_ids become `expired` (default) or `canceled` |
 | GET  | `/_control/bedrock_jobs` | Bedrock batch-inference job registry (status, record counts, unresolved `recordId`s) |
 
-On `respond` / `auto` / `error`, batch entries can be addressed with `custom_id` (+ optional `batch_id`) instead of `pending_id`.
+On `respond` / `auto` / `error`, batch entries can be addressed with `custom_id` (+ optional `batch_id`) instead of `pending_id`, and the latency keys `delay_ms` / `ttfb_ms` / `chunk_delay_ms` / `jitter_ms` (§8) shape that one answer's timing.
 
-Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`.
+The request bodies of the `/_control/*` endpoints that take one are typed (`puppetllm/control_models.py`) and published in `/openapi.json` under `components.schemas` (`/docs` renders them), so a client can be generated from the schema. `{"text": "..."}` is accepted by `/_control/respond` (and rule steps) as shorthand for one text block, also next to an empty `content`; unset optional fields sent as `null` are treated as absent, except that `/_control/config` takes `null` as "restore the default" (serialize it with unset fields omitted).
+
+Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`; `/_control/auto` requires `text` to be a string (other keys are still ignored) and, like every request route, malformed `messages` / `system` / `tools` containers are refused with 400 instead of failing later.
 
 ### Parallel requests (multi-pending)
 
@@ -618,6 +757,12 @@ How to build injection payloads (especially avoiding escape accidents with non-A
 | `PUPPETLLM_S3_ROOT` | a per-process temp dir | Where the S3 emulation stores objects (batch inference I/O). Set it to keep them across restarts, or to see them from the host under Docker (add the variable and a matching volume to your compose override; the shipped `docker-compose.yml` defines neither) |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` ignores the TTL (entries live forever) |
 | `PUPPETLLM_CACHE_MIN_TOKENS` | (per-model) | Override the minimum cache threshold. `0` disables it (cache every prefix). Unset = the generation-aware table (Opus 5 / Fable 512, Opus 4.8 1024, Opus 4.7 2048, Opus 4.6 / 4.5 4096, Sonnet 1024, Haiku 4.5 4096, …) |
+| `PUPPETLLM_PENDING_TIMEOUT` | (none) | Seconds before an unanswered pending gets the timeout error (§8) |
+| `PUPPETLLM_DEFAULT_RESPONSE` | (none) | Text, or a JSON `/_control/respond` body, that answers unmatched requests; setting it selects `on_unmatched: default` |
+| `PUPPETLLM_ON_UNMATCHED` | `pending` | `pending` / `default` / `error` |
+| `PUPPETLLM_SEED` | (none) | Seed for latency jitter |
+| `PUPPETLLM_CONFIG` | (none) | JSON file `{"config": {...}, "rules": [...]}` loaded at startup |
+| `PUPPETLLM_URL` | (none) | Makes the `puppet` pytest fixture use a running server instead of starting one |
 
 ---
 
@@ -632,10 +777,11 @@ docker compose --profile test run --rm proxy-test
 pip install -r requirements.txt
 python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
     puppetllm.tests.test_batches puppetllm.tests.test_conformance \
-    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_boto3_interop -v
+    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_harness \
+    puppetllm.tests.test_boto3_interop -v
 ```
 
-`puppetllm/tests/test_fake_server.py` is an executable specification of the expected behavior.
+`puppetllm/tests/test_fake_server.py` is an executable specification of the expected behavior; `test_harness.py` covers §8 (rules, policies, timeouts, latency, rate limits, the clock, `count_tokens` / `models`, the CLI and `puppetllm.testing` against an in-process uvicorn).
 
 `test_boto3_interop.py` is the only module that drives **real** boto3 / botocore (`>= 1.43`,
 the first service model with every field it exercises) against a running uvicorn instance — every other test encodes and decodes the Bedrock event stream
@@ -651,7 +797,10 @@ reporting `OK` with every SDK test skipped.
 ```
 puppetllm/
 ├── puppetllm/              # package itself
-│   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/*
+│   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/* + count_tokens / models
+│   ├── harness.py          # scenario rules, unmatched policy, latency, rate limit, fake clock
+│   ├── control_models.py   # typed /_control/* request bodies (published in /openapi.json)
+│   ├── testing.py          # test-side client (Puppet, serve()) — pytest_plugin.py adds the `puppet` fixture
 │   ├── batches.py          # Anthropic Message Batches route + batch control endpoints
 │   ├── cache_sim.py        # pseudo prompt cache
 │   ├── pricing.py          # approximate tokens + pricing
@@ -666,6 +815,7 @@ puppetllm/
 ├── LICENSE
 ├── Dockerfile
 ├── docker-compose.yml
+├── pyproject.toml          # `pip install .` → `puppetllm` command + pytest plugin
 └── requirements.txt
 ```
 

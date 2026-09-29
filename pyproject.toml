@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "puppetllm"
+dynamic = ["version"]
+description = "Fake Anthropic Messages / Bedrock / OpenAI API server: human-in-the-loop debugging and scripted test harness"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["anthropic", "bedrock", "openai", "mock", "testing", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Framework :: Pytest",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing :: Mocking",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# The SDKs the interop tests drive against the server (boto3 also makes the Bedrock
+# event-stream / S3 XML tests run instead of skipping).
+test = ["anthropic>=0.40", "openai>=1.40", "boto3>=1.43", "pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/Aetheria-LabsJP/puppetllm"
+Issues = "https://github.com/Aetheria-LabsJP/puppetllm/issues"
+
+[project.scripts]
+puppetllm = "puppetllm.__main__:main"
+
+[project.entry-points.pytest11]
+puppetllm = "puppetllm.pytest_plugin"
+
+[tool.setuptools]
+packages = ["puppetllm", "puppetllm.providers"]
+
+[tool.setuptools.dynamic]
+version = {attr = "puppetllm.__version__"}

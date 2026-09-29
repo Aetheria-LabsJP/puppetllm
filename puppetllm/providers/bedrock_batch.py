@@ -669,9 +669,11 @@ def build_router() -> APIRouter:
                     if job.get("stop_requested"):
                         # A Stop landed while this record was being registered: it already
                         # walked `entries` without seeing this one, so cancel it here.
-                        pentry = fs.state.pending.pop(snapshot["pending_id"], None)
+                        pentry = fs.state.pending.get(snapshot["pending_id"])
                         if pentry is not None and not pentry["future"].done():
                             pentry["future"].set_result({"_batch_override": "stopped"})
+                        # No collector is spawned for it, so release the registry entry here.
+                        fs._discard_pending(snapshot)
                         entry["cancelled"] = True
                         job["entries"][rid] = entry
                         job["stopped_records"] += 1

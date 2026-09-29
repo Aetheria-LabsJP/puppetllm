@@ -111,6 +111,39 @@ _FAMILY_PRICES: dict[str, ModelPrice] = {
     "o1":           _openai(15.0, 60.0, cached=7.50),
 }
 
+# Model ids the `/v1/models` listings advertise (id -> display name). A catalogue, not a
+# gate: any id an app sends is accepted, and `GET /v1/models/{id}` synthesizes an entry
+# for an id that is not listed here.
+KNOWN_MODELS: dict[str, list[tuple[str, str]]] = {
+    "anthropic": [
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+        ("claude-opus-5", "Claude Opus 5"),
+        ("claude-sonnet-5", "Claude Sonnet 5"),
+        ("claude-opus-4-8", "Claude Opus 4.8"),
+        ("claude-opus-4-7", "Claude Opus 4.7"),
+        ("claude-opus-4-6", "Claude Opus 4.6"),
+        ("claude-opus-4-5", "Claude Opus 4.5"),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ],
+    "openai": [
+        ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.4-mini", "GPT-5.4 mini"),
+        ("gpt-5.4-nano", "GPT-5.4 nano"),
+        ("gpt-5.3-codex", "GPT-5.3 Codex"),
+        ("gpt-4.1", "GPT-4.1"),
+        ("gpt-4o", "GPT-4o"),
+        ("o3", "o3"),
+        ("o4-mini", "o4-mini"),
+    ],
+}
+
 # Fallback for unknown models (equivalent to sonnet). The is_estimate flag conveys "unknown".
 # Even if unknown, a model containing "gpt" falls back to the current mid-tier gpt-5.4
 # (sonnet-equivalent) (see resolve_family).

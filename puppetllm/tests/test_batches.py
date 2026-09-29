@@ -859,8 +859,9 @@ class TestBatchCreationRaces(unittest.TestCase):
             base_url="http://test",
         )
 
-    def _gate_second_registration(self) -> tuple[asyncio.Event, asyncio.Event]:
-        """Patch register_request: pause before the 2nd call until `proceed` is set."""
+    def _gate_second_registration(self, *, fail_second: bool = False) -> tuple[asyncio.Event, asyncio.Event]:
+        """Patch register_request: pause before the 2nd call until `proceed` is set (and,
+        with `fail_second`, make that call fail the way an unexpected error mid-loop would)."""
         orig = self.mod.register_request
         gate, proceed = asyncio.Event(), asyncio.Event()
         calls = 0
@@ -871,6 +872,8 @@ class TestBatchCreationRaces(unittest.TestCase):
             if calls == 2:
                 gate.set()
                 await proceed.wait()
+                if fail_second:
+                    raise RuntimeError("registration failed mid-create")
             return await orig(*args, **kwargs)
 
         self.mod.register_request = wrapped
@@ -942,12 +945,11 @@ class TestBatchCreationRaces(unittest.TestCase):
         registered. If the create then fails, that entry's history/cost must go too —
         otherwise stats bill a request belonging to a batch that never existed."""
         async def run() -> None:
-            gate, proceed = self._gate_second_registration()
+            # (a malformed entry is refused before anything is registered; the failure
+            # mid-loop is an unexpected one)
+            gate, proceed = self._gate_second_registration(fail_second=True)
             async with await self._client() as c:
-                reqs = _batch_requests("good")
-                reqs.append({"custom_id": "bad",
-                             "params": {"model": "claude-sonnet-test",
-                                        "messages": 42}})  # explodes in register_request
+                reqs = _batch_requests("good", "bad")
                 create_task = asyncio.create_task(c.post(
                     "/v1/messages/batches", json={"requests": reqs}, timeout=10))
                 await asyncio.wait_for(gate.wait(), timeout=5)

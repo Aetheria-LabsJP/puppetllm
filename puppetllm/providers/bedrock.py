@@ -274,7 +274,21 @@ def _invocation_metrics(usage: dict[str, Any], latency_ms: int, first_byte_ms: i
 
 
 def _latency_ms(snapshot: dict[str, Any]) -> int:
-    return max(0, int((time.time() - snapshot.get("received_at", time.time())) * 1000))
+    # Both ends on the server's (fake) clock, so a clock advance does not zero it.
+    now = fs._now()
+    return max(0, int((now - snapshot.get("received_at", now)) * 1000))
+
+
+def stream_latencies(result: dict[str, Any], snapshot: dict[str, Any],
+                     frame_count: int) -> tuple[int, int]:
+    """(first-byte latency, invocation latency) in ms for a stream whose frames are
+    built before they are paced: the simulated `ttfb_ms` / `chunk_delay_ms` delays are
+    known in advance, so the metrics report the delivery timing the client will see."""
+    lat = result.get("_latency") or {}
+    ttfb = int(lat.get("ttfb_ms") or 0)
+    chunk = int(lat.get("chunk_delay_ms") or 0)
+    base = _latency_ms(snapshot)
+    return base + ttfb, base + ttfb + chunk * max(0, frame_count - 1)
 
 
 async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: str
@@ -329,7 +343,7 @@ def build_router() -> APIRouter:
         if isinstance(received, JSONResponse):
             return received
         model, snapshot, fut = received
-        result = await fs.await_resolution(snapshot, fut)
+        result = await fs.await_resolution(snapshot, fut, request=request)
 
         if result["kind"] == "cleared":
             return _bedrock_error_response(503, "ServiceUnavailableException",
@@ -364,7 +378,7 @@ def build_router() -> APIRouter:
         if isinstance(received, JSONResponse):
             return received
         model, snapshot, fut = received
-        result = await fs.await_resolution(snapshot, fut)
+        result = await fs.await_resolution(snapshot, fut, request=request)
 
         if result["kind"] == "cleared":
             return _bedrock_error_response(503, "ServiceUnavailableException",
@@ -383,10 +397,12 @@ def build_router() -> APIRouter:
                 frames.append(eventstream.encode_exception(
                     member, result["message"], stream_exception_fields(member, result)))
 
+                pace = fs.frame_pacer(result)
+
                 async def gen_err():
                     for frame in frames:
+                        await pace()
                         yield frame
-                        await asyncio.sleep(0)
 
                 return StreamingResponse(gen_err(), media_type=_EVENTSTREAM_MEDIA,
                                          headers={"x-amzn-requestid": req_id,
@@ -408,17 +424,19 @@ def build_router() -> APIRouter:
         # firstByteLatency = time to the first frame (the resolution arriving); the
         # invocation latency is stamped when the last frame is built.
         usage = result["usage"]
-        first_byte_ms = _latency_ms(snapshot)
+        first_byte_ms, total_ms = stream_latencies(result, snapshot, len(events))
         for _name, data in events:
             if data.get("type") == "message_stop":
                 data["amazon-bedrock-invocationMetrics"] = _invocation_metrics(
-                    usage, _latency_ms(snapshot), first_byte_ms)
+                    usage, total_ms, first_byte_ms)
         frames = [eventstream.encode_chunk(data) for _name, data in events]
+
+        pace = fs.frame_pacer(result)
 
         async def gen():
             for frame in frames:
+                await pace()
                 yield frame
-                await asyncio.sleep(0)
 
         return StreamingResponse(gen(), media_type=_EVENTSTREAM_MEDIA,
                                  headers={"x-amzn-requestid": req_id,

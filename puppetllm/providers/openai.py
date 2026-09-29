@@ -478,6 +478,14 @@ def build_router() -> APIRouter:
                                           headers=headers)
         is_stream = bool(body.get("stream"))
         model = body.get("model")
+        # Container shapes the normalizer iterates; the real API refuses these with 400.
+        if not isinstance(body.get("messages"), list):
+            return _openai_error_response(400, "invalid_request_error",
+                                          "messages: must be a list", headers=headers,
+                                          param="messages")
+        if body.get("tools") is not None and not isinstance(body.get("tools"), list):
+            return _openai_error_response(400, "invalid_request_error",
+                                          "tools: must be a list", headers=headers, param="tools")
         canonical = normalize_chat_body(body)
 
         try:
@@ -491,7 +499,7 @@ def build_router() -> APIRouter:
         except fs.RequestValidationError as e:
             return _openai_error_response(400, "invalid_request_error", str(e),
                                           headers=_finish_headers())
-        result = await fs.await_resolution(snapshot, fut)
+        result = await fs.await_resolution(snapshot, fut, request=request)
 
         if result["kind"] == "cleared":
             return _openai_error_response(
@@ -520,10 +528,12 @@ def build_router() -> APIRouter:
             ]
             payloads.append(b"data: [DONE]\n\n")
 
+            pace = fs.frame_pacer(result)
+
             async def gen():
                 for p in payloads:
+                    await pace()
                     yield p
-                    await asyncio.sleep(0)
 
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers=_finish_headers())

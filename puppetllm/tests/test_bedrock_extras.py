@@ -917,7 +917,7 @@ class TestBedrockBatchHardening(_Base):
                 by = {x["recordId"]: x for x in self._out_lines("outbkt", f"out/{job_id}/data.jsonl.out")}
                 # a malformed modelInput is client input: a 400 validation record
                 self.assertEqual(by["bad"]["error"]["errorCode"], 400)
-                self.assertIn("invalid modelInput", by["bad"]["error"]["errorMessage"])
+                self.assertIn("messages: must be a list", by["bad"]["error"]["errorMessage"])
         _run(run())
 
     def test_same_basename_in_different_folders(self) -> None:

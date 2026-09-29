@@ -33,6 +33,8 @@ the InvokeModel route.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import time
 import uuid
@@ -841,6 +843,53 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
 def build_router() -> APIRouter:
     router = APIRouter()
 
+    @router.post("/model/{model_id:path}/count-tokens")
+    async def count_tokens(model_id: str, request: Request) -> Any:
+        """Bedrock `CountTokens`: `{"input": {"invokeModel": {"body": <blob>}}}` (the
+        Messages request, base64 on the wire as boto3 sends it; raw JSON also accepted) or
+        `{"input": {"converse": {...}}}` → `{"inputTokens": N}`, the same estimate the
+        corresponding InvokeModel / Converse request would report. No pending is created."""
+        req_id = str(uuid.uuid4())
+        model = _bedrock.normalize_model_id(model_id)
+        body, errmsg = await fs._parse_json_body(request)
+        if errmsg is not None:
+            return _error(400, "ValidationException", errmsg, req_id)
+        inp = body.get("input")
+        if not isinstance(inp, dict) or len(inp) != 1 or not (
+                set(inp) <= {"invokeModel", "converse"}):
+            return _error(400, "ValidationException",
+                          "input must hold exactly one of invokeModel / converse", req_id)
+        try:
+            if "invokeModel" in inp:
+                spec = inp["invokeModel"]
+                raw = spec.get("body") if isinstance(spec, dict) else None
+                if not isinstance(raw, str):
+                    raise ConverseValidationError(
+                        "input.invokeModel.body must be the Messages request as a blob")
+                # A blob on the REST-JSON wire is base64 (what boto3 sends); the raw JSON
+                # text is accepted too for hand-written clients.
+                try:
+                    decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+                except (binascii.Error, ValueError):
+                    decoded = raw
+                try:
+                    canonical = json.loads(decoded)
+                except ValueError as e:
+                    raise ConverseValidationError(
+                        f"input.invokeModel.body: not a JSON Messages request ({e})")
+                if not isinstance(canonical, dict) or not isinstance(canonical.get("messages"), list):
+                    raise ConverseValidationError(
+                        "input.invokeModel.body must be a Messages request with `messages`")
+            else:
+                spec = inp["converse"]
+                if not isinstance(spec, dict):
+                    raise ConverseValidationError("input.converse must be an object")
+                canonical = to_canonical(spec, prompt_arn=is_prompt_arn(model_id))
+            n = fs.count_input_tokens(canonical, model.canonical)
+        except (ConverseValidationError, fs.RequestValidationError) as e:
+            return _error(400, "ValidationException", str(e), req_id)
+        return JSONResponse({"inputTokens": n}, headers={"x-amzn-requestid": req_id})
+
     @router.post("/model/{model_id:path}/converse")
     async def converse(model_id: str, request: Request) -> Any:
         req_id = str(uuid.uuid4())
@@ -848,7 +897,7 @@ def build_router() -> APIRouter:
         if isinstance(received, JSONResponse):
             return received
         model, snapshot, fut = received
-        result = await fs.await_resolution(snapshot, fut)
+        result = await fs.await_resolution(snapshot, fut, request=request)
         if result["kind"] == "cleared":
             return _error(503, "ServiceUnavailableException",
                           f"request cleared: {result['detail']}", req_id)
@@ -869,7 +918,7 @@ def build_router() -> APIRouter:
         if isinstance(received, JSONResponse):
             return received
         model, snapshot, fut = received
-        result = await fs.await_resolution(snapshot, fut)
+        result = await fs.await_resolution(snapshot, fut, request=request)
         headers = {"x-amzn-requestid": req_id}
         if result["kind"] == "cleared":
             return _error(503, "ServiceUnavailableException",
@@ -902,14 +951,20 @@ def build_router() -> APIRouter:
                 additional = additional_fields(native, extras.get("additionalModelResponseFieldPaths"))
             except ConverseValidationError as e:
                 return _error(400, "ValidationException", str(e), req_id)
-            events = stream_events(blocks, stop_reason, result["usage"],
-                                   _bedrock._latency_ms(snapshot), extras, additional)
+            # The metrics event closes the stream: its latency includes the simulated
+            # pacing of every frame before it (counted once the events exist).
+            events = stream_events(blocks, stop_reason, result["usage"], 0, extras, additional)
+            _first, total_ms = _bedrock.stream_latencies(result, snapshot, len(events))
+            events = stream_events(blocks, stop_reason, result["usage"], total_ms, extras,
+                                   additional)
             frames = [eventstream.encode_event(name, data) for name, data in events]
+
+        pace = fs.frame_pacer(result)
 
         async def gen():
             for frame in frames:
+                await pace()
                 yield frame
-                await asyncio.sleep(0)
 
         return StreamingResponse(gen(), media_type=_EVENTSTREAM_MEDIA, headers=headers)
 

@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import json
 import math
 import os
@@ -55,6 +56,9 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import __version__
+from . import control_models as _cm
+from . import harness as _harness
 from . import pricing
 from .cache_sim import CacheControlError, CacheSimulator, analyze_request
 from .openai_wire import strip_private
@@ -125,6 +129,9 @@ class _ServerState:
         # Bumped by /_control/clear: a request that started before a clear and would
         # otherwise (re)create state afterwards checks this and gives up instead.
         self.clear_generation: int = 0
+        # pending_id → the clear generation it was registered in (an answer resolved
+        # before a clear must not be delivered by a handler that resumes after it).
+        self.pending_generation: dict[str, int] = {}
         self.turn_count: int = 0
         self.lock = asyncio.Lock()
         # The futures currently waiting in /_control/wait_for_pending.
@@ -149,7 +156,16 @@ class _ServerState:
 
 
 state = _ServerState()
-app = FastAPI(title="puppetllm fake-llm-api")
+# Scenario rules, latency / rate-limit simulation, pending timeout and the fake clock.
+harness = _harness.Harness()
+app = FastAPI(title="puppetllm fake-llm-api", version=__version__)
+
+
+def _now() -> float:
+    """Wall time shifted by `/_control/clock/advance`: the clock behind the cache TTLs,
+    the rate-limit window, pending deadlines and history timestamps (batch lifecycles
+    and wire-level timestamps stay on wall time)."""
+    return harness.now()
 
 
 async def _parse_json_body(request: Request) -> tuple[dict[str, Any] | None, str | None]:
@@ -371,6 +387,7 @@ async def _record_and_reset(
     cost: dict[str, Any] | None = None,
     usage_overridden: bool = False,
     batch: bool = False,
+    harness_meta: dict[str, Any] | None = None,
 ) -> None:
     """Append one entry to history and remove that pending from the registry.
 
@@ -388,7 +405,7 @@ async def _record_and_reset(
         "usage": usage,
         "cost": cost,
         "cache": request_snapshot.get("cache"),
-        "completed_at": time.time(),
+        "completed_at": _now(),
     }
     if injected_error is not None:
         entry["injected_error"] = injected_error
@@ -399,6 +416,10 @@ async def _record_and_reset(
     if batch:
         # Came in via the Message Batches route (cost carries the 50% discount).
         entry["batch"] = True
+    if harness_meta:
+        # Answered by the harness, not a responder: {"source": rule|default|unmatched|
+        # rate_limit|timeout, "rule_id"?: ...}.
+        entry["harness"] = harness_meta
     pid = request_snapshot.get("pending_id")
     async with state.lock:
         # If clear ran first and the entry is already gone, don't append to history
@@ -407,6 +428,7 @@ async def _record_and_reset(
             state.history.append(entry)
         if pid is not None:
             state.pending.pop(pid, None)
+            state.pending_generation.pop(pid, None)
 
 
 # ── canonical: request registration / awaiting response (provider-common) ──
@@ -457,6 +479,9 @@ async def register_request(
     system = body.get("system")
     messages = body.get("messages", [])
     tools = body.get("tools", [])
+    shape_err = _request_shape_error(system, tools, messages)
+    if shape_err is not None:
+        raise RequestValidationError(shape_err)
     params = {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body}
     # The `anthropic-beta` request header (Anthropic route) is surfaced like Bedrock's
     # `anthropic_beta` body field so the responder can see which betas the app requested.
@@ -473,13 +498,19 @@ async def register_request(
     except CacheControlError as e:
         raise RequestValidationError(str(e)) from e
     input_tokens_total = request_cache.total_tokens
-    now = time.time()
+    now = _now()
 
     async with state.lock:
         state.turn_count += 1
         turn = state.turn_count
         pending_id = uuid.uuid4().hex[:16]
-        if simulate_cache:
+        is_batch_entry = bool(extra) and ("batch_id" in extra or "job_id" in extra)
+        # Rate admission comes first: a throttled request must not warm the pseudo cache
+        # (the real API never processed it). Batch entries are not throttled.
+        throttled = None if is_batch_entry else harness.throttle(
+            {"pending_id": pending_id, "provider": provider,
+             "input_tokens_total": input_tokens_total}, now)
+        if simulate_cache and throttled is None:
             cache = state.cache.observe(request_cache, model, now)
         else:
             # Same shape as observe()'s "none" (stats counts only hit/miss, so none is not aggregated)
@@ -507,11 +538,20 @@ async def register_request(
         }
         if extra:
             request_snapshot.update(extra)
+        timeout = harness.config.pending_timeout_s
+        state.pending_generation[pending_id] = state.clear_generation
         state.pending[pending_id] = {
             "request": request_snapshot,
             "future": fut,
             "started_at": now,
+            # Fixed at registration (a later config change does not move it); None for
+            # batch entries, which the real batch APIs give hours.
+            "deadline": (now + timeout) if (timeout is not None and not is_batch_entry) else None,
         }
+        if _apply_harness(request_snapshot, fut, throttled):
+            # Answered by a rule / the unmatched policy / the rate limiter: the future is
+            # already resolved, so a responder never sees this pending.
+            return request_snapshot, fut
         # Wake watchers waiting in /_control/wait_for_pending.
         for w in state.pending_arrival_waiters:
             if not w.done():
@@ -519,6 +559,131 @@ async def register_request(
         state.pending_arrival_waiters.clear()
 
     return request_snapshot, fut
+
+
+def _apply_harness(snapshot: dict[str, Any], fut: asyncio.Future,
+                   throttled: dict[str, Any] | None) -> bool:
+    """Resolve a fresh pending the way `/_control/respond` / `/_control/error` would when
+    the harness has an answer for it. Runs inside `state.lock` right after registration.
+
+    Order: rate limiter (`throttled`, decided before the cache was touched; a throttled
+    request never reaches a rule, as on the real APIs) → first matching rule →
+    `on_unmatched` policy (`pending` keeps it for a responder).
+
+    Stored payloads are deep-copied: the encoders fill generated fields (`tool_use.id`,
+    thinking signatures) into the blocks they receive, and a rule / default that answers
+    repeatedly must hand out fresh values every time and stay as the user posted it."""
+    if throttled is not None:
+        fut.set_result({"_inject_error": True, **throttled, "content": [],
+                        "_harness": {"source": "rate_limit"}})
+        return True
+    rule, payload = harness.decide(snapshot)
+    if payload is not None:
+        fut.set_result({**copy.deepcopy(payload),
+                        "_harness": {"source": "rule", "rule_id": rule.id}})
+        return True
+    cfg = harness.config
+    if cfg.on_unmatched == "default" and cfg.default_response is not None:
+        fut.set_result({**copy.deepcopy(cfg.default_response), "_harness": {"source": "default"}})
+        return True
+    if cfg.on_unmatched == "error":
+        fut.set_result({"_inject_error": True, "content": [], **copy.deepcopy(cfg.unmatched_error),
+                        "_harness": {"source": "unmatched"}})
+        return True
+    return False
+
+
+def validate_request_body(body: dict[str, Any], model: str | None) -> None:
+    """Everything `register_request` would refuse, without registering: the shape checks
+    and the token / cache analysis. Raises RequestValidationError. Lets a batch create
+    reject a malformed entry before any entry consumed a scenario step."""
+    system, messages, tools = body.get("system"), body.get("messages", []), body.get("tools", [])
+    shape_err = _request_shape_error(system, tools, messages)
+    if shape_err is not None:
+        raise RequestValidationError(shape_err)
+    params = {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body}
+    try:
+        analyze_request(system, tools, messages, top_level_cache_control=body.get("cache_control"),
+                        params=params, model=model)
+    except CacheControlError as e:
+        raise RequestValidationError(str(e)) from e
+
+
+def _request_shape_error(system: Any, tools: Any, messages: Any) -> str | None:
+    """The structural checks every request route relies on before token analysis (which
+    iterates these containers): the real API refuses them with 400 too."""
+    if not isinstance(messages, list):
+        return "messages: must be a list"
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            return f"messages.{i}: must be an object with role and content"
+        if m.get("content") is not None and not isinstance(m.get("content"), (str, list)):
+            return f"messages.{i}.content: must be a string or a list of content blocks"
+        if isinstance(m.get("content"), list) and not all(isinstance(b, dict) for b in m["content"]):
+            return f"messages.{i}.content: every block must be an object"
+    if system is not None and not isinstance(system, (str, list)):
+        return "system: must be a string or a list of text blocks"
+    if isinstance(system, list) and not all(isinstance(b, dict) for b in system):
+        return "system: every block must be an object"
+    if tools is not None and (not isinstance(tools, list)
+                              or not all(isinstance(t, dict) for t in tools)):
+        return "tools: must be a list of tool objects"
+    return None
+
+
+async def _wait_payload(snapshot: dict[str, Any], fut: asyncio.Future,
+                        request: Request | None) -> dict[str, Any]:
+    """Await the pending's answer while watching for the two things a responder cannot
+    see: the client hanging up (the pending is dropped — no ghost for the responder to
+    answer) and the pending's deadline passing (the server answers with
+    `config.timeout_error`). Both are polled, so a fake-clock advance expires a deadline
+    on the next tick too. The deadline is the one stored on the pending entry at
+    registration (`/_control/pending` shows the same value); batch entries have none."""
+    entry = state.pending.get(snapshot.get("pending_id"))
+    deadline = entry.get("deadline") if entry else None
+    if fut.done() or (request is None and deadline is None):
+        return await fut
+    while not fut.done():
+        await asyncio.wait({fut}, timeout=_HARNESS_POLL_S)
+        if fut.done():
+            break
+        disconnected = request is not None and await request.is_disconnected()
+        if fut.done():
+            # A responder answered while the disconnect check yielded: its injection was
+            # accepted, so it is delivered and recorded like any other.
+            break
+        if disconnected:
+            _discard_pending(snapshot)
+            fut.set_exception(RuntimeError("client disconnected"))
+            break
+        if deadline is not None and _now() >= deadline:
+            fut.set_result({"_inject_error": True, "content": [],
+                            **copy.deepcopy(harness.config.timeout_error),
+                            "_latency": dict(_harness._NO_LATENCY),
+                            "_harness": {"source": "timeout"}})
+            break
+    return await fut
+
+
+# How often a waiting request checks for a client disconnect / an expired deadline.
+_HARNESS_POLL_S = 0.25
+
+
+def frame_pacer(result: dict[str, Any]) -> Any:
+    """The per-frame delay of a stream: `await pace()` before each frame sleeps
+    `ttfb_ms` first, then `chunk_delay_ms` between frames (both from the answer's latency
+    settings; zero → just a scheduling point so other tasks run between frames)."""
+    lat = result.get("_latency") or {}
+    ttfb = int(lat.get("ttfb_ms") or 0) / 1000.0
+    chunk = int(lat.get("chunk_delay_ms") or 0) / 1000.0
+    first = True
+
+    async def pace() -> None:
+        nonlocal first
+        await asyncio.sleep(ttfb if first else chunk)
+        first = False
+
+    return pace
 
 
 def _discard_pending(snapshot: dict[str, Any]) -> None:
@@ -531,10 +696,12 @@ def _discard_pending(snapshot: dict[str, Any]) -> None:
     pid = snapshot.get("pending_id")
     if pid is not None:
         state.pending.pop(pid, None)
+        state.pending_generation.pop(pid, None)
 
 
 async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
-                           *, is_batch: bool = False) -> dict[str, Any]:
+                           *, is_batch: bool = False,
+                           request: Request | None = None) -> dict[str, Any]:
     """Await the control-injected response, record it in history, and return the result as a tagged dict.
 
     The returned "kind":
@@ -550,26 +717,62 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
     is_batch=True (batches route): the estimated cost gets the 50% batch discount and the
     history entry is tagged with `batch: true`.
 
+    `request` (the route's Request) lets the wait notice a client that hung up; the
+    pending is then dropped instead of lingering for a responder to answer.
+
     No path (cancel / unexpected exception) leaves a pending entry behind — if it did, a
     responder in a long-poll would forever keep seeing an unresolvable pending and spin.
     """
+    # The clear generation the pending was registered in: an answer resolved before a
+    # clear (this task resuming after the reset) must not be delivered or recorded.
+    # (A pending no longer known to the registry was cleared: -1 never matches.)
+    generation = state.pending_generation.get(snapshot.get("pending_id"), -1)
     try:
-        response_payload = await fut
+        response_payload = await _wait_payload(snapshot, fut, request)
     except RuntimeError as e:
-        # Cancellation via clear. State has already been reset by clear.
+        # Cancellation via clear (state already reset there) or a client disconnect
+        # (the pending was dropped by the watcher).
         return {"kind": "cleared", "detail": str(e)}
     except BaseException:
         # Task cancellation from client disconnect etc.: clean up the entry, then propagate.
         _discard_pending(snapshot)
         raise
 
+    if isinstance(response_payload, dict) and response_payload.get("_batch_override"):
+        # Batch control finalized this custom_id (canceled/expired) synchronously and
+        # already popped the pending — the discard here is a no-op safety net.
+        _discard_pending(snapshot)
+        return {"kind": "batch_override", "type": response_payload["_batch_override"]}
+    if state.clear_generation != generation:
+        _discard_pending(snapshot)
+        return {"kind": "cleared", "detail": "cleared by control"}
+    latency = harness.latency_for(response_payload.get("_latency")
+                                  if isinstance(response_payload, dict) else None)
+    if latency["delay_ms"]:
+        # Pre-response delay (`delay_ms`): the answer is decided, the wire waits. Slept in
+        # short slices so a /_control/clear or a client hang-up ends the wait at once —
+        # the request is then reported as cleared and not recorded — and a cancelled
+        # handler still drops its pending.
+        remaining = latency["delay_ms"] / 1000.0
+        try:
+            while remaining > 0 and state.clear_generation == generation:
+                step = min(remaining, _HARNESS_POLL_S)
+                await asyncio.sleep(step)
+                remaining -= step
+                if request is not None and await request.is_disconnected():
+                    # The client is gone, but the answer was given (a relay may have paid
+                    # for it): stop waiting and record it like a delivered one.
+                    break
+        except BaseException:
+            _discard_pending(snapshot)
+            raise
+        if state.clear_generation != generation:
+            _discard_pending(snapshot)
+            return {"kind": "cleared", "detail": "cleared by control"}
+    harness_meta = response_payload.get("_harness") if isinstance(response_payload, dict) else None
+
     try:
         model = snapshot.get("model")
-        if isinstance(response_payload, dict) and response_payload.get("_batch_override"):
-            # Batch control finalized this custom_id (canceled/expired) synchronously and
-            # already popped the pending — the discard here is a no-op safety net.
-            _discard_pending(snapshot)
-            return {"kind": "batch_override", "type": response_payload["_batch_override"]}
         if isinstance(response_payload, dict) and response_payload.get("_inject_error"):
             status = int(response_payload.get("status", 500))
             etype = str(response_payload.get("type") or "api_error")
@@ -577,6 +780,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             after_events = response_payload.get("after_events")
             partial = _normalize_blocks(response_payload.get("content") or [])
             err_entry = {"status": status, "type": etype, "message": emsg}
+            if response_payload.get("headers"):
+                err_entry["headers"] = dict(response_payload["headers"])
             if after_events is not None and snapshot.get("stream"):
                 # Mid-stream failure: record the content the responder supplied for the
                 # partial stream (the wire carries the first `after_events` of its events).
@@ -586,8 +791,10 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                 err_entry["partial_content"] = partial
             await _record_and_reset(
                 snapshot, response_blocks=None, injected_error=err_entry, batch=is_batch,
+                harness_meta=harness_meta,
             )
             return {"kind": "error", "status": status, "type": etype, "message": emsg,
+                    "_latency": latency,
                     "code": response_payload.get("code"),
                     "param": response_payload.get("param"),
                     # Extra response headers requested by the injector (e.g. retry-after).
@@ -658,10 +865,15 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         if is_batch:
             cost = _apply_batch_discount(cost)
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        if not is_batch:
+            # Batch entries are outside the rate limiter (never admitted, never charged).
+            harness.note_output(int(usage.get("output_tokens") or 0), _now())
         await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage,
-                                cost=cost, usage_overridden=usage_overridden, batch=is_batch)
+                                cost=cost, usage_overridden=usage_overridden, batch=is_batch,
+                                harness_meta=harness_meta)
         return {
             "kind": "ok",
+            "_latency": latency,
             "content_blocks": content_blocks,
             "usage": usage,
             "cost": cost,
@@ -961,7 +1173,7 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
         return _anthropic_error(400, "invalid_request_error", str(e), headers=headers)
     if on_registered is not None:
         on_registered(snapshot)
-    result = await await_resolution(snapshot, fut)
+    result = await await_resolution(snapshot, fut, request=request)
 
     if result["kind"] == "cleared":
         # 529 overloaded_error is the documented "temporarily unavailable, retry" shape.
@@ -986,10 +1198,12 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
                 "error": {"type": result["type"], "message": result["message"]},
                 "request_id": req_id}))
 
+            pace = frame_pacer(result)
+
             async def gen_err():
                 for frame in frames:
+                    await pace()
                     yield frame
-                    await asyncio.sleep(0)
 
             # No injected error headers here: the response itself is a 200 stream, and a
             # `retry-after` on a 200 would be nonsense.
@@ -1006,10 +1220,12 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
     if is_stream:
         events = _build_sse_stream(message_id, model_out, content_blocks, usage, *stop_args)
 
+        pace = frame_pacer(result)
+
         async def gen():
             for evt in events:
+                await pace()
                 yield evt
-                await asyncio.sleep(0)
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
     return JSONResponse(
@@ -1063,13 +1279,18 @@ async def pending() -> dict[str, Any]:
     oldest is also placed in `request` / `waiting_for_seconds`. Parallel-aware callers use
     the `pending` array.
     """
-    now = time.time()
+    now = _now()
     async with state.lock:
         items = [
             {
                 "pending_id": pid,
                 "request": e["request"],
                 "waiting_for_seconds": round(now - e["started_at"], 2),
+                # When `pending_timeout_s` was configured at registration: the fake-clock
+                # time at which the server answers for the responder, and how long that leaves.
+                "deadline": e.get("deadline"),
+                "timeout_in_seconds": (round(max(0.0, e["deadline"] - now), 2)
+                                       if e.get("deadline") is not None else None),
             }
             for pid, e in state.pending.items()
             if not e["future"].done()  # don't show resolved/awaiting-cleanup entries (ghost prevention)
@@ -1110,7 +1331,7 @@ async def wait_for_pending(timeout: float = _WAIT_TIMEOUT_DEFAULT) -> dict[str, 
                 "has_pending": True,
                 "request": oldest["request"],
                 "pending_id": oldest["request"].get("pending_id"),
-                "waiting_for_seconds": round(time.time() - oldest["started_at"], 2),
+                "waiting_for_seconds": round(_now() - oldest["started_at"], 2),
             }
         loop = asyncio.get_running_loop()
         waiter = loop.create_future()
@@ -1235,46 +1456,42 @@ _USAGE_OVERRIDE_ALL = _USAGE_OVERRIDE_KEYS + _USAGE_OBJECT_KEYS + _USAGE_SCALAR_
 _USAGE_MAX = 10 ** 12
 
 
-@app.post("/_control/respond")
-async def respond(request: Request) -> Any:
-    """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "stop_sequence"?,
-    "stop_details"?, "usage"?}`.
-
-    The content_block type is "text" | "tool_use" | "thinking" | "redacted_thinking"
-    (anything else is dropped). When `pending_id` is omitted, inject
-    into the single pending if there is one (backward compatible). With multiple in-flight,
-    `pending_id` is required — or, for batch entries, address by `custom_id` (+ optional
-    `batch_id` when the custom_id appears in several batches).
-    `stop_reason` (optional) overrides the auto-determination
-    (e.g. "max_tokens" — for testing truncation branches; converted to finish_reason on
-    the OpenAI path). `usage` (optional) overrides the approx token counts with real
-    ones — a dict with any subset of input_tokens / output_tokens /
-    cache_creation_input_tokens / cache_read_input_tokens as non-negative ints
-    (used by relay responders forwarding to a real API).
-    """
-    body, errmsg = await _parse_json_body(request)
-    if errmsg is not None:
-        return _plain_400(errmsg)
+def _respond_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+    """Validate a `/_control/respond` body and build the future payload (also used for
+    rule steps, `config.default_response` and `{"text": ...}` shorthands). → (payload, None)
+    or (None, 400)."""
+    if body.get("text") is not None and not body.get("content"):
+        # `/_control/auto` shorthand accepted everywhere a response body is (a generated
+        # client sends it next to an empty default `content`; `text: null` is unset).
+        if not isinstance(body["text"], str):
+            return None, _plain_400("text must be a string")
+        body = {**body, "content": [{"type": "text", "text": body["text"]}]}
     content = body.get("content", [])
     # Validate the shape here and return 400 (if the encoder crashes after the future is
     # resolved, history records a success while the calling SDK gets a 500 — an inconsistency).
     if not isinstance(content, list) or not all(
         isinstance(b, dict) and isinstance(b.get("type"), str) for b in content
     ):
-        return _plain_400("content must be a list of content-block objects with a string 'type'")
+        return None, _plain_400("content must be a list of content-block objects with a string 'type'")
     bad_payload = _block_payload_error(content)
     if bad_payload is not None:
-        return _plain_400(bad_payload)
+        return None, _plain_400(bad_payload)
     stop_reason = body.get("stop_reason")
     if stop_reason is not None and not isinstance(stop_reason, str):
-        return _plain_400("stop_reason must be a string")
+        return None, _plain_400("stop_reason must be a string")
     stop_sequence = body.get("stop_sequence")
     if stop_sequence is not None and not isinstance(stop_sequence, str):
-        return _plain_400("stop_sequence must be a string")
+        return None, _plain_400("stop_sequence must be a string")
     stop_details = body.get("stop_details")
     if stop_details is not None and not isinstance(stop_details, dict):
-        return _plain_400("stop_details must be an object")
+        return None, _plain_400("stop_details must be an object")
     usage = body.get("usage")
+    if isinstance(usage, dict) and usage:
+        # A generated client serializes the unset token counts as null: treat as absent
+        # (an all-null object overrides nothing; an empty object is still refused).
+        stripped = {k: v for k, v in usage.items()
+                    if not (k in _USAGE_OVERRIDE_KEYS and v is None)}
+        usage = stripped or None
     if usage is not None:
         # Upper bound guards downstream cost math: without it, huge ints overflow float()
         # (int*float in pricing) or produce inf that then poisons /_control/stats JSON.
@@ -1298,23 +1515,54 @@ async def respond(request: Request) -> Any:
         if not isinstance(usage, dict) or not usage or not all(
             _ok(k, v) for k, v in usage.items()
         ) or not any(k in _USAGE_OVERRIDE_KEYS for k in usage):
-            return _plain_400(
+            return None, _plain_400(
                 f"usage must be a non-empty object with integer values in [0, {_USAGE_MAX}] "
                 "for keys among: " + ", ".join(_USAGE_OVERRIDE_KEYS)
                 + " (plus optional " + ", ".join(_USAGE_OBJECT_KEYS + _USAGE_SCALAR_KEYS) + ")")
+    lat_err = _harness.validate_latency(body)
+    if lat_err is not None:
+        return None, _plain_400(lat_err)
+    return {"content": content, "stop_reason": stop_reason, "stop_sequence": stop_sequence,
+            "stop_details": stop_details, "usage": usage,
+            "_latency": {k: body[k] for k in _harness.LATENCY_KEYS if body.get(k) is not None}}, None
+
+
+@app.post("/_control/respond", openapi_extra=_cm.schema_of(_cm.RespondBody))
+async def respond(request: Request) -> Any:
+    """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "stop_sequence"?,
+    "stop_details"?, "usage"?}`.
+
+    The content_block type is "text" | "tool_use" | "thinking" | "redacted_thinking"
+    (anything else is dropped). When `pending_id` is omitted, inject
+    into the single pending if there is one (backward compatible). With multiple in-flight,
+    `pending_id` is required — or, for batch entries, address by `custom_id` (+ optional
+    `batch_id` when the custom_id appears in several batches).
+    `stop_reason` (optional) overrides the auto-determination
+    (e.g. "max_tokens" — for testing truncation branches; converted to finish_reason on
+    the OpenAI path). `usage` (optional) overrides the approx token counts with real
+    ones — a dict with any subset of input_tokens / output_tokens /
+    cache_creation_input_tokens / cache_read_input_tokens as non-negative ints
+    (used by relay responders forwarding to a real API).
+    `delay_ms` / `ttfb_ms` / `chunk_delay_ms` / `jitter_ms` (optional) shape the timing
+    of this one answer (see `/_control/config` `latency` for the defaults).
+    """
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    payload, err = _respond_payload(body)
+    if err is not None:
+        return err
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
-    err = _safe_set_result(fut, {"content": content, "stop_reason": stop_reason,
-                                 "stop_sequence": stop_sequence, "stop_details": stop_details,
-                                 "usage": usage})
+    err = _safe_set_result(fut, payload)
     if err is not None:
         return err
     return {"ok": True}
 
 
-@app.post("/_control/auto")
+@app.post("/_control/auto", openapi_extra=_cm.schema_of(_cm.AutoBody))
 async def auto(request: Request) -> Any:
     """Simple: inject `{"text": "...", "pending_id"?: "..."}` as a text-only response.
 
@@ -1323,13 +1571,19 @@ async def auto(request: Request) -> Any:
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         return _plain_400(errmsg)
+    text = body.get("text", "(empty)")
+    if not isinstance(text, str):
+        return _plain_400("text must be a string")
+    # Only the text, the target and the latency keys are read; any other key is ignored.
+    payload, err = _respond_payload({"content": [{"type": "text", "text": text}],
+                                     **{k: body[k] for k in _harness.LATENCY_KEYS if k in body}})
+    if err is not None:
+        return err
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
-    err = _safe_set_result(fut, {
-        "content": [{"type": "text", "text": body.get("text", "(empty)")}]
-    })
+    err = _safe_set_result(fut, payload)
     if err is not None:
         return err
     return {"ok": True}
@@ -1360,7 +1614,60 @@ def _validate_inject_headers(hdrs: Any) -> str | None:
     return None
 
 
-@app.post("/_control/error")
+def _error_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+    """Validate a `/_control/error` body and build the future payload (also used for rule
+    steps and `config.unmatched_error` / `config.timeout_error`). → (payload, None) or
+    (None, 400)."""
+    try:
+        status = int(body.get("status", 500))
+    except (TypeError, ValueError):
+        return None, _plain_400("status must be an integer")
+    if not (100 <= status <= 599):
+        return None, _plain_400("status must be in [100, 599]")
+    hdrs = body.get("headers")
+    if hdrs is not None:
+        err_msg = _validate_inject_headers(hdrs)
+        if err_msg is not None:
+            return None, _plain_400(err_msg)
+    after_events = body.get("after_events")
+    if after_events is not None and not (type(after_events) is int and after_events >= 0):
+        return None, _plain_400("after_events must be a non-negative integer")
+    original_status = body.get("original_status")
+    if original_status is not None and not (type(original_status) is int
+                                            and 100 <= original_status <= 599):
+        return None, _plain_400("original_status must be an integer HTTP status (100-599)")
+    partial_content = body.get("content", [])
+    if not isinstance(partial_content, list) or not all(
+        isinstance(b, dict) and isinstance(b.get("type"), str) for b in partial_content
+    ):
+        return None, _plain_400("content must be a list of content-block objects with a string 'type'")
+    bad_payload = _block_payload_error(partial_content)
+    if bad_payload is not None:
+        return None, _plain_400(bad_payload)
+    lat_err = _harness.validate_latency(body)
+    if lat_err is not None:
+        return None, _plain_400(lat_err)
+    return {
+        "_inject_error": True,
+        "status": status,
+        # No `type` given: the Anthropic vocabulary for that status, so the SDK raises its
+        # specific class (RateLimitError for a 429) — the Bedrock and OpenAI routes already
+        # derive their own type from the status.
+        "type": str(body.get("type") or _ANTHROPIC_ERROR_TYPE_BY_STATUS.get(status, "api_error")),
+        "message": str(body.get("message", "fake_server injected error")),
+        "code": body.get("code"),
+        "param": body.get("param"),
+        "headers": {k: str(v) for k, v in (hdrs or {}).items()},
+        "after_events": after_events,
+        # Bedrock: the status of the UPSTREAM failure a ModelErrorException /
+        # ModelStreamErrorException reports as `originalStatusCode` (a 424 wrapping a 429).
+        "original_status": original_status,
+        "content": partial_content,
+        "_latency": {k: body[k] for k in _harness.LATENCY_KEYS if body.get(k) is not None},
+    }, None
+
+
+@app.post("/_control/error", openapi_extra=_cm.schema_of(_cm.ErrorBody))
 async def inject_error(request: Request) -> Any:
     """Error injection: make a pending request return an HTTP error.
 
@@ -1381,53 +1688,14 @@ async def inject_error(request: Request) -> Any:
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         return _plain_400(errmsg)
-    try:
-        status = int(body.get("status", 500))
-    except (TypeError, ValueError):
-        return _plain_400("status must be an integer")
-    if not (100 <= status <= 599):
-        return _plain_400("status must be in [100, 599]")
-    hdrs = body.get("headers")
-    if hdrs is not None:
-        err_msg = _validate_inject_headers(hdrs)
-        if err_msg is not None:
-            return _plain_400(err_msg)
-    after_events = body.get("after_events")
-    if after_events is not None and not (type(after_events) is int and after_events >= 0):
-        return _plain_400("after_events must be a non-negative integer")
-    original_status = body.get("original_status")
-    if original_status is not None and not (type(original_status) is int
-                                            and 100 <= original_status <= 599):
-        return _plain_400("original_status must be an integer HTTP status (100-599)")
-    partial_content = body.get("content", [])
-    if not isinstance(partial_content, list) or not all(
-        isinstance(b, dict) and isinstance(b.get("type"), str) for b in partial_content
-    ):
-        return _plain_400("content must be a list of content-block objects with a string 'type'")
-    bad_payload = _block_payload_error(partial_content)
-    if bad_payload is not None:
-        return _plain_400(bad_payload)
+    payload, err = _error_payload(body)
+    if err is not None:
+        return err
     fut, err = await _resolve_target_future(body.get("pending_id"),
                                             body.get("custom_id"), body.get("batch_id"))
     if err is not None:
         return err
-    err = _safe_set_result(fut, {
-        "_inject_error": True,
-        "status": status,
-        # No `type` given: the Anthropic vocabulary for that status, so the SDK raises its
-        # specific class (RateLimitError for a 429) — the Bedrock and OpenAI routes already
-        # derive their own type from the status.
-        "type": str(body.get("type") or _ANTHROPIC_ERROR_TYPE_BY_STATUS.get(status, "api_error")),
-        "message": str(body.get("message", "fake_server injected error")),
-        "code": body.get("code"),
-        "param": body.get("param"),
-        "headers": {k: str(v) for k, v in (hdrs or {}).items()},
-        "after_events": after_events,
-        # Bedrock: the status of the UPSTREAM failure a ModelErrorException /
-        # ModelStreamErrorException reports as `originalStatusCode` (a 424 wrapping a 429).
-        "original_status": original_status,
-        "content": partial_content,
-    })
+    err = _safe_set_result(fut, payload)
     if err is not None:
         return err
     return {"ok": True}
@@ -1521,7 +1789,7 @@ async def stats() -> dict[str, Any]:
 @app.get("/_control/cache")
 async def cache_index() -> dict[str, Any]:
     """The pseudo prompt-cache's current index (by prefix hash)."""
-    now = time.time()
+    now = _now()
     # entries() iterates state.cache.index. Since register_request does cache.observe →
     # index mutation within the lock, this must also take a snapshot within the lock, or
     # a concurrent scan hits "dictionary changed size during iteration".
@@ -1534,8 +1802,20 @@ async def cache_index() -> dict[str, Any]:
     }
 
 
-@app.post("/_control/clear")
-async def clear() -> dict[str, Any]:
+@app.post("/_control/clear", openapi_extra=_cm.schema_of(_cm.ClearBody))
+async def clear(request: Request) -> Any:
+    """Reset the server. Optional body `{"config": true}` also restores the harness
+    configuration to its defaults (a test fixture's full teardown); by default the
+    configuration is kept and only scenario state (rules, rate window, clock) goes."""
+    reset_config = False
+    raw = await request.body()
+    if raw.strip():
+        body, errmsg = await _parse_json_body(request)
+        if errmsg is not None:
+            return _plain_400(errmsg)
+        reset_config = body.get("config", False)
+        if not isinstance(reset_config, bool):
+            return _plain_400("config must be a boolean")
     async with state.lock:
         # Cancel all in-flight pendings (the main handlers gracefully return a retryable error)
         for entry in state.pending.values():
@@ -1543,6 +1823,7 @@ async def clear() -> dict[str, Any]:
             if not fut.done():
                 fut.set_exception(RuntimeError("cleared by control"))
         state.pending.clear()
+        state.pending_generation.clear()
         state.history.clear()
         state.turn_count = 0
         state.cache.reset()
@@ -1551,7 +1832,487 @@ async def clear() -> dict[str, Any]:
         state.batches.clear()
         state.bedrock_jobs.clear()
         state.clear_generation += 1
+        # Scenario state (rules, rate-limit window, fake clock) — and the configuration
+        # only when asked.
+        if reset_config:
+            harness.config = _harness.Config()
+        harness.reset()
     return {"ok": True}
+
+
+
+# ── Harness: configuration / rules / clock ───────────────────────────
+
+
+def _compile_rule(raw: Any) -> tuple[_harness.Rule | None, JSONResponse | None]:
+    """Validate one rule object and pre-build each step's future payload with the same
+    validators `/_control/respond` and `/_control/error` use."""
+    if not isinstance(raw, dict):
+        return None, _plain_400("each rule must be an object")
+    # A generated client serializes unset optional fields as null: treat as absent.
+    raw = {k: v for k, v in raw.items() if v is not None}
+    unknown = sorted(k for k in raw if k not in ("id", "match", "steps", "repeat"))
+    if unknown:
+        return None, _plain_400(f"rule: unknown key(s) {unknown}")
+    rid = raw.get("id")
+    if rid is None:
+        rid = _harness.new_rule_id()
+    elif not isinstance(rid, str) or not rid:
+        return None, _plain_400("rule.id must be a non-empty string")
+    match = raw.get("match", {})
+    if isinstance(match, dict):
+        # A generated client serializes unset optional fields as null: treat as absent.
+        match = {k: v for k, v in match.items() if v is not None}
+    err_msg = _harness.validate_match(match)
+    if err_msg is not None:
+        return None, _plain_400(f"rule {rid}: {err_msg}")
+    steps = raw.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None, _plain_400(f"rule {rid}: steps must be a non-empty list")
+    repeat = raw.get("repeat", False)
+    if not isinstance(repeat, bool):
+        return None, _plain_400(f"rule {rid}: repeat must be a boolean")
+    payloads: list[dict[str, Any]] = []
+    for i, step in enumerate(steps):
+        if isinstance(step, dict):
+            step = {k: v for k, v in step.items() if v is not None}
+        if not isinstance(step, dict) or ("respond" in step) == ("error" in step):
+            return None, _plain_400(
+                f"rule {rid}: step {i} must be an object with exactly one of 'respond' / 'error'")
+        extra = sorted(k for k in step if k not in ("respond", "error") + _harness.LATENCY_KEYS)
+        if extra:
+            return None, _plain_400(f"rule {rid}: step {i}: unknown key(s) {extra}")
+        lat_err = _harness.validate_latency(step, f"step {i}: ")
+        if lat_err is not None:
+            return None, _plain_400(f"rule {rid}: {lat_err}")
+        action = step.get("respond") if "respond" in step else step.get("error")
+        if not isinstance(action, dict):
+            return None, _plain_400(f"rule {rid}: step {i}: the action must be an object")
+        # Latency on the step applies unless the action body sets the same key itself.
+        merged = {**{k: step[k] for k in _harness.LATENCY_KEYS if step.get(k) is not None}, **action}
+        payload, err = (_respond_payload(merged) if "respond" in step else _error_payload(merged))
+        if err is not None:
+            detail = json.loads(bytes(err.body).decode()).get("error")
+            return None, _plain_400(f"rule {rid}: step {i}: {detail}")
+        payloads.append(payload)
+    return _harness.Rule(id=rid, match=dict(match), steps=list(steps), payloads=payloads,
+                         repeat=repeat), None
+
+
+def _compile_rules(body: Any) -> tuple[list[_harness.Rule] | None, JSONResponse | None]:
+    """`{"rules": [...]}`, a bare list, or a single rule object."""
+    if isinstance(body, dict) and "rules" in body:
+        raw = body["rules"]
+    elif isinstance(body, dict):
+        raw = [body]
+    else:
+        raw = body
+    if not isinstance(raw, list):
+        return None, _plain_400('body must be {"rules": [...]}, a list of rules, or one rule')
+    rules: list[_harness.Rule] = []
+    for r in raw:
+        rule, err = _compile_rule(r)
+        if err is not None:
+            return None, err
+        rules.append(rule)
+    ids = [r.id for r in rules]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:
+        return None, _plain_400(f"duplicate rule id(s): {dup}")
+    return rules, None
+
+
+async def _parse_rules_body(request: Request) -> tuple[Any, JSONResponse | None]:
+    try:
+        body = await request.json()
+    except Exception as e:
+        return None, _plain_400(f"invalid JSON body: {str(e)[:200]}")
+    return body, None
+
+
+def _rules_view() -> dict[str, Any]:
+    rules = [r.as_dict() for r in harness.rules]
+    return {"rules": rules,
+            "unconsumed": [r.id for r in harness.rules if not r.exhausted and not r.repeat],
+            "all_consumed": all(r.exhausted or r.repeat for r in harness.rules)}
+
+
+@app.get("/_control/rules")
+async def rules_get() -> dict[str, Any]:
+    """The scenario rules with their consumption counters. `unconsumed` lists the rules
+    that still hold steps nobody asked for — a test's "every expected call happened"
+    assertion is `all_consumed == true`."""
+    return _rules_view()
+
+
+@app.put("/_control/rules", openapi_extra=_cm.schema_of(_cm.RulesBody))
+async def rules_put(request: Request) -> Any:
+    """Replace the rule list (counters restart)."""
+    body, err = await _parse_rules_body(request)
+    if err is not None:
+        return err
+    rules, err = _compile_rules(body)
+    if err is not None:
+        return err
+    async with state.lock:
+        harness.set_rules(rules)
+    return {"ok": True, **_rules_view()}
+
+
+@app.post("/_control/rules", openapi_extra=_cm.schema_of(_cm.RulesBody))
+async def rules_post(request: Request) -> Any:
+    """Append rules (a `{"rules": [...]}` object, a list, or one rule). Rules are tried in
+    order, so a rule added later only answers what the earlier ones leave."""
+    body, err = await _parse_rules_body(request)
+    if err is not None:
+        return err
+    rules, err = _compile_rules(body)
+    if err is not None:
+        return err
+    async with state.lock:
+        existing = {r.id for r in harness.rules}
+        clash = sorted(r.id for r in rules if r.id in existing)
+        if clash:
+            return _plain_400(f"rule id(s) already present: {clash} (PUT replaces the list)")
+        harness.add_rules(rules)
+    return {"ok": True, **_rules_view()}
+
+
+@app.delete("/_control/rules")
+async def rules_delete() -> dict[str, Any]:
+    async with state.lock:
+        harness.set_rules([])
+    return {"ok": True, **_rules_view()}
+
+
+@app.put("/_control/rules/{rule_id}", openapi_extra=_cm.schema_of(_cm.Rule))
+async def rule_put(rule_id: str, request: Request) -> Any:
+    """Replace one rule in place (its position in the order is kept). Counters restart
+    unless the new rule merely extends the old one's steps under the same match, in which
+    case consumption carries over. A rule that does not exist yet is appended."""
+    body, err = await _parse_rules_body(request)
+    if err is not None:
+        return err
+    if not isinstance(body, dict):
+        return _plain_400("body must be one rule object")
+    if body.get("id") not in (None, rule_id):
+        return _plain_400("rule.id in the body must match the path")
+    rule, err = _compile_rule({**body, "id": rule_id})
+    if err is not None:
+        return err
+    async with state.lock:
+        rules = list(harness.rules)
+        idx = next((i for i, r in enumerate(rules) if r.id == rule_id), None)
+        if idx is None:
+            rules.append(rule)
+        else:
+            old = rules[idx]
+            if old.match == rule.match and rule.steps[:len(old.steps)] == old.steps:
+                # Steps were only appended (or repeat toggled): keep what was consumed so a
+                # rule extended after traffic does not replay its first step. A repeating
+                # rule's cursor never went past its last step, so the new steps come next.
+                rule.consumed = min(old.consumed, len(old.steps))
+                rule.matched = old.matched
+            rules[idx] = rule
+        harness.set_rules(rules)
+    return {"ok": True, **_rules_view()}
+
+
+@app.delete("/_control/rules/{rule_id}")
+async def rule_delete(rule_id: str) -> Any:
+    async with state.lock:
+        keep = [r for r in harness.rules if r.id != rule_id]
+        if len(keep) == len(harness.rules):
+            return JSONResponse({"error": f"no rule with id={rule_id}"}, status_code=404)
+        harness.set_rules(keep)
+    return {"ok": True, **_rules_view()}
+
+
+def _config_view() -> dict[str, Any]:
+    return {"config": harness.config.as_dict(), "clock_offset_seconds": harness.clock_offset,
+            "rate_limit_window": harness.rate_limit_snapshot(_now())}
+
+
+def _finite_number(v: Any) -> float | None:
+    """`v` as a finite float, or None when it is not a plain finite JSON number (bools,
+    strings, NaN/inf and integers too large for a float all return None)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def apply_config(body: dict[str, Any]) -> str | None:
+    """Merge `body` into the harness configuration (only the keys present change; `null`
+    restores a key's default). Returns an error message or None. Shared by
+    `/_control/config`, the CLI flags and the startup environment."""
+    if not isinstance(body, dict):
+        return "body must be an object"
+    known = ("pending_timeout_s", "on_unmatched", "default_response", "unmatched_error",
+             "timeout_error", "latency", "rate_limit", "seed")
+    unknown = sorted(k for k in body if k not in known)
+    if unknown:
+        return f"unknown config key(s) {unknown}; allowed: {list(known)}"
+    cfg = harness.config
+    defaults = _harness.Config()
+    new: dict[str, Any] = {}
+    if "pending_timeout_s" in body:
+        v = body["pending_timeout_s"]
+        if v is not None and _finite_number(v) is None or (v is not None and v < 0):
+            return "pending_timeout_s must be a non-negative number of seconds or null"
+        new["pending_timeout_s"] = float(v) if v is not None else None
+    if "on_unmatched" in body:
+        v = body["on_unmatched"] if body["on_unmatched"] is not None else "pending"
+        if v not in _harness.UNMATCHED_MODES:
+            return f"on_unmatched must be one of {list(_harness.UNMATCHED_MODES)}"
+        new["on_unmatched"] = v
+    if "default_response" in body:
+        v = body["default_response"]
+        if v is not None:
+            if isinstance(v, str):
+                v = {"text": v}
+            if not isinstance(v, dict):
+                return "default_response must be a /_control/respond body, a string, or null"
+            payload, err = _respond_payload(v)
+            if err is not None:
+                return "default_response: " + json.loads(bytes(err.body).decode()).get("error", "")
+            v = payload
+        new["default_response"] = v
+    for key in ("unmatched_error", "timeout_error"):
+        if key in body:
+            v = body[key]
+            if v is None:
+                v = getattr(defaults, key)
+            elif not isinstance(v, dict):
+                return f"{key} must be a /_control/error body or null"
+            else:
+                payload, err = _error_payload(v)
+                if err is not None:
+                    return f"{key}: " + json.loads(bytes(err.body).decode()).get("error", "")
+                v = payload
+            new[key] = v
+    if "latency" in body:
+        v = body["latency"] if body["latency"] is not None else {}
+        if not isinstance(v, dict) or any(k not in _harness.LATENCY_KEYS for k in v):
+            return f"latency must be an object with keys among {list(_harness.LATENCY_KEYS)}"
+        lat_err = _harness.validate_latency(v, "latency.")
+        if lat_err is not None:
+            return lat_err
+        new["latency"] = {k: int(x) for k, x in v.items() if x is not None}
+    if "rate_limit" in body:
+        v = body["rate_limit"]
+        if v is not None:
+            if not isinstance(v, dict) or not v or any(k not in ("rpm", "itpm", "otpm") for k in v):
+                return "rate_limit must be an object with keys among rpm / itpm / otpm, or null"
+            for k, x in v.items():
+                if x is not None and (type(x) is not int or x < 1):
+                    return f"rate_limit.{k} must be a positive integer"
+            v = {k: x for k, x in v.items() if x is not None} or None
+        new["rate_limit"] = v
+    if "seed" in body:
+        v = body["seed"]
+        if v is not None and type(v) is not int:
+            return "seed must be an integer or null"
+        new["seed"] = v
+    for k, v in new.items():
+        setattr(cfg, k, v)
+    if "seed" in new:
+        harness.reseed()
+    if "rate_limit" in new:
+        harness._window.clear()  # a new budget starts from an empty window
+    if cfg.on_unmatched == "default" and cfg.default_response is None:
+        # Nothing to answer with: fall back to the interactive behaviour rather than
+        # silently keeping every request pending under a misleading setting.
+        cfg.default_response = {"content": [{"type": "text", "text": "(puppetllm default response)"}],
+                                "stop_reason": None, "stop_sequence": None, "stop_details": None,
+                                "usage": None, "_latency": {}}
+    return None
+
+
+@app.get("/_control/config")
+async def config_get() -> dict[str, Any]:
+    """The harness configuration: pending timeout, unmatched policy, default response,
+    latency defaults, rate limit and RNG seed. Survives `/_control/clear`."""
+    return _config_view()
+
+
+@app.post("/_control/config", openapi_extra=_cm.schema_of(_cm.ConfigBody))
+@app.put("/_control/config", openapi_extra=_cm.schema_of(_cm.ConfigBody))
+async def config_set(request: Request) -> Any:
+    """Change any subset of the configuration; keys absent from the body keep their value
+    and `null` restores the default. `default_response` takes a `/_control/respond` body
+    (or a plain string), `unmatched_error` / `timeout_error` a `/_control/error` body."""
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    async with state.lock:
+        err_msg = apply_config(body)
+    if err_msg is not None:
+        return _plain_400(err_msg)
+    return {"ok": True, **_config_view()}
+
+
+@app.get("/_control/clock")
+async def clock_get() -> dict[str, Any]:
+    return {"now": _now(), "clock_offset_seconds": harness.clock_offset}
+
+
+@app.post("/_control/clock/advance", openapi_extra=_cm.schema_of(_cm.ClockAdvanceBody))
+async def clock_advance(request: Request) -> Any:
+    """Move the server's clock forward by `seconds` — the pseudo prompt cache's TTLs and
+    pending deadlines elapse accordingly, without sleeping. Reset by `/_control/clear`."""
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    v = _finite_number(body.get("seconds"))
+    if v is None or v < 0 or v > 10 * 365 * 86400:
+        return _plain_400("seconds must be a non-negative number (at most ten years)")
+    async with state.lock:
+        harness.clock_offset += v
+    return {"ok": True, "now": _now(), "clock_offset_seconds": harness.clock_offset}
+
+
+# ── Token counting / model catalogue ─────────────────────────────────
+
+
+# Messages-API parameters that have no meaning for count_tokens.
+_MESSAGES_ONLY_PARAMS = ("max_tokens", "stream", "temperature", "top_p", "top_k",
+                         "stop_sequences", "metadata", "service_tier")
+
+
+def count_input_tokens(body: dict[str, Any], model: str | None) -> int:
+    """The estimate `/v1/messages` itself would put in `usage.input_tokens` for a cold
+    request (same tokenizer, same prompt-rendered params). Raises RequestValidationError."""
+    params = {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body}
+    shape_err = _request_shape_error(body.get("system"), body.get("tools"), body.get("messages", []))
+    if shape_err is not None:
+        raise RequestValidationError(shape_err)
+    try:
+        rc = analyze_request(body.get("system"), body.get("tools") or [], body.get("messages", []),
+                             top_level_cache_control=body.get("cache_control"),
+                             params=params, model=model)
+    except CacheControlError as e:
+        raise RequestValidationError(str(e)) from e
+    return rc.total_tokens
+
+
+@app.post("/v1/messages/count_tokens", openapi_extra=_cm.schema_of(_cm.CountTokensBody))
+async def count_tokens(request: Request) -> Any:
+    """Anthropic `count_tokens`: the request's estimated input tokens, without creating a
+    pending (nothing for a responder to answer, nothing in history)."""
+    headers = {"request-id": _new_request_id()}
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _anthropic_error(400, "invalid_request_error", errmsg, headers=headers)
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        return _anthropic_error(400, "invalid_request_error", "model: field required",
+                                headers=headers)
+    if not isinstance(body.get("messages"), list):
+        return _anthropic_error(400, "invalid_request_error", "messages: field required",
+                                headers=headers)
+    extra = [k for k in _MESSAGES_ONLY_PARAMS if k in body]
+    if extra:
+        # Generation parameters are not count_tokens inputs; refused like the real
+        # endpoint refuses fields it does not know.
+        return _anthropic_error(400, "invalid_request_error",
+                                f"{extra[0]}: Extra inputs are not permitted", headers=headers)
+    if _bedrock.is_bedrock_model_id(model):
+        model = _bedrock.normalize_model_id(model).canonical
+    try:
+        n = count_input_tokens(body, model)
+    except RequestValidationError as e:
+        return _anthropic_error(400, "invalid_request_error", str(e), headers=headers)
+    return JSONResponse({"input_tokens": n}, headers=headers)
+
+
+def _catalogue_dialect(request: Request) -> str:
+    """`/v1/models` is served in the Anthropic shape unless the caller looks like an
+    OpenAI client: a bare `Authorization: Bearer` with neither `x-api-key` nor
+    `anthropic-version` (the Anthropic SDK always sends the version header)."""
+    h = request.headers
+    if "x-api-key" in h or "anthropic-version" in h:
+        return "anthropic"
+    if h.get("authorization", "").lower().startswith("bearer "):
+        return "openai"
+    return "anthropic"
+
+
+# A fixed creation timestamp so the catalogue is stable across restarts.
+_CATALOGUE_CREATED = 1_767_225_600  # 2026-01-01T00:00:00Z
+
+
+def _model_entry(dialect: str, model_id: str, display_name: str | None) -> dict[str, Any]:
+    if dialect == "openai":
+        return {"id": model_id, "object": "model", "created": _CATALOGUE_CREATED,
+                "owned_by": "puppetllm"}
+    return {"type": "model", "id": model_id,
+            "display_name": display_name or model_id,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_CATALOGUE_CREATED))}
+
+
+@app.get("/v1/models")
+async def list_models(request: Request) -> Any:
+    """The model catalogue (`pricing.KNOWN_MODELS`), in the dialect of the caller. It is
+    informational: `/v1/messages` accepts any model id whether listed or not. The
+    Anthropic shape pages with `limit` / `after_id` / `before_id` like the real endpoint,
+    so an SDK's auto-pagination terminates."""
+    dialect = _catalogue_dialect(request)
+    family = "openai" if dialect == "openai" else "anthropic"
+    entries = [_model_entry(dialect, mid, name) for mid, name in pricing.KNOWN_MODELS[family]]
+    if dialect == "openai":
+        return {"object": "list", "data": entries}
+    qp = request.query_params
+    headers = {"request-id": _new_request_id()}
+    raw_limit = qp.get("limit")
+    limit = 20
+    if raw_limit is not None:
+        try:
+            limit = int(raw_limit) if raw_limit.isascii() and raw_limit.isdigit() and len(raw_limit) <= 6 else -1
+        except ValueError:
+            limit = -1
+        if not 1 <= limit <= 1000:
+            return _anthropic_error(400, "invalid_request_error",
+                                    "limit: must be an integer between 1 and 1000",
+                                    headers=headers)
+    after_id, before_id = qp.get("after_id"), qp.get("before_id")
+    if after_id is not None and before_id is not None:
+        return _anthropic_error(400, "invalid_request_error",
+                                "after_id and before_id cannot both be specified", headers=headers)
+    ids = [e["id"] for e in entries]
+    if after_id is not None:
+        if after_id not in ids:
+            return _anthropic_error(400, "invalid_request_error",
+                                    f"after_id: unknown model id {after_id!r}", headers=headers)
+        entries = entries[ids.index(after_id) + 1:]
+        page = entries[:limit]
+        has_more = len(entries) > limit
+    elif before_id is not None:
+        if before_id not in ids:
+            return _anthropic_error(400, "invalid_request_error",
+                                    f"before_id: unknown model id {before_id!r}", headers=headers)
+        entries = entries[:ids.index(before_id)]
+        page = entries[-limit:]
+        has_more = len(entries) > limit
+    else:
+        page = entries[:limit]
+        has_more = len(entries) > limit
+    return JSONResponse({"data": page, "has_more": has_more,
+                         "first_id": page[0]["id"] if page else None,
+                         "last_id": page[-1]["id"] if page else None}, headers=headers)
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(model_id: str, request: Request) -> Any:
+    """One catalogue entry. An id that is not listed is synthesized rather than refused,
+    since the server answers requests for any model id."""
+    dialect = _catalogue_dialect(request)
+    family = "openai" if dialect == "openai" else "anthropic"
+    names = dict(pricing.KNOWN_MODELS[family])
+    return _model_entry(dialect, model_id, names.get(model_id))
 
 
 # ── Registering the provider adapters ────────────────────────────────
@@ -1578,24 +2339,185 @@ app.include_router(_s3.build_router())
 app.add_middleware(_s3.ControlCharGuard)
 
 
+def _openapi_with_control_schemas() -> dict[str, Any]:
+    """The generated document plus the control-body models under `components.schemas`,
+    which is where the typed bodies' `$ref`s point (a schema embedded in one operation
+    cannot carry its own definitions in OpenAPI)."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+    schema.setdefault("components", {}).setdefault("schemas", {}).update(_cm.COMPONENT_SCHEMAS)
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_with_control_schemas  # type: ignore[method-assign]
+
+
+# ── Startup configuration ────────────────────────────────────────────
+
+
+def load_config_file(path: str) -> None:
+    """A JSON file `{"config": {...}, "rules": [...]}` (either key optional; a bare list
+    is taken as rules). Applied at startup (`--config` / `PUPPETLLM_CONFIG`)."""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if isinstance(doc, list):
+        doc = {"rules": doc}
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: expected an object with 'config' and/or 'rules'")
+    if doc.get("config") is not None:
+        err_msg = apply_config(doc["config"])
+        if err_msg is not None:
+            raise ValueError(f"{path}: config: {err_msg}")
+    if doc.get("rules") is not None:
+        rules, err = _compile_rules({"rules": doc["rules"]})
+        if err is not None:
+            raise ValueError(f"{path}: rules: {json.loads(bytes(err.body).decode()).get('error')}")
+        harness.set_rules(rules)
+
+
+def load_rules_file(path: str) -> None:
+    """A JSON file holding a rule list (or `{"rules": [...]}`), applied at startup
+    (`--rules`)."""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    rules, err = _compile_rules(doc)
+    if err is not None:
+        raise ValueError(f"{path}: {json.loads(bytes(err.body).decode()).get('error')}")
+    harness.set_rules(rules)
+
+
+def parse_default_response(raw: str) -> Any:
+    """`--default-response` / `PUPPETLLM_DEFAULT_RESPONSE`: a `{`-prefixed value must be a
+    valid JSON `/_control/respond` body (a typo there is an error, not a text answer that
+    happens to look like JSON); anything else is the text to answer with."""
+    if raw.lstrip().startswith("{"):
+        try:
+            return json.loads(raw)
+        except ValueError as e:
+            raise ValueError(f"not valid JSON ({e}); a value starting with '{{' must be a "
+                             "/_control/respond body") from None
+    return raw
+
+
+def _configure_from_env() -> None:
+    """PUPPETLLM_PENDING_TIMEOUT (seconds), PUPPETLLM_DEFAULT_RESPONSE (text, or a JSON
+    object = a /_control/respond body; setting it selects `on_unmatched: default`),
+    PUPPETLLM_ON_UNMATCHED, PUPPETLLM_SEED, PUPPETLLM_CONFIG (file). An invalid value is
+    reported on stderr and ignored rather than preventing startup."""
+    env = os.environ
+    body: dict[str, Any] = {}
+    if env.get("PUPPETLLM_PENDING_TIMEOUT"):
+        try:
+            body["pending_timeout_s"] = float(env["PUPPETLLM_PENDING_TIMEOUT"])
+        except ValueError:
+            print("[puppetllm] PUPPETLLM_PENDING_TIMEOUT must be a number of seconds; ignored",
+                  file=sys.stderr)
+    if env.get("PUPPETLLM_DEFAULT_RESPONSE"):
+        try:
+            body["default_response"] = parse_default_response(env["PUPPETLLM_DEFAULT_RESPONSE"])
+            body.setdefault("on_unmatched", "default")
+        except ValueError as e:
+            print(f"[puppetllm] PUPPETLLM_DEFAULT_RESPONSE ignored: {e}", file=sys.stderr)
+    if env.get("PUPPETLLM_ON_UNMATCHED"):
+        body["on_unmatched"] = env["PUPPETLLM_ON_UNMATCHED"]
+    if env.get("PUPPETLLM_SEED"):
+        try:
+            body["seed"] = int(env["PUPPETLLM_SEED"])
+        except ValueError:
+            print("[puppetllm] PUPPETLLM_SEED must be an integer; ignored", file=sys.stderr)
+    if body:
+        err_msg = apply_config(body)
+        if err_msg is not None:
+            print(f"[puppetllm] invalid harness environment setting ignored: {err_msg}",
+                  file=sys.stderr)
+    if env.get("PUPPETLLM_CONFIG"):
+        try:
+            load_config_file(env["PUPPETLLM_CONFIG"])
+        except (OSError, ValueError) as e:
+            print(f"[puppetllm] PUPPETLLM_CONFIG ignored: {e}", file=sys.stderr)
+
+
+_configure_from_env()
+
+
 # ── Stand-alone startup ──────────────────────────────────────────────
 
 
-def main() -> int:
-    import argparse
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description="Fake Anthropic/Bedrock/OpenAI API server for debugging")
+def add_serve_arguments(parser: Any) -> None:
+    """The `serve` flags (shared with the `puppetllm` console command)."""
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    args = parser.parse_args()
+    parser.add_argument("--pending-timeout", type=float, default=None, metavar="SECONDS",
+                        help="answer a pending with the configured timeout error after this "
+                             "long (default: wait forever for a responder)")
+    parser.add_argument("--default-response", default=None, metavar="TEXT_OR_JSON",
+                        help="answer every unmatched request with this text (or a JSON "
+                             "/_control/respond body) instead of keeping it pending")
+    parser.add_argument("--on-unmatched", choices=_harness.UNMATCHED_MODES, default=None,
+                        help="what an unmatched request gets: pending (default), default, "
+                             "or error")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed for latency jitter (deterministic timing)")
+    parser.add_argument("--config", default=None, metavar="FILE",
+                        help='JSON file {"config": {...}, "rules": [...]} loaded at startup')
+    parser.add_argument("--rules", default=None, metavar="FILE",
+                        help="JSON file holding a rule list loaded at startup")
+
+
+def serve(args: Any) -> int:
+    """Run the server in-process with the parsed `serve` arguments."""
+    import uvicorn
+
+    body: dict[str, Any] = {}
+    if args.pending_timeout is not None:
+        body["pending_timeout_s"] = args.pending_timeout
+    if args.default_response is not None:
+        try:
+            body["default_response"] = parse_default_response(args.default_response)
+        except ValueError as e:
+            print(f"[puppetllm] error: --default-response: {e}", file=sys.stderr)
+            return 2
+        body.setdefault("on_unmatched", "default")
+    if args.on_unmatched is not None:
+        body["on_unmatched"] = args.on_unmatched
+    if args.seed is not None:
+        body["seed"] = args.seed
+    if body:
+        err_msg = apply_config(body)
+        if err_msg is not None:
+            print(f"[puppetllm] error: {err_msg}", file=sys.stderr)
+            return 2
+    for path, kind in ((args.config, "config"), (args.rules, "rules")):
+        if path is None:
+            continue
+        try:
+            (load_config_file if kind == "config" else load_rules_file)(path)
+        except (OSError, ValueError) as e:
+            print(f"[puppetllm] error: --{kind} {path}: {e}", file=sys.stderr)
+            return 2
 
     print(f"[puppetllm] starting on http://{args.host}:{args.port}", file=sys.stderr)
     print(f"[puppetllm] Anthropic: set ANTHROPIC_BASE_URL=http://{args.host}:{args.port}", file=sys.stderr)
     print(f"[puppetllm] Bedrock:   point AnthropicBedrock base_url to http://{args.host}:{args.port}", file=sys.stderr)
     print(f"[puppetllm] OpenAI:    set OPENAI_BASE_URL=http://{args.host}:{args.port}/v1  (note the /v1)", file=sys.stderr)
+    if harness.rules or harness.config.on_unmatched != "pending":
+        print(f"[puppetllm] harness:   {len(harness.rules)} rule(s), "
+              f"on_unmatched={harness.config.on_unmatched}", file=sys.stderr)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m puppetllm.fake_server",
+        description="Fake Anthropic/Bedrock/OpenAI API server for debugging and testing")
+    add_serve_arguments(parser)
+    return serve(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

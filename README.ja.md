@@ -8,6 +8,7 @@ Anthropic Messages API / Bedrock（InvokeModel・Converse・バッチ推論）/ 
 
 - **ゼロ円デバッグ**: 実 API を叩かずにエージェント / オーケストレーションの挙動を再現・検証する
 - **決定論的テスト**: 任意のレスポンス（text / tool_use、エラー）を注入して分岐を再現する
+- **スクリプト駆動のテストハーネス（[§8](#8-テストハーネス-シナリオルールタイムアウトレイテンシレートリミット擬似クロック)）**: ルールでリクエストに定型応答を対応付け、429 → tool_use → 最終テキストのようなシーケンスを台本化し、レイテンシやレートリミットを模擬し、アプリが何を送ったかを assert する — responder なしの CI で（`puppetllm.testing`、pytest フィクスチャ）
 - **クロスプロバイダブリッジ（[relay モード](#relay-モードクロスプロバイダブリッジ)）**: ある SDK 向けに書かれたアプリを**別の実プロバイダ**で動かす（例: Anthropic SDK の agent を Grok / GPT で、OpenAI SDK のアプリを Claude で）— アプリのコードは 1 行も変えずに
 - **コスト目安**: リクエストごとの概算トークン / 料金を集計する（`/_control/stats`）
 - **擬似プロンプトキャッシュ観測**: アプリが `cache_control` を効かせられる構造で投げているかをハッシュで観測する（`/_control/cache`）
@@ -27,7 +28,9 @@ provider 非依存の canonical core + アダプタ:
 - `puppetllm/providers/openai.py` — OpenAI 経路 `POST /v1/chat/completions`（リクエストは canonical（Anthropic 風）に正規化し、レスポンスは `chat.completion` JSON / SSE chunk に変換）
 - `puppetllm/batches.py` — Anthropic Message Batches 経路 `/v1/messages/batches*`（各 custom_id を通常の pending として保持。バッチのライフサイクルは `/_control/batch/*` から注入可能）
 - `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + トップレベル `cache_control` の自動キャッシュ + 前方一致 + 世代別最小閾値 + 5m / 1h TTL + 20-block lookback + effort / thinking / tool_choice による無効化）
-- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude は Fable / Mythos / Sonnet 5 / Opus 4.1 を含む世代別、GPT / o 系ファミリ。公式料金ページに準拠）
+- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude は Fable / Mythos / Sonnet 5 / Opus 4.1 を含む世代別、GPT / o 系ファミリ。公式料金ページに準拠）と `/v1/models` のカタログ
+- `puppetllm/harness.py` — テストハーネス層: シナリオルール・未マッチ時ポリシー・pending タイムアウト・レイテンシ / ジッタ・レートリミット窓・擬似クロック。`puppetllm/control_models.py` は `/openapi.json` に載せる `/_control/*` の型付きリクエストボディ
+- `puppetllm/testing.py` + `puppetllm/pytest_plugin.py` — テスト側クライアント（`Puppet`、`serve()`）と pytest の `puppet` フィクスチャ
 
 provider は **URL パスで自動判別**（モード切替・設定は不要）。応答 content blocks / 制御 API は provider 共通（注入は同じ `/_control/respond`）。
 
@@ -54,9 +57,12 @@ provider は **URL パスで自動判別**（モード切替・設定は不要�
 docker compose up -d
 curl localhost:8765/_control/health        # → {"ok":true,"turn_count":0}
 
-# B) 直接 (Python 3.12+) — 起動バナーと共に foreground 実行
+# B) 直接 (Python 3.10+) — 起動バナーと共に foreground 実行
 pip install -r requirements.txt
 python3 -m puppetllm --host 127.0.0.1 --port 8765
+#   (`pip install .` すれば `puppetllm` コマンドが使える: `puppetllm serve --port 8765`、
+#    `puppetllm relay ...`、`puppetllm wait`（ヘルスチェックが通るまで待つ）、`puppetllm --version`。
+#    `pip install ".[test]"` で anthropic / openai / boto3 の SDK も入る)
 #   [puppetllm] starting on http://127.0.0.1:8765
 #   [puppetllm] Anthropic: set ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 #   [puppetllm] Bedrock:   point AnthropicBedrock base_url to http://127.0.0.1:8765
@@ -67,6 +73,8 @@ python3 -m uvicorn puppetllm.fake_server:app --host 127.0.0.1 --port 8765
 ```
 
 `--host` 既定は `127.0.0.1`（localhost のみ）。LAN/VPN 越しに使うときだけ `0.0.0.0` にする（[セキュリティ](#セキュリティ)参照）。
+
+`serve` は [§8](#8-テストハーネス-シナリオルールタイムアウトレイテンシレートリミット擬似クロック) のハーネス設定も受け取る: `--pending-timeout SECONDS`、`--default-response TEXT_OR_JSON`、`--on-unmatched pending|default|error`、`--seed N`、`--config FILE`、`--rules FILE`（Docker 向けに同じ設定を環境変数でも指定できる）。
 
 ### 2. アプリ / SDK を proxy に向ける
 
@@ -88,6 +96,8 @@ print(msg.usage)            # → 概算 input/output トークン + キャッ�
 ```
 
 API key はダミーで良い（proxy は検証しない）。`base_url` の代わりに環境変数 `ANTHROPIC_BASE_URL=http://localhost:8765` を立てても同じ（コードを触らずに横取りできる）。`stream=True` の SSE もそのまま動く。
+
+pending は responder が応答するまで待ち続けるので、SDK の `timeout` は長めにする（Anthropic SDK・OpenAI SDK の既定は 10 分だが、自前コードの 30 秒の `httpx` タイムアウトはそれより先に切れる）。エラーを注入するときは、SDK が既定で 429 / 5xx をバックオフ付きで 2 回リトライすることに注意 — 注入したエラーを 1 回だけ観測したいなら `max_retries=0`、リトライ処理を試したいならそのまま（リトライごとに新しい pending になる）。
 
 **Bedrock SDK (`AnthropicBedrock`):**
 
@@ -508,6 +518,71 @@ API のパスと衝突するバケット名（`model`、`v1`、`anthropic`、`_c
 
 ---
 
+### 8. テストハーネス: シナリオルール・タイムアウト・レイテンシ・レートリミット・擬似クロック
+
+ここまでは responder が必要だった。ハーネスは台本からリクエストに**自動で**応答するので、何も接続しない CI でも同じサーバが動く — history / stats / cache は人間の responder のときと同じに動く。
+
+**ルール**はリクエストにマッチして応答する。各ルールは順序付きの steps を持ち、マッチしたリクエスト 1 件につき 1 step を消費する（`repeat: true` なら最後の step を繰り返す。使い切ったルールはマッチしなくなり、次のルール — または未マッチ時ポリシー — に譲る）。step は `/_control/respond` のボディ（`{"text": ...}` の短縮形も可）か `/_control/error` のボディで、任意でレイテンシのキーを添える:
+
+```bash
+curl -s -X PUT localhost:8765/_control/rules -H 'content-type: application/json' -d '{
+  "rules": [
+    {"id": "throttle-once", "match": {"provider": "anthropic"},
+     "steps": [{"error": {"status": 429, "headers": {"retry-after": "1"}}}]},
+    {"id": "weather", "match": {"tools": ["get_weather"], "has_tool_result": false},
+     "steps": [{"respond": {"content": [{"type": "tool_use", "id": "toolu_1",
+                                        "name": "get_weather", "input": {"city": "Tokyo"}}]}}]},
+    {"id": "final", "match": {"has_tool_result": true, "last_user_text": "sunny"},
+     "steps": [{"respond": {"text": "It is sunny in Tokyo."}, "ttfb_ms": 200}]}
+  ]}'
+curl -s localhost:8765/_control/rules | jq '.all_consumed, .unconsumed'
+```
+
+マッチのキー（すべて任意、指定したものはすべて成立が必要）: `provider`（`anthropic` / `bedrock` / `openai`）、`model`（glob）、`tools`（列挙したツール名がすべてリクエストに含まれる）、`has_tool_result`（直近の user ターンに `tool_result` ブロックがある）、`last_user_text`（直近の user ターンのテキストに対する正規表現。`tool_result` のテキストも含む）、`turn`、`stream`。ルールは順に試され、最初に成立した生きているルールが答える。`GET /_control/rules` はルールごとの `matched` / `remaining`、`unconsumed`（誰も要求しなかった step が残っているルール）、`all_consumed` — 「台本の呼び出しがすべて起きた」というテストの assert — を返す。`POST` は追加、`PUT` はリスト置換、`PUT /_control/rules/{id}` は 1 件を同じ位置で置換、`DELETE /_control/rules[/{id}]` は削除。ハーネスが答えた history エントリには `harness: {"source": "rule", "rule_id": ...}` が付く（他の出どころは `default` / `unmatched` / `rate_limit` / `timeout`）。
+
+**未マッチ時ポリシーと pending タイムアウト**（`/_control/config`。`/_control/clear` を跨いで保持される）: `on_unmatched` は `pending`（対話用の既定。responder を待つ）、`default`（`default_response` — `/_control/respond` のボディか文字列 — で答える）、`error`（`unmatched_error` — `/_control/error` のボディ。既定は 500 `api_error` — で答える）。`pending_timeout_s` を設定すると、誰も答えなかった pending にサーバが `timeout_error`（既定 504 `api_error`。バッチのエントリは対象外）で答える。期限はリクエスト到着時に確定し（後から設定を変えても新しいリクエストにだけ効く）、`/_control/pending` に出る（`deadline`、`timeout_in_seconds`）。pending 中に切断したクライアントの pending は捨てられるので、誰も待っていないリクエストを responder が見ることはない。注入済みの応答（relay が実課金している可能性がある）は、`delay_ms` の途中でクライアントが切断しても記録される。
+
+```bash
+curl -s -X POST localhost:8765/_control/config -d '{"pending_timeout_s": 30,
+  "on_unmatched": "default", "default_response": "canned answer",
+  "latency": {"delay_ms": 100, "jitter_ms": 50}, "rate_limit": {"rpm": 60}, "seed": 1}'
+```
+
+**レイテンシ**: `delay_ms`（応答前）、`ttfb_ms`（ストリームの最初のフレーム前）、`chunk_delay_ms`（フレーム間）、`jitter_ms`（`delay_ms` に加える 0..N ms の乱数。`seed` で初期化した生成器から引くので再現可能）を、どの注入（`/_control/respond` / `auto` / `error`）にも、どのルール step にも、`config.latency` の既定値としても指定できる。`delay_ms` の待機中の `/_control/clear` が優先される（リクエストは「cleared」のエラーで返り、記録されない）。始まってしまったストリームは `ttfb_ms` / `chunk_delay_ms` のペースで最後まで流れる。
+
+**レートリミット**: `config.rate_limit` = `{"rpm", "itpm", "otpm"}`（任意のサブセット）を 60 秒のスライディング窓で数える。予算を超えたリクエストは、ルールを見る前に `retry-after` とベンダごとのクォータヘッダ（Anthropic 経路は `anthropic-ratelimit-*`、OpenAI 経路は `x-ratelimit-*`、Bedrock は `ThrottlingException`）付きの 429 になる。拒否したリクエストは予算を消費しない（ただし turn 番号は消費し、history にはエラーとして残る）ので、予算に収まるリクエストなら、他のトラフィックがない限り `retry-after` 秒待てば通る。クォータヘッダには設定した次元ごとの残量と回復時刻が入る（Anthropic には合算の `anthropic-ratelimit-tokens-*` も付く）。入力トークンはキャッシュ判定の前に、キャッシュ済み prefix も含めて数える。バッチのエントリは絞らず、計上もしない。現在の窓は `GET /_control/config` に出る。
+
+**擬似クロック**: `POST /_control/clock/advance {"seconds": N}` でサーバの時計を進める — 擬似プロンプトキャッシュの TTL、レートリミット窓、pending の期限が sleep なしで経過する（`GET /_control/clock` でオフセットを確認。`/_control/clear` で戻る）。
+
+**トークン数とモデルカタログ**（pending は作られず、何も記録されない）:
+
+| Method | Path | 説明 |
+|---|---|---|
+| POST | `/v1/messages/count_tokens` | Anthropic の `count_tokens`: `{"input_tokens": N}`。`/v1/messages` がそのリクエスト全体に課金する概算（`usage.input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`）と同じ値 |
+| POST | `/model/{modelId}/count-tokens` | Bedrock の `CountTokens`（`{"input": {"invokeModel": {"body": <blob>}}}` — Messages リクエスト。boto3 が送るとおりワイヤ上は base64。生の JSON も受け付ける — または `{"input": {"converse": {...}}}` → `{"inputTokens": N}`） |
+| GET  | `/v1/models`、`/v1/models/{id}` | カタログ（`pricing.KNOWN_MODELS`）。Anthropic 形式（`x-api-key` か `anthropic-version` がある、または認可ヘッダなし。`limit` / `after_id` / `before_id` でページング）か OpenAI 形式（素の `Authorization: Bearer`）。情報提供用: リクエスト経路はどんなモデル ID でも受け付け、未掲載の ID は拒否せず合成して返す |
+
+**Python のテストから** — `puppetllm.testing` が制御 API を包む。`serve()` は空きポートでサーバをインプロセス起動する:
+
+```python
+import anthropic
+from puppetllm.testing import serve
+
+with serve() as puppet:                       # 起動済みサーバには Puppet("http://127.0.0.1:8765")
+    puppet.expect(tools=["get_weather"], has_tool_result=False).respond(
+        content=[{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Tokyo"}}])
+    puppet.expect(has_tool_result=True).error(429, headers={"retry-after": "0"}).respond(text="sunny")
+    client = anthropic.Anthropic(base_url=puppet.url, api_key="test", max_retries=0)
+    ...テスト対象を実行...
+    puppet.assert_consumed()                  # 台本の step がすべて使われた
+    puppet.assert_sent(model="claude-*", contains="Tokyo", tool="get_weather")
+    puppet.assert_no_pending()
+```
+
+`Puppet` は対話用の操作（`wait_pending`、`respond`、`error`、`pending`、`history`、`stats`、`cache`、`config`、`advance_clock`、`clear`。`clear(config=True)` は設定も既定に戻し、`reset(baseline)` は保存した `baseline()` — 設定とルール — を再適用する）も持つ。`pip install .` すると pytest の `puppet` フィクスチャ（セッションに 1 サーバ。テストの前後で状態を消し、設定とルールはサーバ起動時のものに戻す — `PUPPETLLM_*` の設定や `--config` のルールは生きたまま、あるテストの `puppet.config(...)` や `puppet.expect(...)` が次のテストに漏れない。`PUPPETLLM_URL` で外部サーバに向けられる）が自動登録される。`pip install ".[test]"` で SDK も入る。起動時の台本はファイル — `puppetllm serve --config scenario.json`（`{"config": {...}, "rules": [...]}`）— でも、Docker 向けには環境変数（[環境変数](#環境変数)参照）でも渡せる。
+
+---
+
 ## relay モード（クロスプロバイダブリッジ）
 
 `python -m puppetllm.relay` は、全 pending を**実在の上流 API** に転送して応答を注入して返す**自動 responder**。puppetllm が透過的なクロスプロバイダ・ブリッジになる。アプリは自分の SDK を話し続けたまま、背後の実モデルを差し替えられる:
@@ -544,23 +619,29 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | Method | Path | 説明 |
 |---|---|---|
 | GET  | `/_control/health` | ヘルスチェック（`{"ok","turn_count"}`） |
-| GET  | `/_control/pending` | 保留中リクエスト一覧（`pending[]` + provider 込み、最古は `request` にも） |
+| GET  | `/_control/pending` | 保留中リクエスト一覧（`pending[]` + provider 込み、最古は `request` にも。pending タイムアウト設定時は `deadline` / `timeout_in_seconds` も） |
 | GET  | `/_control/wait_for_pending?timeout=N` | 次の pending を long-poll で待つ（既定 270s / 上限 600s。なければ `{"timeout":true}`） |
 | POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`）を注入。`content` のブロックは `text` / `tool_use` / `thinking` / `redacted_thinking`。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`"refusal"` なら `stop_details` を生成（`stop_details` で `category` / `explanation` を指定可。`recommended_model` などの追加フィールドは素通し）し、OpenAI 経路では OpenAI の refusal 形式（`message.refusal` / `delta.refusal`、`content: null`、`finish_reason: "stop"`）になる。`"stop_sequence"` なら `stop_sequence` を埋める。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int。加えて `cache_creation` / `output_tokens_details` / `server_tool_use` のオブジェクトと `service_tier` / `inference_geo` / `speed` の文字列も任意 — relay モードが使用） |
 | POST | `/_control/auto` | 簡易自動応答（`{"text":"...", "pending_id"?}`、text のみ） |
+| POST | `/_control/config`（PUT も）/ GET | ハーネス設定（§8）: `pending_timeout_s`、`on_unmatched`、`default_response`、`unmatched_error`、`timeout_error`、`latency`、`rate_limit`、`seed`。部分更新。`null` で既定値に戻る。`clear` を跨いで保持 |
+| GET / PUT / POST / DELETE | `/_control/rules` | シナリオルール（§8）: カウンタ付き一覧（`unconsumed`、`all_consumed`）、置換、追加、全削除。`PUT` / `DELETE /_control/rules/{id}` は 1 件を操作（同じ match のまま step を末尾に足すだけの `PUT` は消費カウンタを引き継ぐ） |
+| GET | `/_control/clock` | 擬似クロック（`now`、`clock_offset_seconds`） |
+| POST | `/_control/clock/advance` | `{"seconds": N}` — 擬似クロックを進める（キャッシュ TTL、レートリミット窓、pending の期限） |
 | POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"?, "content"?}` — 後ろ 2 つはストリーミングを途中で失敗させる。§4 参照）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等） |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴 |
 | GET  | `/_control/stats` | コスト目安・トークン・キャッシュの累計サマリ |
 | GET  | `/_control/cache` | 擬似プロンプトキャッシュ index |
-| POST | `/_control/clear` | pending / history / cache / batches / Bedrock バッチジョブを空に（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503、作成中の Bedrock バッチジョブはリトライ不能な 400 `ConflictException`。S3 ストアには触れない） |
+| POST | `/_control/clear` | pending / history / cache / batches / Bedrock バッチジョブ / ルール / レートリミット窓 / クロックのオフセットを空に — ボディ `{"config": true}` なら設定も既定に戻す（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503、作成中の Bedrock バッチジョブはリトライ不能な 400 `ConflictException`。S3 ストアには触れない） |
 | GET  | `/_control/batches` | バッチレジストリ（状態・request_counts・未解決 custom_id） |
 | POST | `/_control/batch/result` | 1 つの custom_id に `canceled` / `expired` を注入（`{"custom_id","type","batch_id"?}`） |
 | POST | `/_control/batch/end` | バッチを強制 `ended` に。未解決 custom_id は `expired`（既定）または `canceled` になる |
 | GET  | `/_control/bedrock_jobs` | Bedrock バッチ推論のジョブレジストリ（状態・レコード数・未解決 `recordId`） |
 
-`respond` / `auto` / `error` では、バッチのエントリを `pending_id` の代わりに `custom_id`（+ 任意で `batch_id`）で指定できる。
+`respond` / `auto` / `error` では、バッチのエントリを `pending_id` の代わりに `custom_id`（+ 任意で `batch_id`）で指定でき、レイテンシのキー `delay_ms` / `ttfb_ms` / `chunk_delay_ms` / `jitter_ms`（§8）でその 1 回の応答のタイミングを決められる。
 
-以前のバージョンから変わった観測可能な挙動（旧値を前提にしたアプリやテストハーネスは更新が必要）: 処理中に clear されたリクエストは Anthropic / Bedrock-Messages 経路で `529 overloaded_error`（旧 `503 api_error`）。OpenAI 経路のエラー `type` は OpenAI 語彙（`server_error`、`service_unavailable_error` 等。旧 `api_error` / `service_unavailable`）。canonical の `refusal` は OpenAI の `message.refusal` + `finish_reason: "stop"` になる（旧 `finish_reason: "content_filter"`。フィルタ形式が欲しければ `stop_reason` に `"content_filter"` を渡す）。Bedrock の pending / 応答は正規化した Anthropic モデル名を持つ。`thinking` ブロックは捨てずに保持する。OpenAI の usage は `n` 個の choice すべてを計上し（応答・history・stats で一致。該当する pending の snapshot には `choices` フィールドが載る）、明示された `service_tier` を返す。`inference_geo: "us"` のリクエストには公式の 1.1 倍を課金に適用する。
+ボディを取る `/_control/*` エンドポイントのリクエストボディは型付き（`puppetllm/control_models.py`）で、`/openapi.json` の `components.schemas` に載る（`/docs` でも見える）ので、スキーマからクライアントを生成できる。`/_control/respond`（とルールの step）は `{"text": "..."}` を text ブロック 1 つの短縮形として受け付け、空の `content` が並んでいても有効。未設定の任意フィールドを `null` で送っても未指定として扱う。ただし `/_control/config` だけは `null` を「既定値に戻す」と解釈するので、未設定フィールドは省いて送ること。
+
+以前のバージョンから変わった観測可能な挙動（旧値を前提にしたアプリやテストハーネスは更新が必要）: 処理中に clear されたリクエストは Anthropic / Bedrock-Messages 経路で `529 overloaded_error`（旧 `503 api_error`）。OpenAI 経路のエラー `type` は OpenAI 語彙（`server_error`、`service_unavailable_error` 等。旧 `api_error` / `service_unavailable`）。canonical の `refusal` は OpenAI の `message.refusal` + `finish_reason: "stop"` になる（旧 `finish_reason: "content_filter"`。フィルタ形式が欲しければ `stop_reason` に `"content_filter"` を渡す）。Bedrock の pending / 応答は正規化した Anthropic モデル名を持つ。`thinking` ブロックは捨てずに保持する。OpenAI の usage は `n` 個の choice すべてを計上し（応答・history・stats で一致。該当する pending の snapshot には `choices` フィールドが載る）、明示された `service_tier` を返す。`inference_geo: "us"` のリクエストには公式の 1.1 倍を課金に適用する。`/_control/auto` は `text` が文字列であることを要求する（他のキーは従来どおり無視）。また全リクエスト経路で、形の崩れた `messages` / `system` / `tools` は後段で失敗する代わりに 400 で拒否する。
 
 ### 並列リクエスト（multi-pending）
 
@@ -596,6 +677,12 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 | `PUPPETLLM_S3_ROOT` | プロセスごとの一時ディレクトリ | S3 エミュレーションがオブジェクトを置く場所（バッチ推論の入出力）。再起動をまたいで残したい場合や、Docker でホストから見たい場合に指定する（その場合は compose の override に環境変数と対応するボリュームを足すこと。同梱の `docker-compose.yml` はどちらも定義していない） |
 | `PUPPETLLM_CACHE_HONOR_TTL` | `1` | `0` で TTL を無視（常に生存） |
 | `PUPPETLLM_CACHE_MIN_TOKENS` | （モデル別） | 最小キャッシュ閾値の上書き。`0` で無効（全 prefix キャッシュ）。未設定は世代別テーブル（Opus 5 / Fable 512、Opus 4.8 1024、Opus 4.7 2048、Opus 4.6 / 4.5 4096、Sonnet 1024、Haiku 4.5 4096 …） |
+| `PUPPETLLM_PENDING_TIMEOUT` | （なし） | 応答のない pending にタイムアウトエラーを返すまでの秒数（§8） |
+| `PUPPETLLM_DEFAULT_RESPONSE` | （なし） | 未マッチのリクエストに返すテキスト、または JSON の `/_control/respond` ボディ。設定すると `on_unmatched: default` になる |
+| `PUPPETLLM_ON_UNMATCHED` | `pending` | `pending` / `default` / `error` |
+| `PUPPETLLM_SEED` | （なし） | レイテンシのジッタの seed |
+| `PUPPETLLM_CONFIG` | （なし） | 起動時に読む JSON ファイル `{"config": {...}, "rules": [...]}` |
+| `PUPPETLLM_URL` | （なし） | pytest の `puppet` フィクスチャを、起動する代わりに稼働中のサーバへ向ける |
 
 ---
 
@@ -610,10 +697,11 @@ docker compose --profile test run --rm proxy-test
 pip install -r requirements.txt
 python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
     puppetllm.tests.test_batches puppetllm.tests.test_conformance \
-    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_boto3_interop -v
+    puppetllm.tests.test_bedrock_extras puppetllm.tests.test_harness \
+    puppetllm.tests.test_boto3_interop -v
 ```
 
-`puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。
+`puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。`test_harness.py` は §8（ルール、ポリシー、タイムアウト、レイテンシ、レートリミット、クロック、`count_tokens` / `models`、CLI、インプロセス uvicorn に対する `puppetllm.testing`）を検証する。
 
 `test_boto3_interop.py` だけが**実物の** boto3 / botocore（`>= 1.43`。このテストが使う全フィールドを
 持つ最初のサービスモデル）を uvicorn インスタンスに向けて駆動する。他のテストは Bedrock の event stream を puppetllm 自身のコーデックで符号化・復号
@@ -629,7 +717,10 @@ SDK テストを全部スキップしたまま `OK` と黙って報告せず失�
 ```
 puppetllm/
 ├── puppetllm/              # パッケージ本体
-│   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/*
+│   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/* + count_tokens / models
+│   ├── harness.py          # シナリオルール・未マッチ時ポリシー・レイテンシ・レートリミット・擬似クロック
+│   ├── control_models.py   # /_control/* の型付きリクエストボディ（/openapi.json に載る）
+│   ├── testing.py          # テスト側クライアント（Puppet、serve()） — pytest_plugin.py が `puppet` フィクスチャを追加
 │   ├── batches.py          # Anthropic Message Batches 経路 + バッチ制御エンドポイント
 │   ├── cache_sim.py        # 擬似プロンプトキャッシュ
 │   ├── pricing.py          # 概算トークン + 料金
@@ -644,6 +735,7 @@ puppetllm/
 ├── LICENSE
 ├── Dockerfile
 ├── docker-compose.yml
+├── pyproject.toml          # `pip install .` → `puppetllm` コマンド + pytest プラグイン
 └── requirements.txt
 ```
 

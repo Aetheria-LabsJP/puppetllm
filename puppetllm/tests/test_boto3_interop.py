@@ -682,6 +682,30 @@ class TestBoto3Interop(unittest.TestCase):
             self.ctl.get_model_invocation_job(jobIdentifier="aaaaaaaaaaaa")
         self.assertEqual(ctx.exception.response["Error"]["Code"], "ResourceNotFoundException")
 
+    def test_count_tokens_both_input_forms(self) -> None:
+        """`CountTokens` through botocore: the InvokeModel body travels as a base64 blob, and
+        the count equals what the same request's `usage.input_tokens` reports."""
+        model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 16,
+                "system": "You are terse.",
+                "messages": [{"role": "user", "content": "How many tokens is this?"}]}
+        out = self.rt.count_tokens(modelId=model,
+                                   input={"invokeModel": {"body": json.dumps(body).encode()}})
+        n = out["inputTokens"]
+        self.assertGreater(n, 0)
+        self.assertEqual(self.http.get("/_control/pending").json()["count"], 0)
+        # the same request, answered by a rule, bills exactly that many input tokens
+        self.http.post("/_control/rules", json={"steps": [{"respond": {"text": "ok"}}]})
+        res = self.rt.invoke_model(modelId=model, body=json.dumps(body))
+        self.assertEqual(json.loads(res["body"].read())["usage"]["input_tokens"], n)
+        out = self.rt.count_tokens(modelId=model, input={"converse": {
+            "system": [{"text": "You are terse."}],
+            "messages": [{"role": "user", "content": [{"text": "How many tokens is this?"}]}]}})
+        self.assertEqual(out["inputTokens"], n)
+        with self.assertRaises(ClientError) as ctx:
+            self.rt.count_tokens(modelId=model, input={"invokeModel": {"body": b"not json"}})
+        self.assertEqual(ctx.exception.response["Error"]["Code"], "ValidationException")
+
 
 if __name__ == "__main__":
     unittest.main()
