@@ -385,7 +385,7 @@ def build_router() -> APIRouter:
                                            f"request cleared: {result['detail']}",
                                            request_id=req_id)
         if result["kind"] == "error":
-            if result.get("after_events") is not None:
+            if fs.is_mid_stream(result):
                 # Mid-stream failure: a 200 event stream carrying some `chunk` frames and
                 # then an exception frame (boto3 raises EventStreamError; the anthropic
                 # SDK surfaces it while iterating).

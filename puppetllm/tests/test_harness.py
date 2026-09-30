@@ -1456,6 +1456,62 @@ class TestTestingHelpers(unittest.TestCase):
             self.assertEqual(other.rules()["rules"], [])
             self.assertEqual(other.startup_baseline["rules"], [])
 
+    def test_bulk_and_strict_helpers(self) -> None:
+        import threading
+        import httpx
+        from puppetllm.testing import PuppetError
+        p = self.puppet
+        out: list[Any] = []
+        errors: list[BaseException] = []
+
+        def call() -> None:
+            try:
+                out.append(self._post(_MSG))
+            except BaseException as e:  # noqa: BLE001 - surfaced by the assertions below
+                errors.append(e)
+
+        def fan_out(n: int) -> list[threading.Thread]:
+            threads = [threading.Thread(target=call) for _ in range(n)]
+            for th in threads:
+                th.start()
+            for _ in range(100):
+                if len(p.pending()) == n:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(len(p.pending()), n)
+            return threads
+
+        def settle(threads: list[threading.Thread], n: int) -> None:
+            for th in threads:
+                th.join(5)
+            self.assertFalse(any(th.is_alive() for th in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(out), n)
+
+        threads = fan_out(2)
+        pids = [x["pending_id"] for x in p.pending()]
+        p.respond_many([{"pending_id": pids[0], "text": "one"}, {"pending_id": pids[1], "text": "two"}])
+        settle(threads, 2)
+        self.assertEqual(sorted(r.json()["content"][0]["text"] for r in out), ["one", "two"])
+        out.clear()
+        threads = fan_out(2)
+        self.assertEqual(len(p.respond_all(text="all")), 2)
+        settle(threads, 2)
+        self.assertEqual([r.json()["content"][0]["text"] for r in out], ["all", "all"])
+        p.strict_blocks()
+        p.expect().error(503, after_blocks=1, content=[{"type": "text", "text": "partial"}])
+        with self.assertRaises(PuppetError):
+            p.expect().respond(content=[{"type": "tool_result", "tool_use_id": "x", "content": "y"}])
+        # the error expectation is consumed by a stream that fails after its first block
+        with httpx.stream("POST", p.url + "/v1/messages", json={**_MSG, "stream": True}, timeout=10) as r:
+            self.assertEqual(r.status_code, 200)
+            body = b"".join(r.iter_raw()).decode()
+        self.assertEqual(body.count("event: content_block_stop"), 1)
+        self.assertIn("event: error", body)
+        p.assert_consumed()
+        p.strict_blocks(False)
+        self.assertTrue(p.config()["strict_blocks"] is False)
+
     def test_repeat_before_steps(self) -> None:
         p = self.puppet
         exp = p.expect(model="claude-*").repeat()

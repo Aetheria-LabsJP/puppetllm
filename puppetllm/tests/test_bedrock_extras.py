@@ -1397,7 +1397,7 @@ class TestS3Emulation(_Base):
                         ("GET", "/model/anthropic.claude-opus-5/converse", "POST"),
                         ("GET", "/model/anthropic.claude-opus-5/invoke", "POST"),
                         ("DELETE", "/v1/messages", "POST"),
-                        ("POST", "/model-invocation-jobs", "GET, HEAD")):
+                        ("POST", "/model-invocation-jobs", "GET")):
                     r = await c.request(method, path)
                     self.assertEqual(r.status_code, 405, path)
                     self.assertEqual(r.headers["allow"], allow, path)

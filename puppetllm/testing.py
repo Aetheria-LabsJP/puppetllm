@@ -76,6 +76,7 @@ class Expectation:
 
     def error(self, status: int = 500, *, type: str | None = None, message: str | None = None,
               headers: dict[str, str] | None = None, after_events: int | None = None,
+              after_blocks: int | None = None,
               content: list[dict[str, Any]] | None = None, **latency: int) -> "Expectation":
         body: dict[str, Any] = {"status": status}
         if type is not None:
@@ -86,6 +87,8 @@ class Expectation:
             body["headers"] = headers
         if after_events is not None:
             body["after_events"] = after_events
+        if after_blocks is not None:
+            body["after_blocks"] = after_blocks
         if content is not None:
             body["content"] = content
         return self._add({"error": body, **_latency_only(latency)})
@@ -205,6 +208,24 @@ class Puppet:
                 body[k] = v
         self._post("/_control/respond", body)
 
+    def respond_all(self, text: str | None = None, *, content: list[dict[str, Any]] | None = None,
+                    **extra: Any) -> list[str]:
+        """The same answer for every live pending (`/_control/respond_all`); returns the
+        pending ids it answered."""
+        body: dict[str, Any] = dict(extra)
+        if content is not None:
+            body["content"] = content
+        elif text is not None:
+            body["text"] = text
+        else:
+            body["content"] = []
+        return self._post("/_control/respond_all", body)["pending_ids"]
+
+    def respond_many(self, responses: list[dict[str, Any]]) -> None:
+        """Several answers at once, each item a `respond` body with its own target
+        (`{"responses": [...]}`): all are validated before any is applied."""
+        self._post("/_control/respond", {"responses": responses})
+
     def error(self, status: int = 500, *, pending_id: str | None = None, **extra: Any) -> None:
         """Fail a pending (`/_control/error`); `extra` takes type / message / headers /
         after_events / content / the latency keys."""
@@ -239,6 +260,11 @@ class Puppet:
         self._delete("/_control/rules")
 
     # ── configuration / clock ──
+
+    def strict_blocks(self, enabled: bool = True) -> None:
+        """Refuse (400) injected block types the server does not model instead of dropping
+        them — `config.strict_blocks`."""
+        self.config(strict_blocks=enabled)
 
     def config(self, **changes: Any) -> dict[str, Any]:
         """No arguments: read. With arguments: change those keys (see `/_control/config`)."""

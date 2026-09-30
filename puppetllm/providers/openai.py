@@ -462,6 +462,7 @@ def _openai_error_response(status: int, etype: str, message: str,
 def build_router() -> APIRouter:
     router = APIRouter()
 
+    @router.post("/chat/completions", include_in_schema=False)
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
         started = time.time()

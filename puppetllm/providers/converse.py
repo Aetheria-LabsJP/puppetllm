@@ -924,10 +924,13 @@ def build_router() -> APIRouter:
             return _error(503, "ServiceUnavailableException",
                           f"request cleared: {result['detail']}", req_id)
         if result["kind"] == "error":
-            if result.get("after_events") is not None:
+            if fs.is_mid_stream(result):
                 partial = stream_events(result["content_blocks"], "end_turn", None, 0)
-                n = int(result.get("after_events") or 0)
-                frames = [eventstream.encode_event(name, data) for name, data in partial[:n]]
+                # stream_events without usage already ends after the last block, so the
+                # cut sees no terminal pair to protect: pad the view it slices.
+                cut = fs.cut_partial_stream(partial + [("_", {}), ("_", {})], result,
+                                            "contentBlockStop")
+                frames = [eventstream.encode_event(name, data) for name, data in cut]
                 member = _bedrock.stream_exception_member(
                     _bedrock.exception_name_for(result["status"], result["type"]),
                     operation="converse", status=result["status"])

@@ -47,5 +47,6 @@ services:
               "puppetllm.tests.test_conformance",
               "puppetllm.tests.test_bedrock_extras",
               "puppetllm.tests.test_harness",
+              "puppetllm.tests.test_compat",
               "puppetllm.tests.test_boto3_interop", "-v"]
     restart: "no"

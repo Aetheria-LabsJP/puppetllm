@@ -74,13 +74,20 @@ class Config:
     # {"rpm": N, "itpm": N, "otpm": N} over a sliding 60 s window; None = unlimited.
     rate_limit: dict[str, int] | None = None
     seed: int | None = None
+    # Refuse (400) an injected content block whose type the server does not model,
+    # instead of dropping it and reporting it under `dropped`.
+    strict_blocks: bool = False
+    # Headers added to every API response (not the control plane), e.g. the vendor's
+    # rate-limit quota headers on a 200.
+    default_headers: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {"pending_timeout_s": self.pending_timeout_s, "on_unmatched": self.on_unmatched,
                 "default_response": _public(self.default_response),
                 "unmatched_error": _public(self.unmatched_error),
                 "timeout_error": _public(self.timeout_error), "latency": dict(self.latency),
-                "rate_limit": self.rate_limit, "seed": self.seed}
+                "rate_limit": self.rate_limit, "seed": self.seed,
+                "strict_blocks": self.strict_blocks, "default_headers": dict(self.default_headers)}
 
 
 def _error_default(status: int, message: str) -> dict[str, Any]:
@@ -88,7 +95,7 @@ def _error_default(status: int, message: str) -> dict[str, Any]:
     that `GET /_control/config` shows the same keys before and after a round trip."""
     return {"_inject_error": True, "status": status, "type": "api_error", "message": message,
             "code": None, "param": None, "headers": {}, "after_events": None,
-            "original_status": None, "content": [], "_latency": {}}
+            "after_blocks": None, "original_status": None, "content": [], "_latency": {}}
 
 
 def _public(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -114,6 +121,8 @@ class Rule:
     repeat: bool = False
     consumed: int = 0
     matched: int = 0
+    # Block types the steps lost at compile time ({"rule", "step", "type"}), reported once.
+    dropped: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def exhausted(self) -> bool:

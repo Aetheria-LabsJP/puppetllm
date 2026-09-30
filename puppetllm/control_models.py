@@ -58,6 +58,8 @@ class RespondBody(Target, Latency):
     stop_sequence: str | None = None
     stop_details: dict[str, Any] | None = None
     usage: Usage | None = None
+    responses: list[dict[str, Any]] | None = Field(
+        default=None, description="bulk form: a list of respond bodies, each with its own target")
 
 
 class AutoBody(Target, Latency):
@@ -72,6 +74,9 @@ class ErrorBody(Target, Latency):
     param: str | None = None
     headers: dict[str, str | int | float] | None = None
     after_events: int | None = Field(default=None, ge=0)
+    after_blocks: int | None = Field(
+        default=None, ge=0, description="route-independent alternative to after_events: "
+        "fail after this many complete content blocks")
     original_status: int | None = Field(default=None, ge=100, le=599)
     content: list[ContentBlock] = Field(default_factory=list)
 
@@ -131,6 +136,20 @@ class ConfigBody(BaseModel):
     latency: Latency | None = None
     rate_limit: RateLimit | None = None
     seed: int | None = None
+    strict_blocks: bool | None = Field(
+        default=None, description="refuse unknown content block types instead of dropping them")
+    default_headers: dict[str, str] | None = Field(
+        default=None, description="headers added to every API response (not /_control)")
+
+
+class RespondAllBody(Latency):
+    """`POST /_control/respond_all` — one answer for every live pending."""
+    text: str | None = None
+    content: list[ContentBlock] = Field(default_factory=list)
+    stop_reason: str | None = None
+    stop_sequence: str | None = None
+    stop_details: dict[str, Any] | None = None
+    usage: Usage | None = None
 
 
 class ClockAdvanceBody(BaseModel):

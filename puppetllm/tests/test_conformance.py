@@ -331,9 +331,11 @@ class TestAnthropicRouteConformance(unittest.TestCase):
                 self.assertEqual(u["service_tier"], "priority")
                 self.assertEqual(u["server_tool_use"], {"web_search_requests": 1})
                 h = (await c.get("/_control/history")).json()["history"][-1]
-                # opus 5: input $5, output $25, 5m write $6.25, 1h write $10 per Mtok
-                expected = (1000 * 5.0 + 100 * 25.0 + 500 * 6.25 + 1500 * 10.0) / 1_000_000
+                # opus 5: input $5, output $25, 5m write $6.25, 1h write $10 per Mtok, plus the
+                # overridden server_tool_use's one web search at $0.01
+                expected = (1000 * 5.0 + 100 * 25.0 + 500 * 6.25 + 1500 * 10.0) / 1_000_000 + 0.01
                 self.assertAlmostEqual(h["cost"]["total_usd"], expected, places=9)
+                self.assertEqual(h["cost"]["server_tool_usd"], 0.01)
                 # object keys alone (no integer counters) are rejected
                 t = await self._pending(c, {
                     "model": "claude-opus-5", "max_tokens": 10,

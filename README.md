@@ -74,6 +74,10 @@ python3 -m uvicorn puppetllm.fake_server:app --host 127.0.0.1 --port 8765
 
 `--host` defaults to `127.0.0.1` (localhost only). Use `0.0.0.0` only when accessing over LAN/VPN (see [Security](#security)).
 
+Trying the cache observation with toy prompts? They never reach a real model's minimum
+cacheable prefix (512–4096 tokens), so `cache.status` stays `none`: start with
+`PUPPETLLM_CACHE_MIN_TOKENS=0` to cache every prefix (see [Environment variables](#environment-variables)).
+
 `serve` also takes the harness settings of [§8](#8-test-harness-scenario-rules-timeouts-latency-rate-limits-fake-clock): `--pending-timeout SECONDS`, `--default-response TEXT_OR_JSON`, `--on-unmatched pending|default|error`, `--seed N`, `--config FILE`, `--rules FILE` (the same settings are available as environment variables for Docker).
 
 ### 2. Point your app / SDK at the proxy
@@ -225,7 +229,7 @@ curl -s -X POST localhost:8765/_control/respond \
       ]}'
 ```
 
-Besides `text` / `tool_use`, the injected content may contain `thinking` (`{"type":"thinking","thinking":"…","signature"?}` — an opaque signature is generated when omitted) and `redacted_thinking` (`{"data":"…"}`) blocks, which are kept in the response, streamed as `thinking_delta` / `signature_delta`, counted in `usage.output_tokens_details.thinking_tokens`, and expected back verbatim on the next turn — exactly the shape current models return by default. `stop_reason` accepts the documented vocabulary (`end_turn` / `max_tokens` / `stop_sequence` / `tool_use` / `pause_turn` / `refusal` / `model_context_window_exceeded`); `"refusal"` yields a `stop_details` object (`{"type":"refusal","category":null,"explanation":null}` unless you pass `stop_details`), `"stop_sequence"` fills `stop_sequence` from the request's `stop_sequences` unless you pass one.
+Besides `text` / `tool_use`, the injected content may contain `thinking` (`{"type":"thinking","thinking":"…","signature"?}` — an opaque signature is generated when omitted) and `redacted_thinking` (`{"data":"…"}`) blocks, which are kept in the response, streamed as `thinking_delta` / `signature_delta`, counted in `usage.output_tokens_details.thinking_tokens`, and expected back verbatim on the next turn — exactly the shape current models return by default. Server-side tool blocks are accepted as fixtures too (never executed): `server_tool_use` / `mcp_tool_use` (an id is generated when omitted; streamed like `tool_use` with `input_json_delta`) and the result blocks `web_search_tool_result` / `web_fetch_tool_result` / `code_execution_tool_result` / `bash_code_execution_tool_result` / `text_editor_code_execution_tool_result` / `tool_search_tool_result` / `mcp_tool_result` (carried verbatim; streamed as one `content_block_start` / `content_block_stop` pair; not counted as output tokens). `usage.server_tool_use` counts the `web_search` / `web_fetch` calls and the cost adds the official web-search price (`cost.server_tool_usd`). A `server_tool_use` does not end the turn (`stop_reason` stays `end_turn`). The blocks travel on the Anthropic route, Bedrock InvokeModel and the Mantle alias; the Converse and OpenAI routes drop them and, since the client never saw a search, do not count or bill them (history still holds the fixture). Any other block type is dropped and reported back in the injection's answer (`{"ok": true, "dropped": ["tool_result"]}`), or refused with 400 under `config.strict_blocks` — a `tool_result` is the app's part of the exchange and belongs in its next request. `stop_reason` accepts the documented vocabulary (`end_turn` / `max_tokens` / `stop_sequence` / `tool_use` / `pause_turn` / `refusal` / `model_context_window_exceeded`); `"refusal"` yields a `stop_details` object (`{"type":"refusal","category":null,"explanation":null}` unless you pass `stop_details`), `"stop_sequence"` fills `stop_sequence` from the request's `stop_sequences` unless you pass one.
 
 Returning a `tool_use` makes the app run the real tool → the result is appended as `tool_result` to the next `messages.create()`, which becomes pending again. Repeating this reproduces an entire multi-turn / tool-execution loop.
 
@@ -270,7 +274,7 @@ plus `modelTimeout` on InvokeModel only): a name outside it keeps its status cla
 429-class `ModelNotReadyException` becomes `throttlingException`; 408/504 stay
 `modelTimeoutException` on InvokeModel and become `modelStreamErrorException` with
 `originalStatusCode` on ConverseStream, whose union has no timeout member), never a silent
-internal error. `after_events` counts each route's own events, so the same number
+internal error. `after_blocks` is the route-independent form: fail after that many complete content blocks (the message start plus N block start/stop groups, whatever events the route uses to carry them; `0` fails right after the stream opened). Both apply to the Anthropic, Bedrock InvokeModel / Mantle and Converse streams; the OpenAI route has no mid-stream error form and answers a plain HTTP error (nothing partial is recorded for it). `after_events` counts each route's own events, so the same number
 delivers different content per route (the InvokeModel stream and SSE have a
 `content_block_start`, ConverseStream starts a text block with its first delta):
 
@@ -575,7 +579,8 @@ the first live match wins. `GET /_control/rules` reports per-rule `matched` /
 `PUT` replaces the list, `PUT /_control/rules/{id}` replaces one rule in place,
 `DELETE /_control/rules[/{id}]` removes. History entries answered by the harness carry
 `harness: {"source": "rule", "rule_id": ...}` (`default` / `unmatched` / `rate_limit` /
-`timeout` for the other sources).
+`timeout` for the other sources). Block types a step would lose are listed under
+`dropped` in the rules response (or refused with 400 when `config.strict_blocks` is set).
 
 **Unmatched policy and pending timeout** (`/_control/config`, kept across
 `/_control/clear`): `on_unmatched` is `pending` (the interactive default: wait for a
@@ -614,6 +619,11 @@ remaining capacity and reset time of each configured dimension (Anthropic also g
 combined `anthropic-ratelimit-tokens-*`). Input tokens are counted before the cache is
 consulted, cached prefixes included. Batch entries are neither throttled nor charged.
 `GET /_control/config` shows the current window.
+
+**Default headers**: `config.default_headers` (`{"anthropic-ratelimit-requests-remaining": "42", ...}`)
+are added to every API response — 200s, streams and the S3 emulation included, never the control plane or the docs —
+unless the route set the same header itself (a limiter's 429 keeps its own values), so an
+app that reads the vendor's quota headers off successful responses can be exercised.
 
 **Fake clock**: `POST /_control/clock/advance {"seconds": N}` moves the server's clock
 forward — pseudo prompt-cache TTLs, rate-limit windows and pending deadlines elapse
@@ -700,13 +710,15 @@ Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE
 | GET  | `/_control/health` | Health check (`{"ok","turn_count"}`) |
 | GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`; `deadline` / `timeout_in_seconds` when a pending timeout is configured) |
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
-| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`) into a pending request. `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode) |
-| POST | `/_control/auto` | Simple auto-response (`{"text":"...", "pending_id"?}`, text only) |
-| POST | `/_control/config` (also PUT) / GET | Harness configuration (§8): `pending_timeout_s`, `on_unmatched`, `default_response`, `unmatched_error`, `timeout_error`, `latency`, `rate_limit`, `seed`. Partial updates; `null` restores a default; kept across `clear` |
+| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}` — or `{"text": "..."}` for one text block — into a pending request; `{"responses": [<body with its own target>, ...]}` injects several at once, all validated and resolved before any is applied (a target that vanished in between makes the answer a 409 with per-item `results`). `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking` and the server-side tool blocks (§3); other types are dropped and reported (`dropped`) or refused under `strict_blocks`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode) |
+| POST | `/_control/respond_all` | The same `respond` body (no target) for every live pending, batch entries included — answers a parallel fan-out in one call (`{"ok", "count", "pending_ids"}`; 400 when nothing is pending) |
+| POST | `/_control/auto` | Deprecated alias of `/_control/respond` with `{"text": "..."}` (same targeting); still works |
+| GET  | `/_control/capabilities` | The compatibility matrix (see [Compatibility matrix](#compatibility-matrix)): surfaces with accepted / injectable / streamed / relayed flags, how each content block type travels on each route, and the operations refused on purpose |
+| POST | `/_control/config` (also PUT) / GET | Harness configuration (§8): `pending_timeout_s`, `on_unmatched`, `default_response`, `unmatched_error`, `timeout_error`, `latency`, `rate_limit`, `seed`, `strict_blocks`, `default_headers`. Partial updates; `null` restores a default; kept across `clear` |
 | GET / PUT / POST / DELETE | `/_control/rules` | Scenario rules (§8): list with counters (`unconsumed`, `all_consumed`), replace, append, remove all. `PUT` / `DELETE /_control/rules/{id}` act on one rule (a `PUT` that only appends steps under the same match keeps the rule's consumption counters) |
 | GET | `/_control/clock` | The fake clock (`now`, `clock_offset_seconds`) |
 | POST | `/_control/clock/advance` | `{"seconds": N}` — advance the fake clock (cache TTLs, rate-limit window, pending deadlines) |
-| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"?, "content"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
+| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"? / "after_blocks"?, "content"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
 | GET  | `/_control/history` | (request, response, usage, cost, cache) history |
 | GET  | `/_control/stats` | Cumulative summary of cost estimates, tokens, cache |
 | GET  | `/_control/cache` | Pseudo prompt-cache index |
@@ -720,7 +732,7 @@ On `respond` / `auto` / `error`, batch entries can be addressed with `custom_id`
 
 The request bodies of the `/_control/*` endpoints that take one are typed (`puppetllm/control_models.py`) and published in `/openapi.json` under `components.schemas` (`/docs` renders them), so a client can be generated from the schema. `{"text": "..."}` is accepted by `/_control/respond` (and rule steps) as shorthand for one text block, also next to an empty `content`; unset optional fields sent as `null` are treated as absent, except that `/_control/config` takes `null` as "restore the default" (serialize it with unset fields omitted).
 
-Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`; `/_control/auto` requires `text` to be a string (other keys are still ignored) and, like every request route, malformed `messages` / `system` / `tools` containers are refused with 400 instead of failing later.
+Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`; `/_control/auto` requires `text` to be a string (other keys are still ignored) and, like every request route, malformed `messages` / `system` / `tools` containers are refused with 400 instead of failing later; `/_control/respond` / `auto` / `error` answer `{"ok": true, "dropped": [...]}` instead of a bare `{"ok": true}` when an injected block type was dropped; server-side tool blocks are kept instead of dropped; an unimplemented path under `/v1`, `/anthropic`, `/model`, `/guardrail`, `/async-invoke` or `/chat` answers 404 in the provider's envelope instead of an S3 error, so `chat`, `models`, `guardrail` and `async-invoke` are no longer usable as S3 bucket names; a wrong method on a real path answers 405 whose `Allow` lists only the methods actually served (`HEAD` is not).
 
 ### Parallel requests (multi-pending)
 
@@ -730,6 +742,32 @@ The server can hold multiple concurrent requests. Each pending has a unique `pen
 - Injecting into a pending that no longer exists (already resolved, or wiped by `clear`) returns `400` (`no pending request`); only a near-simultaneous double-injection race returns `409` (`already resolved`).
 
 How to build injection payloads (especially avoiding escape accidents with non-ASCII + nested JSON) is covered in detail in [`responder/CLAUDE.md`](responder/CLAUDE.md) / [`responder/AGENTS.md`](responder/AGENTS.md).
+
+---
+
+## Compatibility matrix
+
+What each route accepts, whether a responder / rule can answer it (injectable), whether the
+streaming form is served, and whether the relay forwards it. `GET /_control/capabilities`
+returns the same data (plus how every content block type travels on each route).
+
+| Provider | Operation | Path | Accepted | Injectable | Streamed | Relayed |
+|---|---|---|---|---|---|---|
+| Anthropic | Messages | `POST /v1/messages` | yes | yes | yes (SSE) | yes |
+| Anthropic | count_tokens | `POST /v1/messages/count_tokens` | yes | answered directly | – | – |
+| Anthropic | Message Batches | `/v1/messages/batches*` | yes | yes (per custom_id) | – | yes |
+| Anthropic | Models | `GET /v1/models[/{id}]` | yes | catalogue | – | – |
+| Bedrock | InvokeModel | `POST /model/{id}/invoke` | yes | yes | – | yes |
+| Bedrock | InvokeModelWithResponseStream | `POST /model/{id}/invoke-with-response-stream` | yes | yes | yes (event stream) | yes |
+| Bedrock | Converse / ConverseStream | `POST /model/{id}/converse[-stream]` | yes | yes | yes | yes |
+| Bedrock | CountTokens | `POST /model/{id}/count-tokens` | yes | answered directly | – | – |
+| Bedrock | Messages (Mantle) | `POST /anthropic/v1/messages` | yes | yes | yes | yes |
+| Bedrock | Batch inference | `/model-invocation-job*` | yes | yes (per record) | – | yes |
+| S3 | Buckets / objects (subset) | `/{bucket}[/{key}]` | yes | – | – | – |
+| OpenAI | Chat Completions | `POST /v1/chat/completions` (alias `/chat/completions`) | yes | yes | yes (SSE) | yes |
+| OpenAI | Models | `GET /v1/models[/{id}]` (alias `/models`) | yes | catalogue | – | – |
+
+Refused on purpose, in the caller's own error envelope (a 404 naming the method, the path and, for these, the operation): Anthropic Text Completions, Files, Skills, Managed Agents, Admin; OpenAI Responses, Embeddings, Completions, Assistants / vector stores / fine-tuning / audio / images / Realtime; Bedrock ApplyGuardrail, async invoke, bidirectional streams and every other `/model/{id}/*` operation. A wrong method on a real path answers 405 with `Allow`. Content blocks: `text` / `tool_use` travel on every route; `thinking` / `redacted_thinking` on the Anthropic, Bedrock and Converse routes (dropped by OpenAI); the server-side tool blocks on the Anthropic, Bedrock InvokeModel and Mantle routes (dropped, and not billed, by Converse and OpenAI).
 
 ---
 
@@ -778,7 +816,7 @@ pip install -r requirements.txt
 python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
     puppetllm.tests.test_batches puppetllm.tests.test_conformance \
     puppetllm.tests.test_bedrock_extras puppetllm.tests.test_harness \
-    puppetllm.tests.test_boto3_interop -v
+    puppetllm.tests.test_compat puppetllm.tests.test_boto3_interop -v
 ```
 
 `puppetllm/tests/test_fake_server.py` is an executable specification of the expected behavior; `test_harness.py` covers §8 (rules, policies, timeouts, latency, rate limits, the clock, `count_tokens` / `models`, the CLI and `puppetllm.testing` against an in-process uvicorn).
@@ -800,6 +838,7 @@ puppetllm/
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/* + count_tokens / models
 │   ├── harness.py          # scenario rules, unmatched policy, latency, rate limit, fake clock
 │   ├── control_models.py   # typed /_control/* request bodies (published in /openapi.json)
+│   ├── capabilities.py     # compatibility matrix (/_control/capabilities) + the catch-all for unimplemented paths
 │   ├── testing.py          # test-side client (Puppet, serve()) — pytest_plugin.py adds the `puppet` fixture
 │   ├── batches.py          # Anthropic Message Batches route + batch control endpoints
 │   ├── cache_sim.py        # pseudo prompt cache

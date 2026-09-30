@@ -77,7 +77,7 @@ _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _IPV4_RE = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
 RESERVED_SEGMENTS = frozenset((
     "model", "v1", "anthropic", "_control", "model-invocation-job", "model-invocation-jobs",
-    "docs", "redoc", "openapi.json",
+    "docs", "redoc", "openapi.json", "chat", "models", "guardrail", "async-invoke",
 ))
 
 
@@ -545,6 +545,8 @@ def _api_routes(app: Any) -> list[tuple[Any, frozenset[str]]]:
                 continue
             if str(getattr(r, "path", "")).startswith("/{bucket}"):
                 continue  # this router's own catch-alls
+            if getattr(r, "name", None) == "puppetllm_fallback":
+                continue  # the LLM-API catch-alls (every method, every path under a prefix)
             found.append((regex, frozenset(methods)))
         # Cached on the app, not on the module: the tests reload `fake_server`, and a
         # process-wide cache would answer for whichever app instance came first.
@@ -730,8 +732,6 @@ def build_router() -> APIRouter:
             if regex.match(path):
                 allowed |= set(methods)
         if allowed and request.method not in allowed:
-            if "GET" in allowed:
-                allowed.add("HEAD")
             return JSONResponse({"detail": "Method Not Allowed"}, status_code=405,
                                 headers={"Allow": ", ".join(sorted(allowed))})
         return JSONResponse({"detail": "Not Found"}, status_code=404)

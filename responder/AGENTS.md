@@ -61,7 +61,7 @@ curl -s $PUPPET_URL/_control/health
 3. Read the request's system prompt + tools + conversation
 4. Decide "what would the real Anthropic API return", and build the response content blocks
 5. POST $PUPPET_URL/_control/respond -d '{"content": [...]}'
-   or, for text only, _control/auto -d '{"text": "..."}'
+   or, for text only, _control/respond -d '{"text": "..."}'
 6. Go back to 1
 ```
 
@@ -124,18 +124,18 @@ Even when joining mid-stream, the context can be reconstructed by reading `messa
 Do **not** simulate by cutting corners (e.g. returning just `[DONE]` "because it's a test") — that breaks the caller's logic.
 Return what a real LLM should return.
 
-### 6. Tool results are re-injected by the server
+### 6. Tool results come back from the app
 
-When you return a `tool_use`, the caller executes the tool through the server → the result comes back as a `tool_result` in the next turn's request, via the server. The responder receives it and generates the next response.
+When you return a `tool_use`, the **app under test** runs the tool itself and sends the result as a `tool_result` block in the user turn of its next request. The server only relays that request; it never executes tools or builds results. The responder receives it and generates the next response.
 
 ### 7. Do not return `tool_result` blocks
 
-The responder returns **`text` / `tool_use` blocks**, plus `thinking` / `redacted_thinking` when reproducing a thinking model's response shape (see above). Anything else is dropped by the server.
-`tool_result` is built automatically by the server from the caller's tool execution result. Returning `{"type": "tool_result", ...}` by mistake errors on the SDK side.
+The responder returns **`text` / `tool_use` blocks**, plus `thinking` / `redacted_thinking` when reproducing a thinking model's response shape (see above). Server-side tool blocks (`server_tool_use`, `web_search_tool_result`, …) are accepted as fixtures too. Anything else is dropped by the server, which reports the dropped types in its `{"ok": true, "dropped": [...]}` answer (or refuses with 400 when the server runs with `strict_blocks`).
+`tool_result` is the app's part of the exchange, so it belongs in the next request, never in your answer. A `{"type": "tool_result", ...}` in an injection is removed and named in `dropped` (or refused with 400 under `strict_blocks`); it never reaches the app.
 
 ### 8. Be mindful of multi-turn
 
-In a single "session / scan" the same agent is called multiple times. The `messages[]` in each `wait_for_pending` request **accumulates**. Your statements from previous turns, and the tool_results the server injected afterward, are all included in the history.
+In a single "session / scan" the same agent is called multiple times. The `messages[]` in each `wait_for_pending` request **accumulates**. Your statements from previous turns, and the tool_results the app sent afterward, are all included in the history.
 
 - Avoid responses that contradict what you said / promised in previous turns
 - Reading the history in order lets you reconstruct context even when joining mid-stream (same as when the responder session is restarted)
@@ -173,7 +173,7 @@ Never "fill in the blanks with plausible imagination" (that makes the caller mis
 ### text only (sugar)
 
 ```bash
-curl -s -X POST $PUPPET_URL/_control/auto \
+curl -s -X POST $PUPPET_URL/_control/respond \
   -H 'Content-Type: application/json' \
   -d '{"text": "response text here"}'
 ```
@@ -235,7 +235,7 @@ curl -s -X POST $PUPPET_URL/_control/error \
 | GET | `/_control/pending` | Immediately fetch currently pending requests (`has_pending: false` if none) |
 | GET | `/_control/wait_for_pending?timeout=N` | **long-poll**: wait up to N seconds for the next pending (default 270, max 600) |
 | POST | `/_control/respond` | Inject arbitrary content blocks (`{"content": [...], "stop_reason"?, "usage"?}`) into a pending (`usage` = optional real token counts; as an improvising responder you normally omit both) |
-| POST | `/_control/auto` | Sugar for text-only injection (`{"text": "..."}`) |
+| POST | `/_control/respond_all` | The same answer for every live pending (a parallel fan-out) |
 | POST | `/_control/error` | Inject an HTTP error response (`{"status": N, "type": "...", "message": "..."}`) |
 | GET | `/_control/history` | Cumulative (request, response, usage, cost, cache) history |
 | GET | `/_control/stats` | Cumulative summary of cost estimates / tokens / cache (approx) |
@@ -314,7 +314,7 @@ curl -s -X POST http://localhost:8765/_control/respond \
 - Putting long text inside `bash -c "curl ... -d '{...}'"` → breaks under double shell interpretation
 
 **Lighter alternatives** (short text / ASCII-only, etc.):
-- short text only → `_control/auto -d '{"text":"..."}'`
+- short text only → `_control/respond -d '{"text":"..."}'`
 - small inline JSON → heredoc + `--data-binary @-` (`<<'EOF'` disables shell expansion)
 - jq build (`jq -n --arg t '...' '{content:[{type:"text",text:$t}]}'`) — OK up to medium size
 

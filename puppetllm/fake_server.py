@@ -57,6 +57,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
+from . import capabilities as _capabilities
 from . import control_models as _cm
 from . import harness as _harness
 from . import pricing
@@ -221,8 +222,12 @@ def _apply_batch_discount(cost: dict[str, Any]) -> dict[str, Any]:
     `batch_discount` marker so history/stats readers can tell the discount was applied.
     """
     out = dict(cost)
-    for k in ("input_usd", "output_usd", "cache_write_usd", "cache_read_usd", "total_usd"):
+    token_parts = ("input_usd", "output_usd", "cache_write_usd", "cache_read_usd")
+    for k in token_parts:
         out[k] = round(float(out.get(k, 0.0)) * _BATCH_DISCOUNT, 6)
+    # The discount is on token prices; a server tool's flat fee is billed as-is.
+    out["total_usd"] = round(sum(out[k] for k in token_parts)
+                             + float(out.get("server_tool_usd", 0.0)), 6)
     out["batch_discount"] = _BATCH_DISCOUNT
     return out
 
@@ -249,7 +254,14 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
     # OpenAI `n`: the fake duplicates one generated answer into n choices, and the real API
     # bills every choice — fold it into the canonical usage so wire, history and stats agree.
     n = _choices(snapshot)
-    output = pricing.estimate_output_tokens(content_blocks) * n
+    # Server-tool results are not generated tokens; the calls themselves are — but only
+    # on the routes whose wire carries them (Converse and OpenAI drop them, so the client
+    # saw neither the call nor a search: no tokens, no count, no fee).
+    carries = _carries_server_tools(snapshot)
+    billable = _GENERATED_BLOCK_TYPES if carries else ("text", "tool_use", "thinking", "redacted_thinking")
+    generated = [b for b in content_blocks if isinstance(b, dict) and b.get("type") in billable]
+    output = pricing.estimate_output_tokens(generated) * n
+    server_tool_use = _server_tool_requests(content_blocks) if carries else None
     geo, speed = _geo_and_speed(snapshot)
     cost = pricing.compute_cost(
         model,
@@ -259,6 +271,7 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
         cache_read_tokens=read,
         cache_write_1h_tokens=creation_1h,
         inference_geo=geo, speed=speed,
+        web_search_requests=(server_tool_use or {}).get("web_search_requests", 0) * n,
     )
     usage = {
         "input_tokens": uncached,
@@ -269,7 +282,8 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
         "cache_creation": {"ephemeral_5m_input_tokens": creation_5m,
                            "ephemeral_1h_input_tokens": creation_1h},
         "output_tokens_details": {"thinking_tokens": _thinking_tokens(content_blocks) * n},
-        "server_tool_use": None,
+        "server_tool_use": ({k: v * n for k, v in server_tool_use.items()}
+                            if server_tool_use else None),
         # Anthropic Message Batches carry `batch_id`; Bedrock batch inference carries
         # `job_id`. Either way the request is batch traffic.
         "service_tier": "batch" if (snapshot.get("batch_id") or snapshot.get("job_id"))
@@ -296,6 +310,22 @@ def _geo_and_speed(snapshot: dict[str, Any]) -> tuple[str | None, str | None]:
         speed = None  # `speed` is not a Chat Completions parameter; never price it there
     return (geo if isinstance(geo, str) else None,
             speed if isinstance(speed, str) else None)
+
+
+def _carries_server_tools(snapshot: dict[str, Any]) -> bool:
+    """Whether this pending's route puts server-side tool blocks on the wire (Anthropic
+    Messages, Bedrock InvokeModel and the Mantle alias; not Converse, not OpenAI)."""
+    return snapshot.get("provider") in ("anthropic", "bedrock") and snapshot.get("api") != "converse"
+
+
+def _server_tool_requests(content_blocks: list[dict[str, Any]]) -> dict[str, int] | None:
+    """`usage.server_tool_use` for the server_tool_use blocks of an answer (None when there
+    are none, as the real API reports)."""
+    calls = [b for b in content_blocks if isinstance(b, dict) and b.get("type") == "server_tool_use"]
+    if not calls:
+        return None
+    return {"web_search_requests": sum(1 for b in calls if b.get("name") == "web_search"),
+            "web_fetch_requests": sum(1 for b in calls if b.get("name") == "web_fetch")}
 
 
 def _thinking_tokens(content_blocks: list[dict[str, Any]]) -> int:
@@ -349,7 +379,28 @@ def _block_payload_error(blocks: list[dict[str, Any]]) -> str | None:
             except (ValueError, binascii.Error):
                 return (f"content[{i}].data: redacted_thinking data must be base64 "
                         f"(the Bedrock SDKs decode it client-side)")
+        elif b.get("type") in _SERVER_RESULT_BLOCK_TYPES:
+            # The SDKs model these with a required tool_use_id and content.
+            if not isinstance(b.get("tool_use_id"), str) or not b.get("tool_use_id"):
+                return f"content[{i}].tool_use_id: {b['type']} needs the id of its server_tool_use"
+            if "content" not in b:
+                return f"content[{i}].content: {b['type']} needs a content member"
+        elif b.get("type") in ("server_tool_use", "mcp_tool_use"):
+            if not isinstance(b.get("name"), str) or not b.get("name"):
+                return f"content[{i}].name: {b['type']} needs a tool name"
+            if b.get("input") is not None and not isinstance(b.get("input"), dict):
+                return f"content[{i}].input: must be an object"
+            if b["type"] == "mcp_tool_use" and (not isinstance(b.get("server_name"), str)
+                                                or not b.get("server_name")):
+                return f"content[{i}].server_name: mcp_tool_use needs its MCP server name"
     return None
+
+
+def dropped_block_types(blocks: Any) -> list[str]:
+    """The `type`s in an injected content list that the server does not model (reported
+    back to the injector, or refused under `strict_blocks`)."""
+    return [str(b.get("type")) for b in blocks
+            if isinstance(b, dict) and b.get("type") not in _MODELED_BLOCK_TYPES]
 
 
 _ANTHROPIC_ERROR_TYPE_BY_STATUS = {
@@ -370,6 +421,16 @@ def _normalize_blocks(blocks: Any) -> list[dict[str, Any]]:
     for b in out:
         if b.get("type") == "tool_use" and not b.get("id"):
             b["id"] = f"toolu_{uuid.uuid4().hex[:24]}"
+        elif b.get("type") == "server_tool_use":
+            if not isinstance(b.get("input"), dict):
+                b["input"] = {}
+            if not b.get("id"):
+                b["id"] = f"srvtoolu_{uuid.uuid4().hex[:24]}"
+        elif b.get("type") == "mcp_tool_use":
+            if not isinstance(b.get("input"), dict):
+                b["input"] = {}
+            if not b.get("id"):
+                b["id"] = f"mcptoolu_{uuid.uuid4().hex[:24]}"
         elif b.get("type") == "thinking":
             b["thinking"] = "" if b.get("thinking") is None else str(b["thinking"])
             if not b.get("signature"):
@@ -782,12 +843,20 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             err_entry = {"status": status, "type": etype, "message": emsg}
             if response_payload.get("headers"):
                 err_entry["headers"] = dict(response_payload["headers"])
-            if after_events is not None and snapshot.get("stream"):
+            after_blocks = response_payload.get("after_blocks")
+            if ((after_events is not None or after_blocks is not None) and snapshot.get("stream")
+                    and snapshot.get("provider") != "openai"):
+                # (The OpenAI route has no mid-stream error form: it answers a plain
+                # HTTP error, so nothing partial went on its wire.)
                 # Mid-stream failure: record the content the responder supplied for the
-                # partial stream (the wire carries the first `after_events` of its events).
-                # A non-streaming request gets the plain HTTP error, so its history entry
-                # must not claim a mid-stream failure that never went on the wire.
-                err_entry["after_events"] = after_events
+                # partial stream (the wire carries the first `after_events` of its events,
+                # or the first `after_blocks` complete blocks). A non-streaming request gets
+                # the plain HTTP error, so its history entry must not claim a mid-stream
+                # failure that never went on the wire.
+                if after_events is not None:
+                    err_entry["after_events"] = after_events
+                else:
+                    err_entry["after_blocks"] = after_blocks
                 err_entry["partial_content"] = partial
             await _record_and_reset(
                 snapshot, response_blocks=None, injected_error=err_entry, batch=is_batch,
@@ -802,6 +871,7 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                     # Mid-stream injection: emit this many events of `content` first, then
                     # the error event (streaming requests only; None = plain HTTP error).
                     "after_events": response_payload.get("after_events"),
+                    "after_blocks": response_payload.get("after_blocks"),
                     "original_status": response_payload.get("original_status"),
                     "content_blocks": partial,
                     "message_id": f"msg_{uuid.uuid4().hex[:24]}"}
@@ -852,6 +922,11 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             creation_1h = int(cc.get("ephemeral_1h_input_tokens") or 0) if isinstance(cc, dict) else 0
             geo = usage.get("inference_geo")
             speed = usage.get("speed")
+            if not _carries_server_tools(snapshot):
+                # The wire drops server-tool blocks here, so an overridden count is not
+                # something the client saw either: neither reported nor billed.
+                usage["server_tool_use"] = None
+            stu = usage.get("server_tool_use") if isinstance(usage.get("server_tool_use"), dict) else {}
             cost = pricing.compute_cost(
                 model,
                 input_tokens=usage["input_tokens"],
@@ -861,6 +936,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                 cache_write_1h_tokens=creation_1h,
                 inference_geo=geo if isinstance(geo, str) else None,
                 speed=speed if isinstance(speed, str) else None,
+                # An overridden server_tool_use is already the real (n-scaled) count.
+                web_search_requests=int(stu.get("web_search_requests") or 0),
             )
         if is_batch:
             cost = _apply_batch_discount(cost)
@@ -894,7 +971,17 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
 # ── SSE / stream event construction helpers ──────────────────────────
 
 # Content block types the server models end-to-end (history / usage / encoders agree).
-_MODELED_BLOCK_TYPES = ("text", "tool_use", "thinking", "redacted_thinking")
+# Blocks the model produces itself (billed as output) …
+_GENERATED_BLOCK_TYPES = ("text", "tool_use", "thinking", "redacted_thinking",
+                          "server_tool_use", "mcp_tool_use")
+# … and the results of server-side tools, which the real API places in the same assistant
+# turn. Carried through opaquely (a fixture, never executed): non-stream responses and
+# history hold them verbatim, a stream emits each as one content_block_start / stop pair.
+_SERVER_RESULT_BLOCK_TYPES = ("web_search_tool_result", "web_fetch_tool_result",
+                              "code_execution_tool_result", "bash_code_execution_tool_result",
+                              "text_editor_code_execution_tool_result",
+                              "tool_search_tool_result", "mcp_tool_result")
+_MODELED_BLOCK_TYPES = _GENERATED_BLOCK_TYPES + _SERVER_RESULT_BLOCK_TYPES
 
 
 def _fake_signature() -> str:
@@ -1037,17 +1124,16 @@ def stream_event_dicts(
                                   "data": str(block.get("data") or "")},
             }))
             out.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
-        elif btype == "tool_use":
+        elif btype in ("tool_use", "server_tool_use", "mcp_tool_use"):
             idx += 1
             tool_id = str(block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}")
+            start_block: dict[str, Any] = {"type": btype, "id": tool_id,
+                                           "name": str(block.get("name", "")), "input": {}}
+            if btype == "mcp_tool_use":
+                start_block["server_name"] = str(block.get("server_name", ""))
             out.append(("content_block_start", {
                 "type": "content_block_start", "index": idx,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_id,
-                    "name": str(block.get("name", "")),
-                    "input": {},
-                },
+                "content_block": start_block,
             }))
             # The real stream opens with an empty partial_json and then sends the JSON in
             # several chunks; SDK accumulators concatenate them, so chunking is spec-valid.
@@ -1061,6 +1147,13 @@ def stream_event_dicts(
             out.append(("content_block_stop", {
                 "type": "content_block_stop", "index": idx,
             }))
+        elif btype in _SERVER_RESULT_BLOCK_TYPES:
+            # A server tool's result arrives whole: one start carrying the block, one stop.
+            idx += 1
+            out.append(("content_block_start", {
+                "type": "content_block_start", "index": idx, "content_block": strip_private(block),
+            }))
+            out.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
         else:
             # Skip unknown blocks (anything outside _MODELED_BLOCK_TYPES) (don't consume an index = don't create a gap).
             continue
@@ -1181,7 +1274,7 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
                                 f"request cleared: {result['detail']}", headers=headers)
     model_out = model or "claude-sonnet-mock"
     if result["kind"] == "error":
-        if is_stream and result.get("after_events") is not None:
+        if is_stream and is_mid_stream(result):
             # Mid-stream failure, the way the real API reports it: a 200 SSE response that
             # carries some events and then an `error` event (SDKs surface it from the
             # stream; no HTTP status is involved).
@@ -1247,15 +1340,35 @@ def partial_stream_events(result: dict[str, Any], model: str,
     the SSE caller re-inserts it after `message_start` so the bytes on the wire still form
     a prefix of a normal stream.
     """
-    n = int(result.get("after_events") or 0)
-    if n <= 0:
-        return []
     snapshot = snapshot or {}
     params = snapshot.get("params")
     usage, _cost = _compute_usage({**snapshot, "model": model}, result["content_blocks"])
     events = stream_event_dicts(result["message_id"], model, result["content_blocks"], usage,
                                 None, None, None, params)
-    return events[:min(n, max(0, len(events) - 2))]
+    return cut_partial_stream(events, result, "content_block_stop")
+
+
+def is_mid_stream(result: dict[str, Any]) -> bool:
+    """Whether an injected error is a mid-stream failure (`after_events` or `after_blocks`)."""
+    return result.get("after_events") is not None or result.get("after_blocks") is not None
+
+
+def cut_partial_stream(events: list[tuple[str, dict[str, Any]]], result: dict[str, Any],
+                       block_stop: str) -> list[tuple[str, dict[str, Any]]]:
+    """The prefix of a route's event list that goes on the wire before the injected error:
+    the first `after_events` events, or — `after_blocks` — the message start plus the
+    first N complete blocks (`block_stop` names the route's block-end event). Never the
+    terminal pair, so a failed stream never looks completed."""
+    body = events[:max(0, len(events) - 2)]
+    if result.get("after_blocks") is not None:
+        n = int(result["after_blocks"])
+        stops = [i for i, (name, _d) in enumerate(body) if name == block_stop]
+        if n <= 0:
+            return body[:1]
+        if n > len(stops):
+            return body
+        return body[:stops[n - 1] + 1]
+    return body[:int(result.get("after_events") or 0)]
 
 
 def _error_headers(result: dict[str, Any]) -> dict[str, str]:
@@ -1456,7 +1569,8 @@ _USAGE_OVERRIDE_ALL = _USAGE_OVERRIDE_KEYS + _USAGE_OBJECT_KEYS + _USAGE_SCALAR_
 _USAGE_MAX = 10 ** 12
 
 
-def _respond_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+def _respond_payload(body: dict[str, Any], *, strict: bool | None = None,
+                     ) -> tuple[dict[str, Any] | None, JSONResponse | None]:
     """Validate a `/_control/respond` body and build the future payload (also used for
     rule steps, `config.default_response` and `{"text": ...}` shorthands). → (payload, None)
     or (None, 400)."""
@@ -1522,9 +1636,26 @@ def _respond_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONR
     lat_err = _harness.validate_latency(body)
     if lat_err is not None:
         return None, _plain_400(lat_err)
+    dropped = dropped_block_types(content)
+    if dropped and (harness.config.strict_blocks if strict is None else strict):
+        return None, _plain_400(_dropped_message(dropped))
     return {"content": content, "stop_reason": stop_reason, "stop_sequence": stop_sequence,
-            "stop_details": stop_details, "usage": usage,
+            "stop_details": stop_details, "usage": usage, "_dropped": dropped,
             "_latency": {k: body[k] for k in _harness.LATENCY_KEYS if body.get(k) is not None}}, None
+
+
+def _dropped_message(dropped: list[str]) -> str:
+    return (f"content: block type(s) {sorted(set(dropped))} are not modelled by puppetllm "
+            f"(allowed: {list(_MODELED_BLOCK_TYPES)}); a tool_result belongs in the next "
+            "user turn, not in the answer")
+
+
+def _injection_ok(payload: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """`{"ok": true}` plus `dropped` when the injection lost unknown block types."""
+    out: dict[str, Any] = {"ok": True, **extra}
+    if payload.get("_dropped"):
+        out["dropped"] = payload["_dropped"]
+    return out
 
 
 @app.post("/_control/respond", openapi_extra=_cm.schema_of(_cm.RespondBody))
@@ -1532,8 +1663,11 @@ async def respond(request: Request) -> Any:
     """Inject Body: `{"content": [...], "pending_id"?, "stop_reason"?, "stop_sequence"?,
     "stop_details"?, "usage"?}`.
 
-    The content_block type is "text" | "tool_use" | "thinking" | "redacted_thinking"
-    (anything else is dropped). When `pending_id` is omitted, inject
+    `content` blocks: text / tool_use / thinking / redacted_thinking and the server-side
+    tool blocks (server_tool_use, mcp_tool_use and the *_tool_result types); anything
+    else is dropped and named in the answer's `dropped` (a 400 under `config.strict_blocks`).
+    `{"text": "..."}` is shorthand for one text block; `{"responses": [...]}` injects
+    several answers, each with its own target. When `pending_id` is omitted, inject
     into the single pending if there is one (backward compatible). With multiple in-flight,
     `pending_id` is required — or, for batch entries, address by `custom_id` (+ optional
     `batch_id` when the custom_id appears in several batches).
@@ -1549,6 +1683,8 @@ async def respond(request: Request) -> Any:
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         return _plain_400(errmsg)
+    if body.get("responses") is not None:
+        return await _respond_bulk(body)
     payload, err = _respond_payload(body)
     if err is not None:
         return err
@@ -1559,12 +1695,78 @@ async def respond(request: Request) -> Any:
     err = _safe_set_result(fut, payload)
     if err is not None:
         return err
-    return {"ok": True}
+    return _injection_ok(payload)
 
 
-@app.post("/_control/auto", openapi_extra=_cm.schema_of(_cm.AutoBody))
+async def _respond_bulk(body: dict[str, Any]) -> Any:
+    """`{"responses": [<respond body with its target>, ...]}`: every item is validated and
+    its target resolved before any future is set, so a bad item leaves all pendings
+    untouched. Targets must be distinct."""
+    items = body.get("responses")
+    if not isinstance(items, list) or not items or not all(isinstance(i, dict) for i in items):
+        return _plain_400("responses must be a non-empty list of respond bodies")
+    # Unset defaults a generated client serializes (null targets, an empty content) are
+    # fine; a real outer answer or target is not.
+    if any(body.get(k) is not None for k in ("pending_id", "custom_id", "batch_id", "text")) \
+            or body.get("content"):
+        return _plain_400("with responses, the target and the answer go inside each item")
+    prepared: list[tuple[asyncio.Future, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for i, item in enumerate(items):
+        payload, err = _respond_payload(item)
+        if err is not None:
+            detail = json.loads(bytes(err.body).decode()).get("error")
+            return _plain_400(f"responses[{i}]: {detail}")
+        fut, err = await _resolve_target_future(item.get("pending_id"), item.get("custom_id"),
+                                                item.get("batch_id"))
+        if err is not None:
+            detail = json.loads(bytes(err.body).decode()).get("error")
+            return _plain_400(f"responses[{i}]: {detail}")
+        if id(fut) in seen:
+            return _plain_400(f"responses[{i}]: the same pending is addressed twice")
+        seen.add(id(fut))
+        prepared.append((fut, payload))
+    results = []
+    dropped: list[str] = []
+    for fut, payload in prepared:
+        err = _safe_set_result(fut, payload)
+        results.append({"ok": err is None})
+        dropped += payload.get("_dropped") or []
+    out: dict[str, Any] = {"ok": all(r["ok"] for r in results), "results": results}
+    if dropped:
+        out["dropped"] = dropped
+    if not out["ok"]:
+        # A target resolved between validation and application (a clear, a timeout): the
+        # other items were applied, so the status says "partially".
+        return JSONResponse(out, status_code=409)
+    return out
+
+
+@app.post("/_control/respond_all", openapi_extra=_cm.schema_of(_cm.RespondAllBody))
+async def respond_all(request: Request) -> Any:
+    """One answer (a `/_control/respond` body without a target) for every live pending —
+    a parallel fan-out's requests answered in one call. 400 when nothing is pending."""
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    if any(k in body for k in ("pending_id", "custom_id", "batch_id", "responses")):
+        return _plain_400("respond_all takes no target; use /_control/respond for one pending")
+    payload, err = _respond_payload(body)
+    if err is not None:
+        return err
+    async with state.lock:
+        targets = [(pid, e["future"]) for pid, e in state.pending.items() if not e["future"].done()]
+        if not targets:
+            return JSONResponse({"error": "no pending request"}, status_code=400)
+        for _pid, fut in targets:
+            fut.set_result(copy.deepcopy(payload))
+    return _injection_ok(payload, count=len(targets), pending_ids=[pid for pid, _f in targets])
+
+
+@app.post("/_control/auto", openapi_extra=_cm.schema_of(_cm.AutoBody), deprecated=True)
 async def auto(request: Request) -> Any:
-    """Simple: inject `{"text": "...", "pending_id"?: "..."}` as a text-only response.
+    """Deprecated alias: `/_control/respond` accepts `{"text": "..."}` with the same
+    targeting, so use that. Injects a text-only response into one pending.
 
     Batch entries can also be addressed with `custom_id` (+ optional `batch_id`).
     """
@@ -1586,7 +1788,7 @@ async def auto(request: Request) -> Any:
     err = _safe_set_result(fut, payload)
     if err is not None:
         return err
-    return {"ok": True}
+    return _injection_ok(payload)
 
 
 # Headers an injector may not set: framing / hop-by-hop values would corrupt the response
@@ -1604,8 +1806,8 @@ def _validate_inject_headers(hdrs: Any) -> str | None:
     for k, v in hdrs.items():
         if not isinstance(k, str) or not isinstance(v, (str, int, float)) or isinstance(v, bool):
             return "headers must be an object of string → string/number"
-        if not k or not all(c.isalnum() or c in "-_" for c in k):
-            return f"headers: invalid header name {k!r}"
+        if not k or not k.isascii() or not all(c.isalnum() or c in "-_" for c in k):
+            return f"headers: invalid header name {k!r} (ASCII letters, digits, '-' and '_')"
         if k.lower() in _RESERVED_INJECT_HEADERS:
             return f"headers: {k!r} is a framing header and cannot be injected"
         sv = str(v)
@@ -1614,7 +1816,8 @@ def _validate_inject_headers(hdrs: Any) -> str | None:
     return None
 
 
-def _error_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+def _error_payload(body: dict[str, Any], *, strict: bool | None = None,
+                   ) -> tuple[dict[str, Any] | None, JSONResponse | None]:
     """Validate a `/_control/error` body and build the future payload (also used for rule
     steps and `config.unmatched_error` / `config.timeout_error`). → (payload, None) or
     (None, 400)."""
@@ -1632,6 +1835,11 @@ def _error_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONRes
     after_events = body.get("after_events")
     if after_events is not None and not (type(after_events) is int and after_events >= 0):
         return None, _plain_400("after_events must be a non-negative integer")
+    after_blocks = body.get("after_blocks")
+    if after_blocks is not None and not (type(after_blocks) is int and after_blocks >= 0):
+        return None, _plain_400("after_blocks must be a non-negative integer")
+    if after_events is not None and after_blocks is not None:
+        return None, _plain_400("after_events and after_blocks cannot both be given")
     original_status = body.get("original_status")
     if original_status is not None and not (type(original_status) is int
                                             and 100 <= original_status <= 599):
@@ -1647,8 +1855,12 @@ def _error_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONRes
     lat_err = _harness.validate_latency(body)
     if lat_err is not None:
         return None, _plain_400(lat_err)
+    dropped = dropped_block_types(partial_content)
+    if dropped and (harness.config.strict_blocks if strict is None else strict):
+        return None, _plain_400(_dropped_message(dropped))
     return {
         "_inject_error": True,
+        "_dropped": dropped,
         "status": status,
         # No `type` given: the Anthropic vocabulary for that status, so the SDK raises its
         # specific class (RateLimitError for a 429) — the Bedrock and OpenAI routes already
@@ -1659,6 +1871,8 @@ def _error_payload(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONRes
         "param": body.get("param"),
         "headers": {k: str(v) for k, v in (hdrs or {}).items()},
         "after_events": after_events,
+        # Route-independent form: fail after this many complete content blocks.
+        "after_blocks": after_blocks,
         # Bedrock: the status of the UPSTREAM failure a ModelErrorException /
         # ModelStreamErrorException reports as `originalStatusCode` (a 424 wrapping a 429).
         "original_status": original_status,
@@ -1698,7 +1912,7 @@ async def inject_error(request: Request) -> Any:
     err = _safe_set_result(fut, payload)
     if err is not None:
         return err
-    return {"ok": True}
+    return _injection_ok(payload)
 
 
 @app.get("/_control/history")
@@ -1873,6 +2087,7 @@ def _compile_rule(raw: Any) -> tuple[_harness.Rule | None, JSONResponse | None]:
     if not isinstance(repeat, bool):
         return None, _plain_400(f"rule {rid}: repeat must be a boolean")
     payloads: list[dict[str, Any]] = []
+    dropped_steps: list[dict[str, Any]] = []
     for i, step in enumerate(steps):
         if isinstance(step, dict):
             step = {k: v for k, v in step.items() if v is not None}
@@ -1895,8 +2110,12 @@ def _compile_rule(raw: Any) -> tuple[_harness.Rule | None, JSONResponse | None]:
             detail = json.loads(bytes(err.body).decode()).get("error")
             return None, _plain_400(f"rule {rid}: step {i}: {detail}")
         payloads.append(payload)
-    return _harness.Rule(id=rid, match=dict(match), steps=list(steps), payloads=payloads,
-                         repeat=repeat), None
+        for t in payload.get("_dropped") or []:
+            dropped_steps.append({"rule": rid, "step": i, "type": t})
+    rule = _harness.Rule(id=rid, match=dict(match), steps=list(steps), payloads=payloads,
+                         repeat=repeat)
+    rule.dropped = dropped_steps
+    return rule, None
 
 
 def _compile_rules(body: Any) -> tuple[list[_harness.Rule] | None, JSONResponse | None]:
@@ -1930,11 +2149,16 @@ async def _parse_rules_body(request: Request) -> tuple[Any, JSONResponse | None]
     return body, None
 
 
-def _rules_view() -> dict[str, Any]:
+def _rules_view(new_rules: list[Any] | None = None) -> dict[str, Any]:
     rules = [r.as_dict() for r in harness.rules]
-    return {"rules": rules,
-            "unconsumed": [r.id for r in harness.rules if not r.exhausted and not r.repeat],
-            "all_consumed": all(r.exhausted or r.repeat for r in harness.rules)}
+    out = {"rules": rules,
+           "unconsumed": [r.id for r in harness.rules if not r.exhausted and not r.repeat],
+           "all_consumed": all(r.exhausted or r.repeat for r in harness.rules)}
+    dropped = [d for r in (new_rules or []) for d in getattr(r, "dropped", [])]
+    if dropped:
+        # Block types the rules just posted will silently lose (unless strict_blocks).
+        out["dropped"] = dropped
+    return out
 
 
 @app.get("/_control/rules")
@@ -1956,7 +2180,7 @@ async def rules_put(request: Request) -> Any:
         return err
     async with state.lock:
         harness.set_rules(rules)
-    return {"ok": True, **_rules_view()}
+    return {"ok": True, **_rules_view(rules)}
 
 
 @app.post("/_control/rules", openapi_extra=_cm.schema_of(_cm.RulesBody))
@@ -1975,7 +2199,7 @@ async def rules_post(request: Request) -> Any:
         if clash:
             return _plain_400(f"rule id(s) already present: {clash} (PUT replaces the list)")
         harness.add_rules(rules)
-    return {"ok": True, **_rules_view()}
+    return {"ok": True, **_rules_view(rules)}
 
 
 @app.delete("/_control/rules")
@@ -2015,7 +2239,7 @@ async def rule_put(rule_id: str, request: Request) -> Any:
                 rule.matched = old.matched
             rules[idx] = rule
         harness.set_rules(rules)
-    return {"ok": True, **_rules_view()}
+    return {"ok": True, **_rules_view([rule])}
 
 
 @app.delete("/_control/rules/{rule_id}")
@@ -2052,13 +2276,17 @@ def apply_config(body: dict[str, Any]) -> str | None:
     if not isinstance(body, dict):
         return "body must be an object"
     known = ("pending_timeout_s", "on_unmatched", "default_response", "unmatched_error",
-             "timeout_error", "latency", "rate_limit", "seed")
+             "timeout_error", "latency", "rate_limit", "seed", "strict_blocks", "default_headers")
     unknown = sorted(k for k in body if k not in known)
     if unknown:
         return f"unknown config key(s) {unknown}; allowed: {list(known)}"
     cfg = harness.config
     defaults = _harness.Config()
     new: dict[str, Any] = {}
+    # The strictness the payloads in this same body are compiled under.
+    strict = cfg.strict_blocks
+    if "strict_blocks" in body:
+        strict = body["strict_blocks"] if isinstance(body["strict_blocks"], bool) else False
     if "pending_timeout_s" in body:
         v = body["pending_timeout_s"]
         if v is not None and _finite_number(v) is None or (v is not None and v < 0):
@@ -2076,7 +2304,7 @@ def apply_config(body: dict[str, Any]) -> str | None:
                 v = {"text": v}
             if not isinstance(v, dict):
                 return "default_response must be a /_control/respond body, a string, or null"
-            payload, err = _respond_payload(v)
+            payload, err = _respond_payload(v, strict=strict)
             if err is not None:
                 return "default_response: " + json.loads(bytes(err.body).decode()).get("error", "")
             v = payload
@@ -2089,7 +2317,7 @@ def apply_config(body: dict[str, Any]) -> str | None:
             elif not isinstance(v, dict):
                 return f"{key} must be a /_control/error body or null"
             else:
-                payload, err = _error_payload(v)
+                payload, err = _error_payload(v, strict=strict)
                 if err is not None:
                     return f"{key}: " + json.loads(bytes(err.body).decode()).get("error", "")
                 v = payload
@@ -2117,6 +2345,17 @@ def apply_config(body: dict[str, Any]) -> str | None:
         if v is not None and type(v) is not int:
             return "seed must be an integer or null"
         new["seed"] = v
+    if "strict_blocks" in body:
+        v = body["strict_blocks"] if body["strict_blocks"] is not None else False
+        if not isinstance(v, bool):
+            return "strict_blocks must be a boolean"
+        new["strict_blocks"] = v
+    if "default_headers" in body:
+        v = body["default_headers"] if body["default_headers"] is not None else {}
+        hdr_err = _validate_inject_headers(v)
+        if hdr_err is not None:
+            return "default_headers: " + hdr_err
+        new["default_headers"] = {k: str(x) for k, x in v.items()}
     for k, v in new.items():
         setattr(cfg, k, v)
     if "seed" in new:
@@ -2254,6 +2493,25 @@ def _model_entry(dialect: str, model_id: str, display_name: str | None) -> dict[
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_CATALOGUE_CREATED))}
 
 
+@app.get("/_control/capabilities")
+async def capabilities() -> dict[str, Any]:
+    """The compatibility matrix: every surface with accepted / injectable / streamed /
+    relayed flags, how each content block type travels on each route, and the operations
+    refused on purpose."""
+    return _capabilities.matrix(__version__)
+
+
+@app.get("/models", include_in_schema=False)
+async def list_models_root(request: Request) -> Any:
+    """`/v1`-less alias (an OpenAI client whose base_url omits `/v1`)."""
+    return await list_models(request)
+
+
+@app.get("/models/{model_id:path}", include_in_schema=False)
+async def get_model_root(model_id: str, request: Request) -> Any:
+    return await get_model(model_id, request)
+
+
 @app.get("/v1/models")
 async def list_models(request: Request) -> Any:
     """The model catalogue (`pricing.KNOWN_MODELS`), in the dialect of the caller. It is
@@ -2310,6 +2568,9 @@ async def get_model(model_id: str, request: Request) -> Any:
     """One catalogue entry. An id that is not listed is synthesized rather than refused,
     since the server answers requests for any model id."""
     dialect = _catalogue_dialect(request)
+    if not model_id:
+        # `/v1/models/` — an empty id is nothing to synthesize.
+        return await _capabilities.refuse(request, "openai" if dialect == "openai" else "anthropic")
     family = "openai" if dialect == "openai" else "anthropic"
     names = dict(pricing.KNOWN_MODELS[family])
     return _model_entry(dialect, model_id, names.get(model_id))
@@ -2332,11 +2593,55 @@ app.include_router(_openai.build_router())
 app.include_router(_batches.build_router())
 app.include_router(_converse.build_router())
 app.include_router(_bedrock_batch.build_router())
+# Unimplemented operations of the LLM APIs answer in their own envelope (and a wrong
+# method on a real path with 405) before the S3 catch-alls can see them.
+app.include_router(_capabilities.build_router())
 # The S3 emulation's `/{bucket}` / `/{bucket}/{key}` catch-alls go LAST so every API path
 # above keeps precedence (reserved segments are refused there as bucket names too).
 app.include_router(_s3.build_router())
 # Outside the router: settles request paths the router's own convertor mis-handles.
 app.add_middleware(_s3.ControlCharGuard)
+
+
+def _is_control_plane_path(path: str) -> bool:
+    """`/_control/*`, the docs pages and the schema — matched by path segment, so an S3
+    bucket that merely starts with one of these names is not mistaken for them."""
+    first = path.split("/", 2)[1] if path.startswith("/") else ""
+    return first in ("_control", "docs", "redoc", "openapi.json")
+
+
+class DefaultHeadersMiddleware:
+    """Adds `config.default_headers` to every API response — not to the control plane or
+    the docs — without overriding a header the route set itself."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        path = scope.get("path", "") if scope.get("type") == "http" else ""
+        extra = harness.config.default_headers if path else {}
+        if not extra or _is_control_plane_path(path):
+            await self.inner(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                present = {k.decode("latin-1").lower() for k, _v in message.get("headers", [])}
+                added = []
+                for k, v in extra.items():
+                    if k.lower() in present:
+                        continue
+                    try:
+                        added.append((k.lower().encode("ascii"), v.encode("latin-1")))
+                    except UnicodeEncodeError:
+                        continue  # refused by the validator; never let it break a response
+                message = {**message, "headers": list(message.get("headers", [])) + added}
+            await send(message)
+
+        await self.inner(scope, receive, send_with_headers)
+
+
+app.add_middleware(DefaultHeadersMiddleware)
 
 
 def _openapi_with_control_schemas() -> dict[str, Any]:

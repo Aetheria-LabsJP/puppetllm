@@ -245,6 +245,10 @@ def estimate_output_tokens(content_blocks: Any) -> int:
     return approx_tokens(content_blocks)
 
 
+# Anthropic web search: $10 per 1,000 searches.
+WEB_SEARCH_USD_PER_REQUEST = 0.01
+
+
 def compute_cost(
     model: str | None,
     *,
@@ -255,6 +259,7 @@ def compute_cost(
     cache_write_1h_tokens: int = 0,
     inference_geo: str | None = None,
     speed: str | None = None,
+    web_search_requests: int = 0,
 ) -> dict[str, Any]:
     """Return the estimated cost in USD. Each breakdown + total + resolved family + is_estimate.
 
@@ -274,7 +279,9 @@ def compute_cost(
     cache_write_cost = (cache_write_tokens * p.cache_write
                         + cache_write_1h_tokens * p.cache_write_1h) / per_mtok
     cache_read_cost = cache_read_tokens * p.cache_read / per_mtok
-    total = input_cost + output_cost + cache_write_cost + cache_read_cost
+    # Server-side web search is billed per request on top of the tokens; web fetch is not.
+    server_tool_cost = web_search_requests * WEB_SEARCH_USD_PER_REQUEST
+    total = input_cost + output_cost + cache_write_cost + cache_read_cost + server_tool_cost
     return {
         "model_family": fam,
         "is_estimate": True,  # always an estimate (not a real tokenizer)
@@ -285,6 +292,7 @@ def compute_cost(
         "output_usd": round(output_cost, 6),
         "cache_write_usd": round(cache_write_cost, 6),
         "cache_read_usd": round(cache_read_cost, 6),
+        "server_tool_usd": round(server_tool_cost, 6),
         "total_usd": round(total, 6),
     }
 
