@@ -45,6 +45,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import fnmatch
 import json
 import math
 import os
@@ -54,12 +55,14 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from . import __version__
 from . import capabilities as _capabilities
 from . import control_models as _cm
 from . import harness as _harness
+from . import observability as _obs
+from ._responses import SafeJSONResponse as JSONResponse
 from . import pricing
 from .cache_sim import CacheControlError, CacheSimulator, analyze_request
 from .openai_wire import strip_private
@@ -109,6 +112,46 @@ _CACHE_MIN_TOKENS = _parse_cache_min(os.environ.get("PUPPETLLM_CACHE_MIN_TOKENS"
 # ── Server state ──────────────────────────────────────────────────────
 
 
+# Append-only JSONL mirror of history (`PUPPETLLM_HISTORY_FILE` / `serve --history-file`).
+_HISTORY_FILE: str | None = os.environ.get("PUPPETLLM_HISTORY_FILE") or None
+_history_file_warned: set[str] = set()
+
+# Request headers kept in the snapshot: client identity and trace / request ids only — an
+# explicit allow-list, so a header carrying a credential, a session or a client address
+# never reaches history (or the history file, which `clear` does not truncate).
+_SNAPSHOT_HEADERS = frozenset((
+    "user-agent", "anthropic-version", "openai-organization", "openai-project",
+    # W3C / B3 / vendor trace propagation (ids only; `baggage` is excluded — it carries
+    # application-defined key=value pairs).
+    # (`tracestate` is excluded for the same reason.)
+    "traceparent", "b3", "x-cloud-trace-context", "x-datadog-trace-id",
+    "x-datadog-parent-id", "sentry-trace", "uber-trace-id",
+    "x-request-id", "x-client-request-id", "x-correlation-id", "x-trace-id",
+    # botocore: the invocation id is constant across retries, the attempt counter is not.
+    # (`amz-sdk-request` is `attempt=1; max=3`, a key=value list, so it is not kept.)
+    "x-amzn-trace-id", "amz-sdk-invocation-id", "x-amz-user-agent",
+))
+_SNAPSHOT_HEADER_PREFIXES = ("x-b3-", "x-stainless-")
+_SECRET_HEADER_WORDS = ("key", "token", "secret", "auth", "signature", "credential", "cookie",
+                        "password", "session")
+
+
+def _snapshot_headers(request_headers: Any) -> dict[str, str]:
+    """The allow-listed request headers: `user-agent`, `anthropic-version`, the OpenAI
+    organization / project ids, W3C / B3 / vendor trace ids, `x-request-id` and the other
+    common request ids, botocore's `amz-sdk-*` retry correlation, `x-stainless-*` SDK
+    telemetry (minus any name that smells like a credential). Nothing else."""
+    if request_headers is None:
+        return {}
+    out: dict[str, str] = {}
+    for k, v in request_headers.items():
+        lk = str(k).lower()
+        if lk in _SNAPSHOT_HEADERS or (lk.startswith(_SNAPSHOT_HEADER_PREFIXES)
+                                      and not any(w in lk for w in _SECRET_HEADER_WORDS)):
+            out[lk] = str(v)[:512]
+    return out
+
+
 class _ServerState:
     def __init__(self) -> None:
         # multi-pending (README §parallel-request support): pending_id → {request, future, started_at}.
@@ -134,6 +177,9 @@ class _ServerState:
         # before a clear must not be delivered by a handler that resumes after it).
         self.pending_generation: dict[str, int] = {}
         self.turn_count: int = 0
+        # Monotonic record counter (never reset by clear): the cursor /_control/history
+        # pages on — entries complete out of turn order, turns restart after a clear.
+        self.record_seq: int = 0
         self.lock = asyncio.Lock()
         # The futures currently waiting in /_control/wait_for_pending.
         self.pending_arrival_waiters: list[asyncio.Future[dict[str, Any]]] = []
@@ -159,7 +205,17 @@ class _ServerState:
 state = _ServerState()
 # Scenario rules, latency / rate-limit simulation, pending timeout and the fake clock.
 harness = _harness.Harness()
-app = FastAPI(title="puppetllm fake-llm-api", version=__version__)
+app = FastAPI(default_response_class=JSONResponse, title="puppetllm fake-llm-api", version=__version__)
+
+
+_obs.metrics.gauge("puppetllm_pending", "Requests waiting for an answer",
+                   lambda: sum(1 for e in state.pending.values() if not e["future"].done()))
+_obs.metrics.gauge("puppetllm_turns", "Requests registered since the last clear",
+                   lambda: state.turn_count)
+_obs.metrics.gauge("puppetllm_rules_unconsumed", "Rules that still hold unconsumed steps",
+                   lambda: sum(1 for r in harness.rules if not r.exhausted and not r.repeat))
+_obs.metrics.gauge("puppetllm_clock_offset_seconds", "Fake clock offset",
+                   lambda: harness.clock_offset)
 
 
 def _now() -> float:
@@ -235,7 +291,8 @@ def _apply_batch_discount(cost: dict[str, Any]) -> dict[str, Any]:
 # ── canonical: cost/cache computation ────────────────────────────────
 
 
-def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]]) -> tuple[dict, dict]:
+def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]],
+                   *, pricing_model: str | None = None) -> tuple[dict, dict]:
     """Build usage and an estimated cost from the snapshot (input) and the response content_blocks.
 
     Follows Anthropic usage semantics:
@@ -264,7 +321,8 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
     server_tool_use = _server_tool_requests(content_blocks) if carries else None
     geo, speed = _geo_and_speed(snapshot)
     cost = pricing.compute_cost(
-        model,
+        pricing_model or model,
+        inbound_anthropic=pricing_model is None and snapshot.get("provider") != "openai",
         input_tokens=uncached,
         output_tokens=output,
         cache_write_tokens=creation_5m,
@@ -449,6 +507,9 @@ async def _record_and_reset(
     usage_overridden: bool = False,
     batch: bool = False,
     harness_meta: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+    pricing_model: str | None = None,
+    generation: int | None = None,
 ) -> None:
     """Append one entry to history and remove that pending from the registry.
 
@@ -457,17 +518,30 @@ async def _record_and_reset(
     other in-flight requests). usage / cost / cache are recorded alongside so that
     /_control/stats can aggregate them.
     """
+    completed_at = _now()
     entry: dict[str, Any] = {
         "turn": request_snapshot.get("turn"),
         "provider": request_snapshot.get("provider"),
         "model": request_snapshot.get("model"),
+        "request_id": request_snapshot.get("request_id"),
+        "path": request_snapshot.get("path"),
         "request": request_snapshot,
         "response_blocks": response_blocks,
         "usage": usage,
         "cost": cost,
         "cache": request_snapshot.get("cache"),
-        "completed_at": _now(),
+        "completed_at": completed_at,
+        # Arrival to answer, on the server's clock (a delay_ms wait counts).
+        "latency_ms": int(max(0.0, completed_at - float(request_snapshot.get("received_at") or completed_at)) * 1000),
+        # Where the numbers came from: the approx tokenizer, or a responder's override
+        # (a relay forwarding the upstream's usage); and which model priced them. An
+        # error entry has no usage, so no source.
+        "usage_source": None if usage is None else ("override" if usage_overridden else "estimate"),
+        "pricing_model": pricing_model or request_snapshot.get("model"),
     }
+    if provenance:
+        # What a relay knew about the upstream call (provider, model, dropped fields).
+        entry["provenance"] = provenance
     if injected_error is not None:
         entry["injected_error"] = injected_error
     if usage_overridden:
@@ -482,14 +556,110 @@ async def _record_and_reset(
         # rate_limit|timeout, "rule_id"?: ...}.
         entry["harness"] = harness_meta
     pid = request_snapshot.get("pending_id")
+    recorded = False
     async with state.lock:
         # If clear ran first and the entry is already gone, don't append to history
         # (prevents a "pre-clear request" from resurrecting and mixing in after a clear).
         if pid is None or pid in state.pending:
+            state.record_seq += 1
+            entry["seq"] = state.record_seq
             state.history.append(entry)
+            recorded = True
         if pid is not None:
             state.pending.pop(pid, None)
             state.pending_generation.pop(pid, None)
+    if recorded:
+        _observe_recorded(entry)
+    elif generation is not None and state.clear_generation == generation:
+        # Not a clear: a batch create rolled back and swept this pending after its answer.
+        _canceled(request_snapshot, "batch creation rolled back", label="batch")
+    else:
+        _canceled(request_snapshot, "cleared by control")
+
+
+def _observe_recorded(entry: dict[str, Any]) -> None:
+    """Metrics, the JSON log event and the history file for one recorded entry."""
+    provider = str(entry.get("provider"))
+    err = entry.get("injected_error")
+    outcome = "error" if err is not None else "ok"
+    m = _obs.metrics
+    m.inc("puppetllm_requests_total", provider=provider, outcome=outcome)
+    m.inc("puppetllm_latency_seconds_total", entry["latency_ms"] / 1000.0, provider=provider)
+    usage = entry.get("usage") or {}
+    for kind, key in (("input", "input_tokens"), ("output", "output_tokens"),
+                      ("cache_read", "cache_read_input_tokens"),
+                      ("cache_creation", "cache_creation_input_tokens")):
+        if usage.get(key):
+            m.inc("puppetllm_tokens_total", float(usage[key]), provider=provider, kind=kind)
+    cost = entry.get("cost") or {}
+    if cost.get("total_usd"):
+        m.inc("puppetllm_cost_usd_total", float(cost["total_usd"]), provider=provider)
+    cache = entry.get("cache") or {}
+    m.inc("puppetllm_cache_lookups_total", status=str(cache.get("status") or "none"))
+    harness_meta = entry.get("harness") or {}
+    if harness_meta.get("source"):
+        m.inc("puppetllm_harness_answers_total", source=str(harness_meta["source"]))
+    _obs.log_event("resolved", seq=entry.get("seq"), turn=entry.get("turn"),
+                   pending_id=entry["request"].get("pending_id"),
+                   request_id=entry.get("request_id"), provider=provider, model=entry.get("model"),
+                   **_batch_ids(entry["request"]),
+                   outcome=outcome, status=(err or {}).get("status"),
+                   latency_ms=entry["latency_ms"], source=harness_meta.get("source"),
+                   rule_id=harness_meta.get("rule_id"), usage_source=entry["usage_source"],
+                   output_tokens=usage.get("output_tokens"), cost_usd=cost.get("total_usd"))
+    if _HISTORY_FILE:
+        # A synchronous append (one line, local file) keeps file order equal to history
+        # order. The mirror must never fail the request it mirrors: any error is logged
+        # once per distinct message.
+        try:
+            with open(_HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(_json_line(entry))
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            if msg not in _history_file_warned:
+                _history_file_warned.add(msg)
+                print(f"[puppetllm] history file {_HISTORY_FILE}: {msg}", file=sys.stderr)
+
+
+def _json_line(entry: dict[str, Any]) -> str:
+    """One JSONL line. A lone surrogate in a request (legal JSON, not legal UTF-8) is escaped
+    instead of failing the write / the response."""
+    # `allow_nan=False` would raise on an `inf` a client sent (`1e999` parses to it); the
+    # control-plane JSON renders it as null, so do the same here.
+    entry = _finite(entry)
+    line = json.dumps(entry, ensure_ascii=False, default=str)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        line = json.dumps(entry, ensure_ascii=True, default=str)
+    return line + "\n"
+
+
+def _finite(value: Any) -> Any:
+    """A copy with non-finite floats replaced by None (JSON has no inf / nan)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    return value
+
+
+def _batch_ids(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The batch / job identifiers of a pending, for log events (empty for interactive ones)."""
+    return {k: snapshot[k] for k in ("batch_id", "custom_id", "job_id", "record_id") if k in snapshot}
+
+
+def _check_history_file(path: str) -> str | None:
+    """Whether the history file can be appended to (`serve` refuses an unusable path at
+    startup instead of discovering it on the first entry)."""
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+    except OSError as e:
+        return str(e)
+    return None
 
 
 # ── canonical: request registration / awaiting response (provider-common) ──
@@ -503,7 +673,7 @@ _EXTRA_PARAM_KEYS: tuple[str, ...] = (
     "tool_choice", "temperature", "top_p", "top_k", "stop_sequences", "thinking",
     "output_config", "cache_control", "metadata", "service_tier", "inference_geo",
     "container", "context_management", "fallbacks", "speed", "mcp_servers",
-    "anthropic_beta",
+    "anthropic_beta", "diagnostics",
     # OpenAI Chat Completions (also carried through the OpenAI route's normalization)
     "response_format", "stop", "parallel_tool_calls", "n", "reasoning_effort",
     "max_completion_tokens", "seed", "store", "prompt_cache_key", "safety_identifier",
@@ -522,6 +692,9 @@ async def register_request(
     simulate_cache: bool = True,
     extra: dict[str, Any] | None = None,
     request_headers: Any = None,
+    request_path: str | None = None,
+    request_id: str | None = None,
+    count_rejection: bool = True,
 ) -> tuple[dict[str, Any], asyncio.Future]:
     """Build a normalized snapshot, register it as pending, and return a future to await the response.
 
@@ -542,7 +715,7 @@ async def register_request(
     tools = body.get("tools", [])
     shape_err = _request_shape_error(system, tools, messages)
     if shape_err is not None:
-        raise RequestValidationError(shape_err)
+        _reject(provider, model, request_id, shape_err, path=request_path, count=count_rejection)
     params = {k: body[k] for k in _EXTRA_PARAM_KEYS if k in body}
     # The `anthropic-beta` request header (Anthropic route) is surfaced like Bedrock's
     # `anthropic_beta` body field so the responder can see which betas the app requested.
@@ -557,7 +730,7 @@ async def register_request(
                                         top_level_cache_control=body.get("cache_control"),
                                         params=params, model=model)
     except CacheControlError as e:
-        raise RequestValidationError(str(e)) from e
+        _reject(provider, model, request_id, str(e), path=request_path, count=count_rejection)
     input_tokens_total = request_cache.total_tokens
     now = _now()
 
@@ -571,14 +744,19 @@ async def register_request(
         throttled = None if is_batch_entry else harness.throttle(
             {"pending_id": pending_id, "provider": provider,
              "input_tokens_total": input_tokens_total}, now)
+        fingerprint = None
         if simulate_cache and throttled is None:
-            cache = state.cache.observe(request_cache, model, now)
+            # A `diagnostics.previous_message_id` names the message to explain a miss
+            # against; otherwise the previous request for the model is used.
+            diag = params.get("diagnostics")
+            previous = state.cache.message_fingerprint(diag.get("previous_message_id")) \
+                if isinstance(diag, dict) else None
+            cache = state.cache.observe(request_cache, model, now, previous=previous)
+            fingerprint = cache.pop("_fingerprint", None)
         else:
             # Same shape as observe()'s "none" (stats counts only hit/miss, so none is not aggregated)
-            cache = {"status": "none", "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                     "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
-                     "prefix_hash": None, "read_seg_count": 0,
-                     "breakpoints": len(request_cache.breakpoints)}
+            cache = state.cache.none_result(request_cache, model,
+                                            "throttled" if throttled is not None else "disabled")
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         request_snapshot = {
             "pending_id": pending_id,
@@ -596,15 +774,26 @@ async def register_request(
             "received_at": now,
             "input_tokens_total": input_tokens_total,
             "cache": cache,
+            # Where it came in and how to correlate it with the client's logs.
+            "request_id": request_id,
+            "path": request_path,
+            "headers": _snapshot_headers(request_headers),
         }
         if extra:
             request_snapshot.update(extra)
+        _obs.log_event("received", turn=turn, pending_id=pending_id, request_id=request_id,
+                       provider=provider, model=model, path=request_path, stream=is_stream,
+                       **_batch_ids(request_snapshot),
+                       input_tokens=input_tokens_total, cache=cache.get("status"),
+                       throttled=throttled is not None)
         timeout = harness.config.pending_timeout_s
         state.pending_generation[pending_id] = state.clear_generation
         state.pending[pending_id] = {
             "request": request_snapshot,
             "future": fut,
             "started_at": now,
+            # What the cache remembers for the message this request produces.
+            "fingerprint": fingerprint,
             # Fixed at registration (a later config change does not move it); None for
             # batch entries, which the real batch APIs give hours.
             "deadline": (now + timeout) if (timeout is not None and not is_batch_entry) else None,
@@ -622,6 +811,24 @@ async def register_request(
     return request_snapshot, fut
 
 
+def note_rejected(provider: str, model: Any, request_id: str | None, message: str,
+                  path: str | None = None) -> None:
+    """Count and log a request refused with 400 before it became a pending (malformed
+    JSON, a shape or version check in a route, the request analysis)."""
+    _obs.metrics.inc("puppetllm_rejected_total", provider=str(provider))
+    _obs.log_event("rejected", provider=provider, model=model, request_id=request_id,
+                   path=path, reason=message)
+
+
+def _reject(provider: str, model: Any, request_id: str | None, message: str,
+            path: str | None = None, count: bool = True) -> None:
+    """A request the real API refuses with 400: counted and logged (unless `count` is
+    False — a batch record that becomes an error result, not a refused request), raised."""
+    if count:
+        note_rejected(provider, model, request_id, message, path=path)
+    raise RequestValidationError(message)
+
+
 def _apply_harness(snapshot: dict[str, Any], fut: asyncio.Future,
                    throttled: dict[str, Any] | None) -> bool:
     """Resolve a fresh pending the way `/_control/respond` / `/_control/error` would when
@@ -637,21 +844,32 @@ def _apply_harness(snapshot: dict[str, Any], fut: asyncio.Future,
     if throttled is not None:
         fut.set_result({"_inject_error": True, **throttled, "content": [],
                         "_harness": {"source": "rate_limit"}})
+        _matched(snapshot, "rate_limit")
         return True
     rule, payload = harness.decide(snapshot)
     if payload is not None:
         fut.set_result({**copy.deepcopy(payload),
                         "_harness": {"source": "rule", "rule_id": rule.id}})
+        _matched(snapshot, "rule", rule_id=rule.id, step=rule.consumed)
         return True
     cfg = harness.config
     if cfg.on_unmatched == "default" and cfg.default_response is not None:
         fut.set_result({**copy.deepcopy(cfg.default_response), "_harness": {"source": "default"}})
+        _matched(snapshot, "default")
         return True
     if cfg.on_unmatched == "error":
         fut.set_result({"_inject_error": True, "content": [], **copy.deepcopy(cfg.unmatched_error),
                         "_harness": {"source": "unmatched"}})
+        _matched(snapshot, "unmatched")
         return True
     return False
+
+
+def _matched(snapshot: dict[str, Any], source: str, **fields: Any) -> None:
+    """The harness decided this pending's answer (`source`: rate_limit / rule / default /
+    unmatched / timeout)."""
+    _obs.log_event("matched", turn=snapshot.get("turn"), pending_id=snapshot.get("pending_id"),
+                   request_id=snapshot.get("request_id"), source=source, **fields)
 
 
 def validate_request_body(body: dict[str, Any], model: str | None) -> None:
@@ -722,6 +940,7 @@ async def _wait_payload(snapshot: dict[str, Any], fut: asyncio.Future,
                             **copy.deepcopy(harness.config.timeout_error),
                             "_latency": dict(_harness._NO_LATENCY),
                             "_harness": {"source": "timeout"}})
+            _matched(snapshot, "timeout")
             break
     return await fut
 
@@ -745,6 +964,18 @@ def frame_pacer(result: dict[str, Any]) -> Any:
         first = False
 
     return pace
+
+
+def _canceled(snapshot: dict[str, Any], reason: str, label: str | None = None) -> None:
+    """A pending that ended without an answer being delivered. `label` is the metric's
+    reason: clear / disconnect / cancelled (the handler task was cancelled) / batch (the
+    batch was canceled, expired or stopped) / error (the answer could not be encoded)."""
+    if label is None:
+        label = "disconnect" if "disconnect" in reason else "clear"
+    _obs.metrics.inc("puppetllm_canceled_total", reason=label)
+    _obs.log_event("canceled", turn=snapshot.get("turn"), pending_id=snapshot.get("pending_id"),
+                   request_id=snapshot.get("request_id"), provider=snapshot.get("provider"),
+                   **_batch_ids(snapshot), reason=reason)
 
 
 def _discard_pending(snapshot: dict[str, Any]) -> None:
@@ -793,19 +1024,23 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
     except RuntimeError as e:
         # Cancellation via clear (state already reset there) or a client disconnect
         # (the pending was dropped by the watcher).
+        _canceled(snapshot, str(e))
         return {"kind": "cleared", "detail": str(e)}
     except BaseException:
         # Task cancellation from client disconnect etc.: clean up the entry, then propagate.
         _discard_pending(snapshot)
+        _canceled(snapshot, "handler cancelled", label="cancelled")
         raise
 
     if isinstance(response_payload, dict) and response_payload.get("_batch_override"):
         # Batch control finalized this custom_id (canceled/expired) synchronously and
         # already popped the pending — the discard here is a no-op safety net.
         _discard_pending(snapshot)
+        _canceled(snapshot, f"batch {response_payload['_batch_override']}", label="batch")
         return {"kind": "batch_override", "type": response_payload["_batch_override"]}
     if state.clear_generation != generation:
         _discard_pending(snapshot)
+        _canceled(snapshot, "cleared by control")
         return {"kind": "cleared", "detail": "cleared by control"}
     latency = harness.latency_for(response_payload.get("_latency")
                                   if isinstance(response_payload, dict) else None)
@@ -826,11 +1061,15 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                     break
         except BaseException:
             _discard_pending(snapshot)
+            _canceled(snapshot, "handler cancelled", label="cancelled")
             raise
         if state.clear_generation != generation:
             _discard_pending(snapshot)
+            _canceled(snapshot, "cleared by control")
             return {"kind": "cleared", "detail": "cleared by control"}
     harness_meta = response_payload.get("_harness") if isinstance(response_payload, dict) else None
+    provenance = response_payload.get("_provenance") if isinstance(response_payload, dict) else None
+    pricing_model = (provenance or {}).get("pricing_model") or None
 
     try:
         model = snapshot.get("model")
@@ -860,7 +1099,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                 err_entry["partial_content"] = partial
             await _record_and_reset(
                 snapshot, response_blocks=None, injected_error=err_entry, batch=is_batch,
-                harness_meta=harness_meta,
+                harness_meta=harness_meta, provenance=provenance, pricing_model=pricing_model,
+                generation=generation,
             )
             return {"kind": "error", "status": status, "type": etype, "message": emsg,
                     "_latency": latency,
@@ -885,7 +1125,7 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         # providers) all agree. (The encoders also skip unknown blocks defensively, but this
         # is what makes usage and /_control/history reflect exactly what the caller receives.)
         content_blocks = _normalize_blocks(content_blocks)
-        usage, cost = _compute_usage(snapshot, content_blocks)
+        usage, cost = _compute_usage(snapshot, content_blocks, pricing_model=pricing_model)
         # Optional usage override from /_control/respond (validated there): real token
         # counts, e.g. relayed from an upstream API. Partial overrides are allowed —
         # provided keys replace the approx values; cost is recomputed from the result.
@@ -928,7 +1168,8 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
                 usage["server_tool_use"] = None
             stu = usage.get("server_tool_use") if isinstance(usage.get("server_tool_use"), dict) else {}
             cost = pricing.compute_cost(
-                model,
+                pricing_model or model,
+                inbound_anthropic=pricing_model is None and snapshot.get("provider") != "openai",
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
                 cache_write_tokens=max(0, usage["cache_creation_input_tokens"] - creation_1h),
@@ -945,9 +1186,13 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         if not is_batch:
             # Batch entries are outside the rate limiter (never admitted, never charged).
             harness.note_output(int(usage.get("output_tokens") or 0), _now())
+        # The message id can name this request as `diagnostics.previous_message_id` later.
+        fingerprint = (state.pending.get(snapshot.get("pending_id")) or {}).get("fingerprint")
+        state.cache.remember_message(message_id, fingerprint)
         await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage,
                                 cost=cost, usage_overridden=usage_overridden, batch=is_batch,
-                                harness_meta=harness_meta)
+                                harness_meta=harness_meta, provenance=provenance,
+                                pricing_model=pricing_model, generation=generation)
         return {
             "kind": "ok",
             "_latency": latency,
@@ -962,9 +1207,14 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
             "stop_sequence": response_payload.get("stop_sequence"),
             "stop_details": response_payload.get("stop_details"),
         }
-    except BaseException:
+    except asyncio.CancelledError:
+        _discard_pending(snapshot)
+        _canceled(snapshot, "handler cancelled", label="cancelled")
+        raise
+    except BaseException as e:
         # Unexpected error such as in usage computation: a 500 is returned, but the pending is always cleaned up.
         _discard_pending(snapshot)
+        _canceled(snapshot, f"internal error: {type(e).__name__}", label="error")
         raise
 
 
@@ -1034,8 +1284,11 @@ def stream_event_dicts(
     stop_sequence: Any = None,
     stop_details: Any = None,
     params: dict[str, Any] | None = None,
+    *,
+    extra_message: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Build the (event_name, data) sequence for the Anthropic streaming protocol.
+    `extra_message` adds top-level Message fields (e.g. `diagnostics`) to message_start.
 
     Returns a wire-format-independent dict sequence so the same event stream can be used
     for both SSE (Anthropic) and eventstream (Bedrock). If usage is unspecified, fake
@@ -1066,6 +1319,7 @@ def stream_event_dicts(
             "stop_sequence": None,
             "stop_details": None,
             "usage": start_usage,
+            **(extra_message or {}),
         },
     }))
 
@@ -1177,6 +1431,8 @@ def _build_sse_stream(
     stop_sequence: Any = None,
     stop_details: Any = None,
     params: dict[str, Any] | None = None,
+    *,
+    extra_message: dict[str, Any] | None = None,
 ) -> list[bytes]:
     """Build the SSE byte sequence that satisfies the Anthropic streaming protocol.
 
@@ -1185,7 +1441,7 @@ def _build_sse_stream(
     message_start (SSE path only; the SDK ignores it).
     """
     events = stream_event_dicts(message_id, model, content_blocks, usage, stop_reason,
-                                stop_sequence, stop_details, params)
+                                stop_sequence, stop_details, params, extra_message=extra_message)
     out = [_sse_event(events[0][0], events[0][1]), _sse_event("ping", {"type": "ping"})]
     out.extend(_sse_event(name, data) for name, data in events[1:])
     return out
@@ -1200,6 +1456,8 @@ def _build_non_stream_response(
     stop_sequence: Any = None,
     stop_details: Any = None,
     params: dict[str, Any] | None = None,
+    *,
+    extra_message: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Keep parity with the streaming path (stream_event_dicts), which only emits the
     # modeled block types: filter unknown block types here too so the same injection
@@ -1219,7 +1477,24 @@ def _build_non_stream_response(
         "stop_sequence": stop_sequence,
         "stop_details": stop_details,
         "usage": _usage_wire(usage),
+        **(extra_message or {}),
     }
+
+
+def cache_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """`diagnostics` for a Message when the request asked for them (a `diagnostics`
+    object, as the cache-diagnosis beta sends; its `previous_message_id` names the message
+    a miss is explained against). The fields are puppetllm's own vocabulary — the pseudo
+    cache's decision and reason — on the Messages routes (Anthropic and the Mantle alias)."""
+    if not isinstance((snapshot.get("params") or {}).get("diagnostics"), dict):
+        return None
+    cache = snapshot.get("cache") or {}
+    return {"diagnostics": {"cache_miss_reason": cache.get("reason"),
+                            "cache_status": cache.get("status"),
+                            "matched_through": cache.get("matched_through"),
+                            "first_changed_path": cache.get("first_changed_path"),
+                            "minimum_tokens": cache.get("minimum_tokens"),
+                            "eligible_prefix_tokens": cache.get("eligible_prefix_tokens")}}
 
 
 # ── Anthropic compatible endpoint ────────────────────────────────────
@@ -1255,13 +1530,15 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
     body, errmsg = await _parse_json_body(request)
     if errmsg is not None:
         # Like the real API, errors on the Anthropic path are always returned in the official envelope.
+        note_rejected(provider, model_override, req_id, errmsg, path=request.url.path)
         return _anthropic_error(400, "invalid_request_error", errmsg, headers=headers)
     is_stream = bool(body.get("stream"))
     model = model_override if model_override is not None else body.get("model")
 
     try:
         snapshot, fut = await register_request(provider, model, body, is_stream, extra=extra,
-                                               request_headers=request.headers)
+                                               request_headers=request.headers,
+                                               request_path=request.url.path, request_id=req_id)
     except RequestValidationError as e:
         return _anthropic_error(400, "invalid_request_error", str(e), headers=headers)
     if on_registered is not None:
@@ -1310,8 +1587,10 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
     stop_args = (result.get("stop_reason"), result.get("stop_sequence"),
                  result.get("stop_details"), snapshot.get("params"))
 
+    diagnostics = cache_diagnostics(snapshot)
     if is_stream:
-        events = _build_sse_stream(message_id, model_out, content_blocks, usage, *stop_args)
+        events = _build_sse_stream(message_id, model_out, content_blocks, usage, *stop_args,
+                                   extra_message=diagnostics)
 
         pace = frame_pacer(result)
 
@@ -1322,7 +1601,8 @@ async def handle_messages(request: Request, *, provider: str, headers: dict[str,
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
     return JSONResponse(
-        _build_non_stream_response(message_id, model_out, content_blocks, usage, *stop_args),
+        _build_non_stream_response(message_id, model_out, content_blocks, usage, *stop_args,
+                                   extra_message=diagnostics),
         headers=headers,
     )
 
@@ -1384,20 +1664,48 @@ async def health() -> dict[str, Any]:
     return {"ok": True, "turn_count": state.turn_count}
 
 
+def _pending_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The short view of a pending's request: enough to pick and route it without the
+    whole conversation."""
+    msgs = snapshot.get("messages") or []
+    out = {k: snapshot.get(k) for k in ("pending_id", "turn", "provider", "model", "stream",
+                                        "received_at", "request_id", "path", "input_tokens_total")}
+    out["message_count"] = len(msgs)
+    out["tools"] = sorted(_harness.tool_names(snapshot))
+    out["last_user_text"] = _harness.last_user_text(snapshot)[:200]
+    out["has_tool_result"] = _harness.has_tool_result(snapshot)
+    for k in ("batch_id", "custom_id", "job_id", "record_id"):
+        if k in snapshot:
+            out[k] = snapshot[k]
+    return out
+
+
 @app.get("/_control/pending")
-async def pending() -> dict[str, Any]:
+async def pending(request: Request) -> Any:
     """Return all current pendings (multi-pending).
 
     Backward compatible: `has_pending` (bool), and if there is at least one pending, the
     oldest is also placed in `request` / `waiting_for_seconds`. Parallel-aware callers use
-    the `pending` array.
+    the `pending` array. `summary=1` replaces each `request` with a short view
+    (`_pending_summary`); `fields=a,b` keeps only those snapshot keys (plus `pending_id`).
     """
+    qp = request.query_params
+    summary = qp.get("summary") in ("1", "true", "yes")
+    fields = [f.strip() for f in (qp.get("fields") or "").split(",") if f.strip()]
+
+    def view(snapshot: dict[str, Any]) -> dict[str, Any]:
+        if summary:
+            return _pending_summary(snapshot)
+        if fields:
+            return {k: snapshot.get(k) for k in ["pending_id", *fields] if k in snapshot or k == "pending_id"}
+        return snapshot
+
     now = _now()
     async with state.lock:
         items = [
             {
                 "pending_id": pid,
-                "request": e["request"],
+                "request": view(e["request"]),
                 "waiting_for_seconds": round(now - e["started_at"], 2),
                 # When `pending_timeout_s` was configured at registration: the fake-clock
                 # time at which the server answers for the responder, and how long that leaves.
@@ -1417,7 +1725,7 @@ async def pending() -> dict[str, Any]:
         "count": len(items),
         "pending": items,
         # backward compatible (oldest pending)
-        "request": oldest["request"] if oldest else None,
+        "request": view(oldest["request"]) if oldest else None,
         "waiting_for_seconds": round(now - oldest["started_at"], 2) if oldest else None,
     }
 
@@ -1639,9 +1947,52 @@ def _respond_payload(body: dict[str, Any], *, strict: bool | None = None,
     dropped = dropped_block_types(content)
     if dropped and (harness.config.strict_blocks if strict is None else strict):
         return None, _plain_400(_dropped_message(dropped))
+    provenance, prov_err = _provenance_of(body)
+    if prov_err is not None:
+        return None, _plain_400(prov_err)
     return {"content": content, "stop_reason": stop_reason, "stop_sequence": stop_sequence,
             "stop_details": stop_details, "usage": usage, "_dropped": dropped,
+            "_provenance": provenance,
             "_latency": {k: body[k] for k in _harness.LATENCY_KEYS if body.get(k) is not None}}, None
+
+
+_PROVENANCE_KEYS = ("upstream_provider", "upstream_model", "usage_source", "pricing_model",
+                    "translation")
+
+
+def _provenance_of(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """`provenance` on an injection: what a relay knew about the upstream call. Recorded
+    in history; `pricing_model` also selects the price table the cost is computed with."""
+    p = body.get("provenance")
+    if p is None:
+        return None, None
+    if not isinstance(p, dict):
+        return None, "provenance must be an object"
+    unknown = sorted(k for k in p if k not in _PROVENANCE_KEYS)
+    if unknown:
+        return None, f"provenance: unknown key(s) {unknown}; allowed: {list(_PROVENANCE_KEYS)}"
+    out: dict[str, Any] = {}
+    for k in ("upstream_provider", "upstream_model", "usage_source", "pricing_model"):
+        v = p.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v:
+            return None, f"provenance.{k} must be a non-empty string"
+        out[k] = v
+    tr = p.get("translation")
+    if tr is not None:
+        if not isinstance(tr, dict):
+            return None, "provenance.translation must be an object"
+        unknown = sorted(k for k in tr if k != "dropped_fields")
+        if unknown:
+            return None, f"provenance.translation: unknown key(s) {unknown}; allowed: ['dropped_fields']"
+        dropped = tr.get("dropped_fields")
+        if dropped is None:
+            dropped = []
+        if not isinstance(dropped, list) or not all(isinstance(x, str) for x in dropped):
+            return None, "provenance.translation.dropped_fields must be a list of strings"
+        out["translation"] = {"dropped_fields": dropped}
+    return (out or None), None
 
 
 def _dropped_message(dropped: list[str]) -> str:
@@ -1858,9 +2209,13 @@ def _error_payload(body: dict[str, Any], *, strict: bool | None = None,
     dropped = dropped_block_types(partial_content)
     if dropped and (harness.config.strict_blocks if strict is None else strict):
         return None, _plain_400(_dropped_message(dropped))
+    provenance, prov_err = _provenance_of(body)
+    if prov_err is not None:
+        return None, _plain_400(prov_err)
     return {
         "_inject_error": True,
         "_dropped": dropped,
+        "_provenance": provenance,
         "status": status,
         # No `type` given: the Anthropic vocabulary for that status, so the SDK raises its
         # specific class (RateLimitError for a 429) — the Bedrock and OpenAI routes already
@@ -1916,14 +2271,70 @@ async def inject_error(request: Request) -> Any:
 
 
 @app.get("/_control/history")
-async def history() -> dict[str, Any]:
+async def history(request: Request) -> Any:
+    """The recorded exchanges, in the order they completed. Filters: `since_turn` (entries
+    with a greater turn), `provider`, `model` (glob); `limit` (1..1000) pages, the answer
+    carrying `has_more` and `next_cursor` — the record sequence (`seq`) of the last entry
+    (or the cursor passed in when nothing new was recorded), passed back as `cursor` to
+    continue; `seq` grows with completion (never reset by clear), so paging and tailing
+    never skip an entry that completed out of turn order.
+    `format=jsonl` returns one entry per line. Without parameters, the whole list as before."""
+    qp = request.query_params
+    try:
+        after_seq = max(int(qp.get("cursor") or 0), 0)
+        after_turn = max(int(qp.get("since_turn") or 0), 0)
+        limit = int(qp["limit"]) if qp.get("limit") is not None else None
+    except ValueError:
+        return _plain_400("since_turn / cursor / limit must be integers")
+    if limit is not None and not 1 <= limit <= 1000:
+        return _plain_400("limit must be between 1 and 1000")
+    provider, model = qp.get("provider"), qp.get("model")
+    if provider is not None and provider not in ("anthropic", "bedrock", "openai"):
+        return _plain_400("provider must be anthropic, bedrock or openai")
     # Snapshot under the lock (a copy) for consistency with stats(); avoids handing out
     # the live list while a concurrent request appends to it.
     async with state.lock:
-        return {"turn_count": state.turn_count, "history": list(state.history)}
+        turn_count = state.turn_count
+        entries = list(state.history)
+    selected = [e for e in entries
+                if (e.get("seq") or 0) > after_seq
+                and (e.get("turn") or 0) > after_turn
+                and (provider is None or e.get("provider") == provider)
+                and (model is None or fnmatch.fnmatchcase(str(e.get("model") or ""), model))]
+    has_more = limit is not None and len(selected) > limit
+    page = selected[:limit] if limit is not None else selected
+    # Always the cursor to continue from: the last entry's seq, or the one passed in when
+    # nothing new was recorded — so a tailer just passes it back.
+    next_cursor = page[-1].get("seq") if page else after_seq
+    if qp.get("format") == "jsonl":
+        body = "".join(_json_line(e) for e in page)
+        return Response(body, media_type="application/x-ndjson",
+                        headers={"x-puppetllm-has-more": "1" if has_more else "0",
+                                 "x-puppetllm-next-cursor": str(next_cursor)})
+    return {"turn_count": turn_count, "history": page, "count": len(page),
+            "has_more": has_more, "next_cursor": next_cursor}
 
 
-@app.get("/_control/stats")
+@app.get("/_control/history/{turn}")
+async def history_entry(turn: str) -> Any:
+    if not (turn.isascii() and turn.isdigit()):
+        return _plain_400("turn must be a positive integer")
+    async with state.lock:
+        for e in state.history:
+            if e.get("turn") == int(turn):
+                return e
+    return JSONResponse({"error": f"no history entry for turn {turn}"}, status_code=404)
+
+
+@app.get("/_control/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus text exposition: cumulative counters (requests, tokens, cost, cache
+    decisions, harness answers, rejections, cancellations; kept across /_control/clear)
+    and live gauges (pendings, turns, unconsumed rules, clock offset)."""
+    return Response(_obs.metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/_control/stats", response_model=None)  # client model ids key `by_model`: no pydantic pass, the response class escapes them
 async def stats() -> dict[str, Any]:
     """Aggregate cumulative estimated-cost, token, and cache summaries from history.
 
@@ -1966,7 +2377,8 @@ async def stats() -> dict[str, Any]:
         # too — otherwise savings would be overstated for batch traffic (the discount
         # factor is recorded on the entry's cost by _apply_batch_discount).
         savings_factor = float(cost.get("batch_discount", 1.0))
-        totals["cache_savings_usd"] += pricing.cache_savings_usd(model, read) * savings_factor
+        totals["cache_savings_usd"] += pricing.cache_savings_usd(
+            e.get("pricing_model") or model, read) * savings_factor
 
         cstatus = cache.get("status")
         if cstatus == "hit":
@@ -2743,6 +3155,15 @@ def _configure_from_env() -> None:
             load_config_file(env["PUPPETLLM_CONFIG"])
         except (OSError, ValueError) as e:
             print(f"[puppetllm] PUPPETLLM_CONFIG ignored: {e}", file=sys.stderr)
+    if env.get("PUPPETLLM_PRICING_FILE"):
+        try:
+            pricing.load_pricing_file(env["PUPPETLLM_PRICING_FILE"])
+        except (OSError, ValueError, TypeError) as e:
+            print(f"[puppetllm] PUPPETLLM_PRICING_FILE ignored: {e}", file=sys.stderr)
+    if _HISTORY_FILE:
+        err = _check_history_file(_HISTORY_FILE)
+        if err is not None:
+            print(f"[puppetllm] PUPPETLLM_HISTORY_FILE {_HISTORY_FILE}: {err}", file=sys.stderr)
 
 
 _configure_from_env()
@@ -2770,12 +3191,35 @@ def add_serve_arguments(parser: Any) -> None:
                         help='JSON file {"config": {...}, "rules": [...]} loaded at startup')
     parser.add_argument("--rules", default=None, metavar="FILE",
                         help="JSON file holding a rule list loaded at startup")
+    parser.add_argument("--log-format", choices=_obs.LOG_FORMATS, default=None,
+                        help="text (adapter receipt lines only, default) or json (one event "
+                             "per line: received / matched / resolved / rejected / canceled)")
+    parser.add_argument("--history-file", default=None, metavar="FILE",
+                        help="append every history entry to this JSONL file")
+    parser.add_argument("--pricing-file", default=None, metavar="FILE",
+                        help='JSON price table {"<model glob>": {"input", "output", ...}} '
+                             "($ per MTok) consulted before the built-in families")
 
 
 def serve(args: Any) -> int:
     """Run the server in-process with the parsed `serve` arguments."""
     import uvicorn
 
+    global _HISTORY_FILE
+    if args.log_format:
+        _obs.set_log_format(args.log_format)
+    if args.history_file:
+        err = _check_history_file(args.history_file)
+        if err is not None:
+            print(f"[puppetllm] error: --history-file: {err}", file=sys.stderr)
+            return 2
+        _HISTORY_FILE = args.history_file
+    if args.pricing_file:
+        try:
+            pricing.load_pricing_file(args.pricing_file)
+        except (OSError, ValueError, TypeError) as e:
+            print(f"[puppetllm] error: --pricing-file: {e}", file=sys.stderr)
+            return 2
     body: dict[str, Any] = {}
     if args.pending_timeout is not None:
         body["pending_timeout_s"] = args.pending_timeout

@@ -38,7 +38,8 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+from .._responses import SafeJSONResponse as JSONResponse
 
 from ..openai_wire import (image_url_to_canonical as _image_url_to_canonical,
                            openai_call_id as _openai_call_id,
@@ -475,16 +476,21 @@ def build_router() -> APIRouter:
 
         body, errmsg = await fs._parse_json_body(request)
         if errmsg is not None:
+            fs.note_rejected("openai", None, headers["x-request-id"], errmsg, path=request.url.path)
             return _openai_error_response(400, "invalid_request_error", errmsg,
                                           headers=headers)
         is_stream = bool(body.get("stream"))
         model = body.get("model")
         # Container shapes the normalizer iterates; the real API refuses these with 400.
         if not isinstance(body.get("messages"), list):
+            fs.note_rejected("openai", model, headers["x-request-id"], "messages: must be a list",
+                             path=request.url.path)
             return _openai_error_response(400, "invalid_request_error",
                                           "messages: must be a list", headers=headers,
                                           param="messages")
         if body.get("tools") is not None and not isinstance(body.get("tools"), list):
+            fs.note_rejected("openai", model, headers["x-request-id"], "tools: must be a list",
+                             path=request.url.path)
             return _openai_error_response(400, "invalid_request_error",
                                           "tools: must be a list", headers=headers, param="tools")
         canonical = normalize_chat_body(body)
@@ -496,7 +502,9 @@ def build_router() -> APIRouter:
         try:
             snapshot, fut = await fs.register_request(
                 "openai", model, canonical, is_stream, simulate_cache=False,
-                extra={"choices": n} if n > 1 else None)
+                extra={"choices": n} if n > 1 else None,
+                request_headers=request.headers, request_path=request.url.path,
+                request_id=headers["x-request-id"])
         except fs.RequestValidationError as e:
             return _openai_error_response(400, "invalid_request_error", str(e),
                                           headers=_finish_headers())

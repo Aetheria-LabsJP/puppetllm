@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "puppetllm"
 dynamic = ["version"]
-description = "Fake Anthropic Messages / Bedrock / OpenAI API server: human-in-the-loop debugging and scripted test harness"
+description = "Fake Anthropic Messages / Bedrock / OpenAI API server: human-in-the-loop debugging, scripted test harness, cross-provider relay and observability (history, JSON logs, Prometheus metrics, cache diagnostics)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-keywords = ["anthropic", "bedrock", "openai", "mock", "testing", "llm"]
+keywords = ["anthropic", "bedrock", "openai", "mock", "testing", "llm", "observability", "prometheus", "prompt-caching"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: FastAPI",

@@ -42,7 +42,8 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+from .._responses import SafeJSONResponse as JSONResponse
 
 from . import bedrock as _bedrock
 from . import eventstream
@@ -822,6 +823,7 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
     body, errmsg = await fs._parse_json_body(request)
     if errmsg is not None:
         _bedrock._log(f"{op} model={model.raw} rejected: {errmsg}")
+        fs.note_rejected("bedrock", model.canonical, req_id, errmsg, path=request.url.path)
         return _error(400, "ValidationException", errmsg, req_id)
     try:
         canonical = to_canonical(body, prompt_arn=is_prompt_arn(model_id))
@@ -830,9 +832,12 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
         snapshot, fut = await fs.register_request(
             "bedrock", model.canonical, canonical, is_stream=is_stream,
             extra={"bedrock_model_id": model.raw, "api": "converse", "converse": extras},
+            request_headers=request.headers, request_path=request.url.path, request_id=req_id,
         )
     except (ConverseValidationError, fs.RequestValidationError) as e:
         _bedrock._log(f"{op} model={model.raw} rejected: {e}")
+        if isinstance(e, ConverseValidationError):  # register_request counted its own
+            fs.note_rejected("bedrock", model.canonical, req_id, str(e), path=request.url.path)
         return _error(400, "ValidationException", str(e), req_id)
     mapped = f" -> {model.canonical}" if model.canonical != model.raw else ""
     _bedrock._log(f"{op} model={model.raw}{mapped} pending={snapshot['pending_id']} "

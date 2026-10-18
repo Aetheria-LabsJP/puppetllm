@@ -22,6 +22,7 @@ On a price change, only this table needs updating.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
 import re
@@ -192,12 +193,84 @@ _FAMILY_ORDER: tuple[str, ...] = (
 _O_SERIES = re.compile(r"^o\d")
 
 
+# The built-in Claude families (the entries of _FAMILY_ORDER ahead of the OpenAI ones).
+_ANTHROPIC_FAMILIES: frozenset[str] = frozenset(_FAMILY_ORDER[:_FAMILY_ORDER.index("codex")])
+
 def _family_matches(fam: str, m: str) -> bool:
     if _O_SERIES.match(fam):
         # "o1" / "o3" must not match inside e.g. "gpt-4o1..." — require a non-alphanumeric
         # (or string) boundary on both sides. "o3-mini" still matches "o3" (order handles it).
         return re.search(r"(?<![a-z0-9])" + re.escape(fam) + r"(?![a-z0-9])", m) is not None
     return fam in m
+
+
+# Custom prices (`PUPPETLLM_PRICING_FILE` / `serve --pricing-file`): (model glob, price),
+# consulted before the built-in families. The glob doubles as the family name in costs.
+_CUSTOM_PRICES: list[tuple[str, ModelPrice]] = []
+_PRICE_KEYS = ("input", "output", "cache_write", "cache_read", "cache_write_1h")
+# Keeps every cost finite: price × tokens × the derived 2x cache-write rate × the 2.2x
+# worst-case multipliers.
+MAX_PRICE_PER_MTOK = 1_000_000.0
+
+
+def load_pricing_file(path: str) -> int:
+    """`{"<model glob>": {"input": $/MTok, "output": $/MTok, "cache_write"?, "cache_read"?,
+    "cache_write_1h"?}, ...}`; unspecified cache rates follow the Anthropic ratios. Rates
+    are finite JSON numbers from 0 to 1,000,000 $/MTok, `cache_read` at most `input`,
+    no other keys. Globs are tried in file order (first match wins) against the whole
+    model id, case-insensitively. An empty object clears the custom table. Returns the
+    number of entries loaded."""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: expected an object of model glob -> prices")
+    loaded: list[tuple[str, ModelPrice]] = []
+    for glob, spec in doc.items():
+        if not isinstance(glob, str) or not glob or not isinstance(spec, dict):
+            raise ValueError(f"{path}: {glob!r}: expected an object with input / output")
+        if "input" not in spec or "output" not in spec:
+            raise ValueError(f"{path}: {glob!r}: input and output ($ per MTok) are required")
+        unknown = sorted(k for k in spec if k not in _PRICE_KEYS)
+        if unknown:
+            raise ValueError(f"{path}: {glob!r}: unknown key(s) {unknown}; allowed: {list(_PRICE_KEYS)}")
+
+        def rate(key: str, default: float | None) -> float:
+            v = spec.get(key)
+            if v is None:
+                if default is None:
+                    raise ValueError(f"{path}: {glob!r}: {key} must be a number ($ per MTok)")
+                return default + 0.0  # derived from a validated rate: in range by construction
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{path}: {glob!r}: {key} must be a number ($ per MTok)")
+            try:
+                x = float(v)
+            except (ValueError, OverflowError):
+                raise ValueError(f"{path}: {glob!r}: {key} must be a finite, non-negative number") from None
+            if not math.isfinite(x) or not 0 <= x <= MAX_PRICE_PER_MTOK:
+                raise ValueError(f"{path}: {glob!r}: {key} must be a number from 0 to "
+                                 f"{MAX_PRICE_PER_MTOK:g} ($ per MTok)")
+            return x + 0.0  # -0.0 → 0.0
+        inp, out = rate("input", None), rate("output", None)
+        price = ModelPrice(
+            input=inp, output=out,
+            cache_write=rate("cache_write", round(inp * 1.25, 6)),
+            cache_read=rate("cache_read", round(inp * 0.1, 6)),
+            cache_write_1h=rate("cache_write_1h", round(inp * 2.0, 6)))
+        if price.cache_read > price.input:
+            raise ValueError(f"{path}: {glob!r}: cache_read must not exceed input "
+                             f"(a cache read cannot cost more than the tokens it saves)")
+        loaded.append((glob, price))
+    _CUSTOM_PRICES[:] = loaded
+    return len(loaded)
+
+
+def custom_family(model: Any) -> str | None:
+    """The custom glob (from the pricing file) that prices this id, if any."""
+    m = str(model or "")
+    for glob, _price in _CUSTOM_PRICES:
+        if fnmatch.fnmatchcase(m, glob) or fnmatch.fnmatchcase(m.lower(), glob.lower()):
+            return glob
+    return None
 
 
 def resolve_family(model: Any) -> str:
@@ -207,6 +280,9 @@ def resolve_family(model: Any) -> str:
     model is assumed to be a str, but callers (register/usage computation) may pass through
     values from a malformed request, so non-str inputs are coerced with str() to avoid crashing.
     """
+    custom = custom_family(model)
+    if custom is not None:
+        return custom
     m = str(model or "").lower()
     for fam in _FAMILY_ORDER:
         if _family_matches(fam, m):
@@ -217,7 +293,38 @@ def resolve_family(model: Any) -> str:
 
 
 def price_for(model: str | None) -> ModelPrice:
+    """The price table for a model id: the first custom glob that matches it, else its
+    built-in family's."""
+    m = str(model or "")
+    for glob, price in _CUSTOM_PRICES:
+        if fnmatch.fnmatchcase(m, glob) or fnmatch.fnmatchcase(m.lower(), glob.lower()):
+            return price
     return _FAMILY_PRICES[resolve_family(model)]
+
+
+def is_fallback_family(model: Any) -> bool:
+    """True when nothing prices this id specifically: no custom glob and no built-in family
+    matched, so the default table (Sonnet, or gpt-5.4 for `gpt-*`) is used."""
+    if custom_family(model) is not None:
+        return False
+    m = str(model or "").lower()
+    return not any(_family_matches(fam, m) for fam in _FAMILY_ORDER)
+
+
+def anthropic_billing(model: Any, inbound_anthropic: bool = False) -> bool:
+    """Whether the fast-mode and US-inference multipliers apply to this id: a built-in
+    Claude family, or an id that names Claude but matches no family; never a custom
+    table, never an OpenAI family. An unrelated id priced by the default table counts
+    only when `inbound_anthropic` says it arrived on an Anthropic-shaped route (a made-up
+    id against the fake), not when a relay prices by an upstream nothing matches."""
+    if custom_family(model) is not None:
+        return False
+    m = str(model or "").lower()
+    if any(_family_matches(fam, m) for fam in _ANTHROPIC_FAMILIES):
+        return True
+    if not is_fallback_family(model):
+        return False
+    return inbound_anthropic or "claude" in m or "anthropic" in m
 
 
 def approx_tokens(value: Any) -> int:
@@ -259,6 +366,7 @@ def compute_cost(
     cache_write_1h_tokens: int = 0,
     inference_geo: str | None = None,
     speed: str | None = None,
+    inbound_anthropic: bool = False,
     web_search_requests: int = 0,
 ) -> dict[str, Any]:
     """Return the estimated cost in USD. Each breakdown + total + resolved family + is_estimate.
@@ -270,9 +378,14 @@ def compute_cost(
     official 1.1x multiplier to every token category; `speed="fast"` (fast mode) applies 2x.
     """
     fam = resolve_family(model)
-    p = _FAMILY_PRICES[fam]
-    geo_mult = US_INFERENCE_MULTIPLIER if inference_geo == "us" else 1.0
-    speed_mult = FAST_MODE_MULTIPLIER if speed == "fast" else 1.0
+    p = price_for(model)
+    # Fast mode and US-only inference are Anthropic billing modifiers: they apply to the
+    # Claude tables only, never to an OpenAI family, a custom table or the default table
+    # an unrelated id falls back to (a relay pricing by its upstream must not inherit the
+    # inbound request's `speed`).
+    anthropic = anthropic_billing(model, inbound_anthropic)
+    geo_mult = US_INFERENCE_MULTIPLIER if (anthropic and inference_geo == "us") else 1.0
+    speed_mult = FAST_MODE_MULTIPLIER if (anthropic and speed == "fast") else 1.0
     per_mtok = 1_000_000.0 / (geo_mult * speed_mult)
     input_cost = input_tokens * p.input / per_mtok
     output_cost = output_tokens * p.output / per_mtok

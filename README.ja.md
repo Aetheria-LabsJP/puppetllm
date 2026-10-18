@@ -315,6 +315,15 @@ curl -s localhost:8765/_control/cache | jq
 
 # 1 リクエストずつの (request, response, usage, cost, cache) 履歴
 curl -s localhost:8765/_control/history | jq '.history[-1]'
+# 絞り込みとページング: turn 40 以降、プロバイダ指定、モデルの glob、20 件ずつ
+curl -s 'localhost:8765/_control/history?since_turn=40&provider=anthropic&model=claude-*&limit=20' | jq
+curl -s 'localhost:8765/_control/history?limit=20&cursor=60' | jq '.next_cursor, .has_more'
+curl -s 'localhost:8765/_control/history?format=jsonl' > history.jsonl   # 1 行 1 エントリ
+curl -s localhost:8765/_control/history/12 | jq                            # 1 ターン分
+# 軽いポーリング: pending ごとの短い要約（会話本文なし）
+curl -s 'localhost:8765/_control/pending?summary=1' | jq '.pending[].request'
+# Prometheus のカウンタとゲージ
+curl -s localhost:8765/_control/metrics
 
 # テスト間のクリーンアップ (pending / history / cache を全消去)
 curl -s -X POST localhost:8765/_control/clear
@@ -334,6 +343,12 @@ curl -s -X POST localhost:8765/_control/clear
 - **usage の形**: 2026 年の usage オブジェクト（`cache_creation`、`output_tokens_details.thinking_tokens`、`server_tool_use`、`service_tier`（`standard` / `batch`）、`inference_geo`、fast mode 要求時は `speed`）を返し、ストリームの `message_delta.usage` には実 API と同様に累積の input / cache 各値も載る。
 
 料金は公式の世代別表に従う（例: Opus 5 $5/$25、Sonnet 5 $2/$10、Sonnet 4.6 $3/$15、Haiku 4.5 $1/$5、Fable 5.1 $10/$50・cache read $0.25、Opus 4.1 $15/$75）。未知の Claude ID は Sonnet 4.x 価格、未知の `gpt-*` は gpt-5.4 価格にフォールバックする。
+
+history の各エントリには、そのやり取りの相関情報と来歴が入る: `seq`（完了順の記録番号。history のカーソル）、`request_id`（応答ヘッダに載せた id。`request-id` / `x-amzn-requestid` / `x-request-id`。batch のエントリでは null で、代わりに `batch_id` / `custom_id` や `job_id` / `record_id` を持つ）、`path`、`latency_ms`（到着から応答までをサーバの時計で）、`usage_source`（概算トークナイザなら `estimate`、responder が実数を渡したなら `override`、エラーなら null）、`pricing_model`（コスト計算に使った料金表のモデル）、relay が答えた場合は `provenance`（`upstream_provider`、`upstream_model`、`translation.dropped_fields`）。snapshot にはリクエストヘッダの allow-list — `user-agent`、`anthropic-version`、OpenAI の organization / project id、W3C / B3 / ベンダの trace id（`traceparent`、`x-cloud-trace-context`、`x-datadog-trace-id`、`sentry-trace` など。key=value の列を運ぶ `tracestate` と `baggage` は除く）、`x-request-id` などの一般的な request id、botocore の `amz-sdk-invocation-id`、`x-stainless-*` — だけが残り、それ以外は残らない（クレデンシャル、セッション、クライアントのアドレスは history に入らない）。`cache` は hit でなかった理由を説明する: `reason` は `no_cache_control`、`below_minimum`（`minimum_tokens` と、最も深いマーカーまでのサイズ `eligible_prefix_tokens` 付き）、`first_seen`、`prefix_changed`（比較対象と `first_changed_path` から先が違う — `system[0]` や `tools[1]` のような静的プレフィックスの変更、または `messages[3].content[1]` のようなターンの編集。`matched_through` = 先頭から変わっていなかったセグメント数。同じモデルの直前のリクエストと tools / system がそのまま共通でそこから先が別の会話は `first_seen`）、`parameters_changed`（内容は同じで、プロンプトに描画されるパラメータ `params.speed` や `params.thinking` などが違う）、`ttl_expired`、`lookback`、疑似キャッシュが見なかったリクエストなら `disabled` / `throttled`。リクエストが `diagnostics` オブジェクト（cache-diagnosis beta のリクエストの形）を送っていれば、同じ説明を Message の `diagnostics.cache_miss_reason`（加えて `cache_status`、`matched_through`、`first_changed_path`、`minimum_tokens`、`eligible_prefix_tokens`。本物の beta ではなく puppetllm 独自のフィールド）として非ストリームの本文と `message_start` に返す（Anthropic 経路と Bedrock の Mantle エイリアス）。比較対象は、`diagnostics.previous_message_id` がこのサーバの答えた message なら その message のリクエスト、そうでなければ同じモデルの直前のリクエスト。
+
+`PUPPETLLM_HISTORY_FILE`（または `serve --history-file`）は記録のたびにエントリを JSONL ファイルへ追記する（ローカルファイルへの同期 append で history と同じ順。パスは起動時に確認 — `--history-file` は使えないパスを拒否し、環境変数は警告のみ — し、書き込みエラーは 1 回だけ報告してリクエストは失敗させない。JSON としては正しいが UTF-8 にならないクライアントのテキスト — lone surrogate など — はここでも全ての JSON 応答でもエスケープして、失敗させない）— `/_control/clear` に消されない永続ログ。メトリクスと同様に追記のみなので、ロールバックされた batch create の先行した応答も残る。`--log-format json`（または `PUPPETLLM_LOG_FORMAT=json`）にすると stderr がライフサイクルイベント 1 件 1 行の JSON になる — `received`、`matched`（ルール / レートリミット / 既定ポリシー / unmatched エラー / タイムアウト）、`resolved`（結果、レイテンシ、コスト）、`rejected`（リクエスト経路で pending になる前に返した 400。`count_tokens` と batch のエンベロープ検査は数えない）、`canceled`（clear、切断、ハンドラのキャンセル、batch の cancel / expire / stop やロールバック、応答をエンコードできなかった内部エラー）— `pending_id`、`request_id`、batch の id で相関できる。既定の `text` はアダプタの受付行だけを出す。`GET /_control/metrics` は Prometheus のテキスト形式: `/_control/clear` を跨いで積み上がるカウンタ（`puppetllm_requests_total{provider,outcome}`、`puppetllm_tokens_total{provider,kind}`、`puppetllm_cost_usd_total{provider}`、`puppetllm_cache_lookups_total{status}`、`puppetllm_harness_answers_total{source}`、`puppetllm_rejected_total{provider}`、`puppetllm_canceled_total{reason}`、`puppetllm_latency_seconds_total{provider}` — レイテンシは `latency_ms` と同じくサーバの時計基準なので、待機中の `/_control/clock/advance` も加算される）と、現在値のゲージ（`puppetllm_pending`、`puppetllm_turns`、`puppetllm_rules_unconsumed`、`puppetllm_clock_offset_seconds`）。
+
+料金は内蔵のファミリ表から引く。`PUPPETLLM_PRICING_FILE`（または `serve --pricing-file`）で独自の表を足せる — `{"<モデルの glob>": {"input": 0.5, "output": 2.0, "cache_write"?, "cache_read"?, "cache_write_1h"?}}`（100 万トークンあたりのドル）。内蔵ファミリより先に照合され、glob がコストの `model_family` になる。glob はファイルの順に、ID 全体に対して大文字小文字を無視して照合する（Bedrock / Vertex の ID は `*claude-*` で拾う）。料金は 1,000,000 までの JSON の数値で、`cache_read` は `input` 以下、他のキーは不可。空のオブジェクトは表を消す。fast mode と US 推論の倍率は Claude の ID（内蔵の Claude 表、Claude を名乗る未知の ID、Anthropic 形式の経路に来た架空の ID）にだけ掛かり、独自の表、OpenAI のファミリ、relay が上流基準で計算する一致なしのモデルには掛からない。どの表にも一致しない `pricing_model` は、未知の受信側 ID と同じく既定ファミリ（Sonnet、`gpt-*` なら gpt-5.4）で計算される。
 
 ### 6. Message Batches API
 
@@ -583,7 +598,7 @@ with serve() as puppet:                       # 起動済みサーバには Pupp
     puppet.assert_no_pending()
 ```
 
-`Puppet` は対話用の操作（`wait_pending`、`respond`、`error`、`pending`、`history`、`stats`、`cache`、`config`、`advance_clock`、`clear`。`clear(config=True)` は設定も既定に戻し、`reset(baseline)` は保存した `baseline()` — 設定とルール — を再適用する）も持つ。`pip install .` すると pytest の `puppet` フィクスチャ（セッションに 1 サーバ。テストの前後で状態を消し、設定とルールはサーバ起動時のものに戻す — `PUPPETLLM_*` の設定や `--config` のルールは生きたまま、あるテストの `puppet.config(...)` や `puppet.expect(...)` が次のテストに漏れない。`PUPPETLLM_URL` で外部サーバに向けられる）が自動登録される。`pip install ".[test]"` で SDK も入る。起動時の台本はファイル — `puppetllm serve --config scenario.json`（`{"config": {...}, "rules": [...]}`）— でも、Docker 向けには環境変数（[環境変数](#環境変数)参照）でも渡せる。
+`Puppet` は対話用の操作（`wait_pending`、`respond`、`error`、`pending`（`summary=` / `fields=`）、`history`（フィルタ。カーソル付きの envelope は `history_page`、1 件は `history_entry`）、`metrics`、`stats`、`cache`、`config`、`advance_clock`、`clear`。`clear(config=True)` は設定も既定に戻し、`reset(baseline)` は保存した `baseline()` — 設定とルール — を再適用する）も持つ。`pip install .` すると pytest の `puppet` フィクスチャ（セッションに 1 サーバ。テストの前後で状態を消し、設定とルールはサーバ起動時のものに戻す — `PUPPETLLM_*` の設定や `--config` のルールは生きたまま、あるテストの `puppet.config(...)` や `puppet.expect(...)` が次のテストに漏れない。`PUPPETLLM_URL` で外部サーバに向けられる）が自動登録される。`pip install ".[test]"` で SDK も入る。起動時の台本はファイル — `puppetllm serve --config scenario.json`（`{"config": {...}, "rules": [...]}`）— でも、Docker 向けには環境変数（[環境変数](#環境変数)参照）でも渡せる。
 
 ---
 
@@ -608,13 +623,15 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 
 - `--kind openai`（既定）は **OpenAI 互換の任意エンドポイント**に対応 — OpenAI / xAI Grok / Groq / Ollama / OpenRouter など、`--target` に base URL を向けるだけ。`--kind anthropic` は本家 Anthropic API。
 - リクエストは canonical（system / messages / tools（`strict` と OpenAI の `custom` ツール込み）/ tool_choice / stop / temperature / seed / verbosity / prompt_cache_key / metadata 等。画像ブロック ↔ `image_url` パートは双方向に変換）から変換され、レスポンスは canonical blocks として戻る — 上流の実 signature 付き `thinking` ブロック、OpenAI の `refusal` はテキスト + `stop_reason: "refusal"` — **実の `stop_reason` / `stop_details` と実トークン usage** 込み（`/_control/respond` の `stop_reason` / `stop_details` / `usage` フィールドを使用。usage は `cache_creation` / `output_tokens_details` / `service_tier` のオブジェクトごと透過）。`/_control/stats` は実数値を集計する（history エントリに `"usage_overridden": true`）。上流が usage を返さない場合は puppetllm の概算を維持する。
-- 実 Anthropic 上流へは、OpenAI 形式で入った `response_format: json_schema` を `output_config.format` に、`reasoning_effort` を `output_config.effort`（`none` / `minimal` → `low`）に変換する。Anthropic 形式で入った `thinking` / `output_config` / `cache_control` / `inference_geo` / `speed` はそのまま転送し、アプリの `anthropic-beta` ヘッダ（`params.anthropic_beta` として捕捉）も Anthropic 上流へ再送するので、ベータ機能（fast mode、compaction など）が relay 越しでも動く。ベンダー固有の語彙は転送せず変換する: `service_tier`（`standard_only` ↔ `default`、`flex` / `priority` → `auto`）、Anthropic の `effort: max` → OpenAI の `reasoning_effort: xhigh`。`n` は転送しない（relay は 1 choice しか使わず、余分なサンプルは課金されるだけ）。puppetllm 内部の canonical キー（`_openai_custom`、`_openai_detail`）はどの wire にも出ない。変換できないパラメータは 1 回だけ警告して落とす。
+- 実 Anthropic 上流へは、OpenAI 形式で入った `response_format: json_schema` を `output_config.format` に、`reasoning_effort` を `output_config.effort`（`none` / `minimal` → `low`）に、`parallel_tool_calls: false` を `tool_choice.disable_parallel_tool_use` に、`user` を `metadata.user_id` に変換する。Anthropic 形式で入った `thinking` / `output_config` / `cache_control` / `inference_geo` / `speed` / `mcp_servers` / `fallbacks` はそのまま転送し、アプリの `anthropic-beta` ヘッダ（`params.anthropic_beta` として捕捉）も Anthropic 上流へ再送するので、ベータ機能（fast mode、compaction など）が relay 越しでも動く。ベンダー固有の語彙は転送せず変換する: `service_tier`（`standard_only` ↔ `default`、`flex` / `priority` → `auto`）、Anthropic の `effort: max` → OpenAI の `reasoning_effort: xhigh`。`n` は転送しない（relay は 1 choice しか使わず、余分なサンプルは課金されるだけ）。puppetllm 内部の canonical キー（`_openai_custom`、`_openai_detail`）はどの wire にも出ない。変換できないパラメータは 1 回だけ警告して落とす。
 - `--max-tokens-param` の既定は `auto`: ターゲット URL のホスト名が正確に `api.openai.com` なら `max_completion_tokens`（そこでは `max_tokens` は非推奨で reasoning 系モデルに拒否される）、他の OpenAI 互換バックエンドには `max_tokens`。バックエンドが合わない場合は明示指定する。
 - 上流 API のエラーは status/type/message（および `code`/`param`）ごと中継されるので、アプリの SDK は実プロバイダ相手と同じ例外クラスを送出する。
 - relay は*あくまで responder の一種*。**既定では見えた pending を全て掴む**ため、人間 / AI エージェント responder とはライブなキューを共有しない（切替は逐次的: relay を止めて手動に引き継ぐ）。**並行**させたい場合は `--only "<glob>,…"` を使い、マッチする inbound モデルだけを掴ませて残りを人間（や別エージェント）に委ねる。
+- relay が答えた応答も、上流モデルを解決した後に relay が返した失敗も `provenance`（`upstream_provider`、解決できていれば `upstream_model`、上流が usage を返したなら `usage_source: upstream` それ以外は `estimate`、`translation.dropped_fields`）を history に残す。コントロールプレーンが relay のペイロードを拒否したときに送る 502 のフォールバックも、拒否された原因が provenance 自体でなければ provenance を保つ。`--price-by upstream` なら記録するコストを受信側 ID ではなく上流モデルの料金表で計算する（エントリの `pricing_model` がどちらかを示す。上流モデルに一致する内蔵の表がなければ relay が 1 回警告する — サーバの `--pricing-file` で足す）。`--strict-translation` は、上流向けに翻訳できないものがあるリクエストを、警告付きで落とす代わりに拒否する（アプリには 400、上流には送らない）: パラメータ（`speed`、`top_k`、`thinking`、`container`、`verbosity`、`n > 1`、未知の `service_tier` など）と、relay がプレースホルダに置き換えてしまう内容（`document` ブロック、未対応の画像ソース、OpenAI の `input_audio` / `file` パート、Anthropic のサーバサイドツール、相手の API にない形の `tool_choice`、`metadata.user_id` の上限を超える `user`）。既定を頼むだけの値（`frequency_penalty: 0`、`logprobs: false`、`logit_bias: {}`、`thinking` がそのモデルの既定モードで budget なし、`verbosity: medium` など）と、答えを変えないパラメータ（`cache_control`、`user_id` 以外の `metadata`、`anthropic_beta`、`diagnostics`、`store`、`prompt_cache_key`、`safety_identifier`、`stream_options`）は数えない。`--dry-run` は上流リクエストを翻訳してログに出す（長い文字列は切る）だけで送らない（アプリには 400）。
+- Anthropic 側から来た `output_config.format`（`json_schema`）は OpenAI の `response_format` に翻訳する（スキーマと名前。`strict` は付けない — Anthropic のスキーマは OpenAI の strict の規則を満たすとは限らない）。Anthropic 向けの `response_format` → `output_config` の逆方向。
 - `--max-concurrency N` で同時 in-flight な上流呼び出し数を上限化（既定: 無制限）。pending がバーストしても一気にファンアウトして上流のレート制限を踏まない。
 
-注意: 上流呼び出しは非ストリーミングのため、ストリーミングアプリの SSE は正しく動くが最初のトークンまでの遅延が上流の完全応答時間になる。音声 / ファイルパートと `document` ブロックは未変換（画像は変換する）。このモードは**実課金**が発生する。`/_control/stats` の料金換算は*受信側* model id 基準なので、上流モデルの実際の価格とはずれうる。
+注意: 上流呼び出しは非ストリーミングのため、ストリーミングアプリの SSE は正しく動くが最初のトークンまでの遅延が上流の完全応答時間になる。音声 / ファイルパートと `document` ブロックは未変換（画像は変換する）。このモードは**実課金**が発生する。既定では記録するコスト（したがって `/_control/stats`）は*受信側* model id 基準なので、上流モデルの実際の価格とはずれうる — `--price-by upstream` で上流モデルの表に切り替えられる。
 
 ---
 
@@ -623,9 +640,9 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | Method | Path | 説明 |
 |---|---|---|
 | GET  | `/_control/health` | ヘルスチェック（`{"ok","turn_count"}`） |
-| GET  | `/_control/pending` | 保留中リクエスト一覧（`pending[]` + provider 込み、最古は `request` にも。pending タイムアウト設定時は `deadline` / `timeout_in_seconds` も） |
+| GET  | `/_control/pending` | 保留中リクエスト一覧（`pending[]` + provider 込み、最古は `request` にも。pending タイムアウト設定時は `deadline` / `timeout_in_seconds` も）。`?summary=1` で各 `request` を短い要約（turn、model、`message_count`、`tools`、`last_user_text`、`has_tool_result`、各種 id）に、`?fields=model,turn` で指定した snapshot キーだけに絞る |
 | GET  | `/_control/wait_for_pending?timeout=N` | 次の pending を long-poll で待つ（既定 270s / 上限 600s。なければ `{"timeout":true}`） |
-| POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}`、または text ブロック 1 つの短縮形 `{"text": "..."}`）を注入。`{"responses": [<対象付きのボディ>, ...]}` で複数を一括注入（全件を検証・解決してから適用。その間に消えた対象があれば項目ごとの `results` 付きの 409）。`content` のブロックは `text` / `tool_use` / `thinking` / `redacted_thinking` とサーバー側ツールのブロック（§3）。他の型は捨てて報告（`dropped`）、`strict_blocks` なら拒否。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`"refusal"` なら `stop_details` を生成（`stop_details` で `category` / `explanation` を指定可。`recommended_model` などの追加フィールドは素通し）し、OpenAI 経路では OpenAI の refusal 形式（`message.refusal` / `delta.refusal`、`content: null`、`finish_reason: "stop"`）になる。`"stop_sequence"` なら `stop_sequence` を埋める。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int。加えて `cache_creation` / `output_tokens_details` / `server_tool_use` のオブジェクトと `service_tier` / `inference_geo` / `speed` の文字列も任意 — relay モードが使用） |
+| POST | `/_control/respond` | 保留中リクエストに応答（`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?, "provenance"?}`、または text ブロック 1 つの短縮形 `{"text": "..."}`）を注入。`{"responses": [<対象付きのボディ>, ...]}` で複数を一括注入（全件を検証・解決してから適用。その間に消えた対象があれば項目ごとの `results` 付きの 409）。`content` のブロックは `text` / `tool_use` / `thinking` / `redacted_thinking` とサーバー側ツールのブロック（§3）。他の型は捨てて報告（`dropped`）、`strict_blocks` なら拒否。`stop_reason` で自動判定を上書き（例 `"max_tokens"` — 打ち切り分岐のテスト用。OpenAI 経路では `finish_reason: "length"` に変換）。`"refusal"` なら `stop_details` を生成（`stop_details` で `category` / `explanation` を指定可。`recommended_model` などの追加フィールドは素通し）し、OpenAI 経路では OpenAI の refusal 形式（`message.refusal` / `delta.refusal`、`content: null`、`finish_reason: "stop"`）になる。`"stop_sequence"` なら `stop_sequence` を埋める。`usage` で概算トークンを実数値に上書き（`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` の非空サブセット、`[0, 1e12]` の int。加えて `cache_creation` / `output_tokens_details` / `server_tool_use` のオブジェクトと `service_tier` / `inference_geo` / `speed` の文字列も任意 — relay モードが使用。`provenance`（`{upstream_provider, upstream_model, usage_source, pricing_model, translation.dropped_fields}`、§5）はエントリに記録され、その `pricing_model` が料金表を選ぶ） |
 | POST | `/_control/respond_all` | 同じ `respond` ボディ（対象指定なし）を生きている pending すべて（バッチのエントリ含む）に注入 — 並列ファンアウトを 1 回で答える（`{"ok", "count", "pending_ids"}`。pending がなければ 400） |
 | POST | `/_control/auto` | `{"text": "..."}` を受ける `/_control/respond` の非推奨エイリアス（対象指定は同じ）。引き続き動く |
 | GET  | `/_control/capabilities` | 互換性マトリクス（[互換性マトリクス](#互換性マトリクス)参照）: 各 surface の accepted / injectable / streamed / relayed、content ブロック型ごとの経路での扱い、意図的に未実装の操作 |
@@ -633,8 +650,10 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 | GET / PUT / POST / DELETE | `/_control/rules` | シナリオルール（§8）: カウンタ付き一覧（`unconsumed`、`all_consumed`）、置換、追加、全削除。`PUT` / `DELETE /_control/rules/{id}` は 1 件を操作（同じ match のまま step を末尾に足すだけの `PUT` は消費カウンタを引き継ぐ） |
 | GET | `/_control/clock` | 擬似クロック（`now`、`clock_offset_seconds`） |
 | POST | `/_control/clock/advance` | `{"seconds": N}` — 擬似クロックを進める（キャッシュ TTL、レートリミット窓、pending の期限） |
-| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"? / "after_blocks"?, "content"?}` — 後ろ 2 つはストリーミングを途中で失敗させる。§4 参照）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等） |
-| GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴 |
+| POST | `/_control/error` | HTTP エラー応答を注入（`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"? / "after_blocks"?, "content"?, "provenance"?}` — 後ろ 2 つはストリーミングを途中で失敗させる。§4 参照）。`headers`（文字列 → 文字列/数値）はエラー応答にそのまま付与される — 429 の `{"retry-after": 3}` や `anthropic-ratelimit-*` / `x-ratelimit-*` など、アプリのバックオフ処理の検証用（`content-length` / `transfer-encoding` などのフレーミング系ヘッダ、制御文字、非 Latin-1 の値は 400 で拒否）。Anthropic 経路のエラーボディには（Batches も含め）`request-id` ヘッダと一致する `request_id` が入り、OpenAI 経路は Anthropic 語彙の `type` を自分の語彙に変換する（`api_error` → status に応じて `server_error` 等）。`provenance` は respond と同じく記録される |
+| GET  | `/_control/history` | (request, response, usage, cost, cache) 履歴（完了順）。クエリ: `cursor`（その `seq` より後に記録されたもの）、`since_turn`（その turn より後）、`provider`、`model`（glob）、`limit`（1〜1000。応答に `has_more` と `next_cursor` — 続きを取る `seq`、新しい記録がなければ渡した cursor がそのまま返る。並列リクエストが turn 順と違う順で完了してもページングと tail で取りこぼさない）、`format=jsonl`（1 行 1 エントリ。`has_more` / `next_cursor` は応答ヘッダ `x-puppetllm-has-more` / `x-puppetllm-next-cursor` に移る）。エントリには `seq`、`request_id`、`path`、`latency_ms`、`usage_source`、`pricing_model`、`provenance`（§5） |
+| GET  | `/_control/history/{turn}` | 1 エントリ（未知なら 404、整数でなければ 400） |
+| GET  | `/_control/metrics` | Prometheus テキスト: 累積カウンタ（`clear` を跨いで保持）と現在値のゲージ（§5） |
 | GET  | `/_control/stats` | コスト目安・トークン・キャッシュの累計サマリ |
 | GET  | `/_control/cache` | 擬似プロンプトキャッシュ index |
 | POST | `/_control/clear` | pending / history / cache / batches / Bedrock バッチジョブ / ルール / レートリミット窓 / クロックのオフセットを空に — ボディ `{"config": true}` なら設定も既定に戻す（in-flight はリトライ可能なエラーで解放: Anthropic 経路は 529 `overloaded_error`、Bedrock / OpenAI は 503、作成中の Bedrock バッチジョブはリトライ不能な 400 `ConflictException`。S3 ストアには触れない） |
@@ -647,7 +666,7 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 
 ボディを取る `/_control/*` エンドポイントのリクエストボディは型付き（`puppetllm/control_models.py`）で、`/openapi.json` の `components.schemas` に載る（`/docs` でも見える）ので、スキーマからクライアントを生成できる。`/_control/respond`（とルールの step）は `{"text": "..."}` を text ブロック 1 つの短縮形として受け付け、空の `content` が並んでいても有効。未設定の任意フィールドを `null` で送っても未指定として扱う。ただし `/_control/config` だけは `null` を「既定値に戻す」と解釈するので、未設定フィールドは省いて送ること。
 
-以前のバージョンから変わった観測可能な挙動（旧値を前提にしたアプリやテストハーネスは更新が必要）: 処理中に clear されたリクエストは Anthropic / Bedrock-Messages 経路で `529 overloaded_error`（旧 `503 api_error`）。OpenAI 経路のエラー `type` は OpenAI 語彙（`server_error`、`service_unavailable_error` 等。旧 `api_error` / `service_unavailable`）。canonical の `refusal` は OpenAI の `message.refusal` + `finish_reason: "stop"` になる（旧 `finish_reason: "content_filter"`。フィルタ形式が欲しければ `stop_reason` に `"content_filter"` を渡す）。Bedrock の pending / 応答は正規化した Anthropic モデル名を持つ。`thinking` ブロックは捨てずに保持する。OpenAI の usage は `n` 個の choice すべてを計上し（応答・history・stats で一致。該当する pending の snapshot には `choices` フィールドが載る）、明示された `service_tier` を返す。`inference_geo: "us"` のリクエストには公式の 1.1 倍を課金に適用する。`/_control/auto` は `text` が文字列であることを要求する（他のキーは従来どおり無視）。また全リクエスト経路で、形の崩れた `messages` / `system` / `tools` は後段で失敗する代わりに 400 で拒否する。`/_control/respond` / `auto` / `error` は、注入したブロック型を捨てた場合に素の `{"ok": true}` ではなく `{"ok": true, "dropped": [...]}` を返す。サーバー側ツールのブロックは捨てずに保持する。`/v1`、`/anthropic`、`/model`、`/guardrail`、`/async-invoke`、`/chat` 配下の未実装パスは S3 のエラーではなくプロバイダ形式の 404 を返す。そのため `chat`、`models`、`guardrail`、`async-invoke` は S3 のバケット名として使えなくなった。実在パスへの誤ったメソッドは 405 で、`Allow` には実際に提供するメソッドだけを載せる（`HEAD` は含まない）。
+以前のバージョンから変わった観測可能な挙動（旧値を前提にしたアプリやテストハーネスは更新が必要）: fast mode と US 推論のコスト倍率は Claude の ID にだけ掛かる（OpenAI のファミリ、独自の料金表、relay が上流基準で計算するモデルには掛からない。Anthropic 形式の経路に来た架空の ID には掛かる）。処理中に clear されたリクエストは Anthropic / Bedrock-Messages 経路で `529 overloaded_error`（旧 `503 api_error`）。OpenAI 経路のエラー `type` は OpenAI 語彙（`server_error`、`service_unavailable_error` 等。旧 `api_error` / `service_unavailable`）。canonical の `refusal` は OpenAI の `message.refusal` + `finish_reason: "stop"` になる（旧 `finish_reason: "content_filter"`。フィルタ形式が欲しければ `stop_reason` に `"content_filter"` を渡す）。Bedrock の pending / 応答は正規化した Anthropic モデル名を持つ。`thinking` ブロックは捨てずに保持する。OpenAI の usage は `n` 個の choice すべてを計上し（応答・history・stats で一致。該当する pending の snapshot には `choices` フィールドが載る）、明示された `service_tier` を返す。`inference_geo: "us"` のリクエストには公式の 1.1 倍を課金に適用する。`/_control/auto` は `text` が文字列であることを要求する（他のキーは従来どおり無視）。また全リクエスト経路で、形の崩れた `messages` / `system` / `tools` は後段で失敗する代わりに 400 で拒否する。`/_control/respond` / `auto` / `error` は、注入したブロック型を捨てた場合に素の `{"ok": true}` ではなく `{"ok": true, "dropped": [...]}` を返す。サーバー側ツールのブロックは捨てずに保持する。`/v1`、`/anthropic`、`/model`、`/guardrail`、`/async-invoke`、`/chat` 配下の未実装パスは S3 のエラーではなくプロバイダ形式の 404 を返す。そのため `chat`、`models`、`guardrail`、`async-invoke` は S3 のバケット名として使えなくなった。実在パスへの誤ったメソッドは 405 で、`Allow` には実際に提供するメソッドだけを載せる（`HEAD` は含まない）。
 
 ### 並列リクエスト（multi-pending）
 
@@ -713,6 +732,9 @@ server は同時複数リクエストを保持できる。各 pending は一意�
 | `PUPPETLLM_SEED` | （なし） | レイテンシのジッタの seed |
 | `PUPPETLLM_CONFIG` | （なし） | 起動時に読む JSON ファイル `{"config": {...}, "rules": [...]}` |
 | `PUPPETLLM_URL` | （なし） | pytest の `puppet` フィクスチャを、起動する代わりに稼働中のサーバへ向ける |
+| `PUPPETLLM_HISTORY_FILE` | （なし） | history の各エントリをこの JSONL ファイルに追記（§5） |
+| `PUPPETLLM_LOG_FORMAT` | `text` | `json` で stderr を 1 行 1 イベントの JSON に（§5） |
+| `PUPPETLLM_PRICING_FILE` | （なし） | 内蔵ファミリより先に照合する JSON 料金表（§5） |
 
 ---
 
@@ -728,7 +750,8 @@ pip install -r requirements.txt
 python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
     puppetllm.tests.test_batches puppetllm.tests.test_conformance \
     puppetllm.tests.test_bedrock_extras puppetllm.tests.test_harness \
-    puppetllm.tests.test_compat puppetllm.tests.test_boto3_interop -v
+    puppetllm.tests.test_compat puppetllm.tests.test_observability \
+    puppetllm.tests.test_boto3_interop -v
 ```
 
 `puppetllm/tests/test_fake_server.py` は期待挙動の executable specification。`test_harness.py` は §8（ルール、ポリシー、タイムアウト、レイテンシ、レートリミット、クロック、`count_tokens` / `models`、CLI、インプロセス uvicorn に対する `puppetllm.testing`）を検証する。
@@ -752,6 +775,8 @@ puppetllm/
 │   ├── control_models.py   # /_control/* の型付きリクエストボディ（/openapi.json に載る）
 │   ├── capabilities.py     # 互換性マトリクス（/_control/capabilities）+ 未実装パスのキャッチオール
 │   ├── testing.py          # テスト側クライアント（Puppet、serve()） — pytest_plugin.py が `puppet` フィクスチャを追加
+│   ├── observability.py    # JSON ログイベント + Prometheus メトリクス（/_control/metrics）
+│   ├── _responses.py       # 全ルートが使う JSON 応答クラス（surrogate 安全）
 │   ├── batches.py          # Anthropic Message Batches 経路 + バッチ制御エンドポイント
 │   ├── cache_sim.py        # 擬似プロンプトキャッシュ
 │   ├── pricing.py          # 概算トークン + 料金

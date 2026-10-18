@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from ._responses import SafeJSONResponse as JSONResponse
 
 # Content block types a responder may inject and how each route carries them
 # (`bedrock_invoke` covers InvokeModel and the Mantle alias, which share the wire).

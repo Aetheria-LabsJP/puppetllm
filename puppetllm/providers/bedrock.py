@@ -41,7 +41,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+from .._responses import SafeJSONResponse as JSONResponse
 
 from . import eventstream
 
@@ -207,7 +208,7 @@ def exception_name_for(status: int, etype: str | None) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[bedrock] {msg}", file=sys.stderr, flush=True)
+    fs._obs.log_text("bedrock", msg)
 
 
 def _bedrock_error_response(status: int, etype: str | None, message: str,
@@ -306,6 +307,7 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
         options, errmsg = _invoke_options(request)
     if errmsg is not None:
         _log(f"{op} model={model.raw} rejected: {errmsg}")
+        fs.note_rejected("bedrock", model.canonical, req_id, errmsg, path=request.url.path)
         return _bedrock_error_response(400, "ValidationException", errmsg, request_id=req_id)
     if options.get("service_tier") and isinstance(body, dict):
         # Make the requested tier visible to the responder in the canonical vocabulary
@@ -317,6 +319,7 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
         snapshot, fut = await fs.register_request(
             "bedrock", model.canonical, body, is_stream=is_stream,
             extra={"bedrock_model_id": model.raw, "bedrock_options": options},
+            request_headers=request.headers, request_path=request.url.path, request_id=req_id,
         )
     except fs.RequestValidationError as e:
         _log(f"{op} model={model.raw} rejected: {e}")

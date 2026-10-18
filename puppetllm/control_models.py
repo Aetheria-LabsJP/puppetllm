@@ -44,6 +44,22 @@ class Latency(BaseModel):
     jitter_ms: int | None = Field(default=None, ge=0, le=600_000)
 
 
+class Translation(BaseModel):
+    """What the relay could not express for its upstream."""
+    model_config = ConfigDict(extra="forbid")
+    dropped_fields: list[str] | None = None
+
+
+class Provenance(BaseModel):
+    """What a relay knew about the upstream call, recorded with the history entry."""
+    model_config = ConfigDict(extra="forbid")
+    upstream_provider: str | None = None
+    upstream_model: str | None = None
+    usage_source: str | None = Field(default=None, description="e.g. upstream / estimate")
+    pricing_model: str | None = Field(default=None, description="price the cost with this model")
+    translation: Translation | None = None
+
+
 class Target(BaseModel):
     """Which pending an injection addresses (omit all when exactly one is pending)."""
     pending_id: str | None = None
@@ -58,6 +74,7 @@ class RespondBody(Target, Latency):
     stop_sequence: str | None = None
     stop_details: dict[str, Any] | None = None
     usage: Usage | None = None
+    provenance: Provenance | None = None
     responses: list[dict[str, Any]] | None = Field(
         default=None, description="bulk form: a list of respond bodies, each with its own target")
 
@@ -79,6 +96,7 @@ class ErrorBody(Target, Latency):
         "fail after this many complete content blocks")
     original_status: int | None = Field(default=None, ge=100, le=599)
     content: list[ContentBlock] = Field(default_factory=list)
+    provenance: Provenance | None = None
 
 
 class RuleMatch(BaseModel):

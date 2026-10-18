@@ -59,7 +59,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+from ._responses import SafeJSONResponse as JSONResponse
 
 # canonical core. WARNING: circular import (same constraint as providers/*):
 # fake_server imports this module at its end and calls build_router(). Here we hold
@@ -447,10 +448,11 @@ def build_router() -> APIRouter:
                 fs.validate_request_body(item["params"], item["params"].get("model"))
             except Exception as e:
                 _rollback_creation(batch)
-                return fs._anthropic_error(
-                    400, "invalid_request_error",
-                    f"requests[{i}].params could not be processed: "
-                    f"{type(e).__name__}: {str(e)[:200]}")
+                message = (f"requests[{i}].params could not be processed: "
+                           f"{type(e).__name__}: {str(e)[:200]}")
+                fs.note_rejected("anthropic", item["params"].get("model"), None, message,
+                                 path="/v1/messages/batches")
+                return fs._anthropic_error(400, "invalid_request_error", message)
         try:
             for i, item in enumerate(requests_in):
                 cid = item["custom_id"]
@@ -469,6 +471,7 @@ def build_router() -> APIRouter:
                     snapshot, fut = await fs.register_request(
                         "anthropic", params.get("model"), params, is_stream=False,
                         extra={"batch_id": batch_id, "custom_id": cid},
+                        request_path="/v1/messages/batches", count_rejection=False,
                     )
                 except Exception as e:
                     # Shallow validation deliberately lets malformed params through, so
@@ -476,10 +479,11 @@ def build_router() -> APIRouter:
                     # everything already registered — a failed create must leave no
                     # half-built batch and no ghost pendings.
                     _rollback_creation(batch)
-                    return fs._anthropic_error(
-                        400, "invalid_request_error",
-                        f"requests[{i}].params could not be processed: "
-                        f"{type(e).__name__}: {str(e)[:200]}")
+                    message = (f"requests[{i}].params could not be processed: "
+                               f"{type(e).__name__}: {str(e)[:200]}")
+                    fs.note_rejected("anthropic", item["params"].get("model"), None, message,
+                                     path="/v1/messages/batches")
+                    return fs._anthropic_error(400, "invalid_request_error", message)
                 # No await between register_request returning and these assignments, so
                 # a concurrent injection cannot observe the entry missing. The collector
                 # task is kept on the entry so _is_inflight can tell "outcome on its way"

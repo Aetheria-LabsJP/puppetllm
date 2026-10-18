@@ -60,7 +60,7 @@ from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape
 
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import JSONResponse
+from .._responses import SafeJSONResponse as JSONResponse
 
 _TMP_SEQ = itertools.count()
 # The HTTP handlers run their file I/O on the event-loop thread with no `await` in between,

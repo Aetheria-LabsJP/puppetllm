@@ -45,7 +45,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import JSONResponse
+from .._responses import SafeJSONResponse as JSONResponse
 
 from . import bedrock as _bedrock
 from . import converse as _converse
@@ -643,7 +643,8 @@ def build_router() -> APIRouter:
                             # AWS: "Prompt caching ... is not supported with the batch
                             # inference API", so a batch record never observes the cache.
                             "bedrock", model.canonical, canonical, is_stream=False,
-                            simulate_cache=False,
+                            simulate_cache=False, request_path="/model-invocation-job",
+                            count_rejection=False,  # an error record, not a refused request
                             extra={"job_arn": job["arn"], "job_id": job_id, "record_id": rid,
                                    "bedrock_model_id": model.raw, **extra})
                     except (_converse.ConverseValidationError, fs.RequestValidationError) as e:
@@ -672,8 +673,10 @@ def build_router() -> APIRouter:
                         pentry = fs.state.pending.get(snapshot["pending_id"])
                         if pentry is not None and not pentry["future"].done():
                             pentry["future"].set_result({"_batch_override": "stopped"})
-                        # No collector is spawned for it, so release the registry entry here.
+                        # No collector is spawned for it, so release the registry entry (and
+                        # emit its terminal event) here.
                         fs._discard_pending(snapshot)
+                        fs._canceled(snapshot, "batch stopped", label="batch")
                         entry["cancelled"] = True
                         job["entries"][rid] = entry
                         job["stopped_records"] += 1

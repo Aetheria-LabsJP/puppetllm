@@ -135,23 +135,26 @@ def _segments(system: Any, tools: Any, messages: Any) -> list[dict[str, Any]]:
     """
     segs: list[dict[str, Any]] = []
 
-    for tool in tools or []:
-        segs.append({"_kind": "tool", "role": None, "block": tool})
+    for i, tool in enumerate(tools or []):
+        segs.append({"_kind": "tool", "role": None, "block": tool, "_path": f"tools[{i}]"})
 
     if isinstance(system, list):
-        for b in system:
-            segs.append({"_kind": "system", "role": None, "block": b})
+        for i, b in enumerate(system):
+            segs.append({"_kind": "system", "role": None, "block": b, "_path": f"system[{i}]"})
     elif isinstance(system, str) and system:
-        segs.append({"_kind": "system", "role": None, "block": {"type": "text", "text": system}})
+        segs.append({"_kind": "system", "role": None, "block": {"type": "text", "text": system},
+                     "_path": "system"})
 
-    for msg in messages or []:
+    for i, msg in enumerate(messages or []):
         content = msg.get("content") if isinstance(msg, dict) else None
         role = msg.get("role") if isinstance(msg, dict) else None
         if isinstance(content, list):
-            for b in content:
-                segs.append({"_kind": "message", "role": role, "block": b})
+            for j, b in enumerate(content):
+                segs.append({"_kind": "message", "role": role, "block": b,
+                             "_path": f"messages[{i}].content[{j}]"})
         elif isinstance(content, str):
-            segs.append({"_kind": "message", "role": role, "block": {"type": "text", "text": content}})
+            segs.append({"_kind": "message", "role": role, "block": {"type": "text", "text": content},
+                         "_path": f"messages[{i}]"})
     return segs
 
 
@@ -168,13 +171,20 @@ def _strip_cc(seg: dict[str, Any]) -> dict[str, Any]:
     return {"_kind": seg.get("_kind"), "role": seg.get("role"), "block": b}
 
 
-def _hash_prefix(segs: list[dict[str, Any]], n: int, *salts: str | None) -> str:
-    stripped = [_strip_cc(s) for s in segs[:n]]
-    h = hashlib.sha256(json.dumps(stripped, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+def _segment_dump(seg: dict[str, Any]) -> str:
+    """The canonical JSON of one segment's content (what every hash is made of)."""
+    return json.dumps(_strip_cc(seg), ensure_ascii=False, sort_keys=True)
+
+
+def _hash_prefix(dumps: list[str], n: int, *salts: str | None) -> str:
+    """sha256 of the JSON array of the first `n` segment dumps (byte-identical to dumping the
+    list of stripped segments at once) plus the key salts. Lone surrogates in client text
+    are legal JSON, so the digest encodes them with `surrogatepass` instead of failing."""
+    h = hashlib.sha256(("[" + ", ".join(dumps[:n]) + "]").encode("utf-8", "surrogatepass"))
     for salt in salts:
         if salt:
             h.update(b"\x00")
-            h.update(salt.encode("utf-8"))
+            h.update(salt.encode("utf-8", "surrogatepass"))
     return h.hexdigest()
 
 
@@ -284,13 +294,21 @@ class RequestCache:
     _hash_memo: dict[int, str] = field(default_factory=dict, repr=False)
     _tokens_memo: dict[int, int] = field(default_factory=dict, repr=False)
     _positions_memo: list[int] | None = field(default=None, repr=False)
+    _dumps_memo: list[str] | None = field(default=None, repr=False)
+
+    def segment_dumps(self) -> list[str]:
+        """Each segment's canonical JSON, serialized once per request and shared by the
+        prefix hashes and the per-segment fingerprint."""
+        if self._dumps_memo is None:
+            self._dumps_memo = [_segment_dump(s) for s in self.segs]
+        return self._dumps_memo
 
     def prefix_hash(self, seg_count: int) -> str:
         h = self._hash_memo.get(seg_count)
         if h is None:
             sys_salt = self.sys_salt if seg_count > self.system_start else None
             salt = self.salt if seg_count > self.messages_start else None
-            h = self._hash_memo[seg_count] = _hash_prefix(self.segs, seg_count, sys_salt, salt)
+            h = self._hash_memo[seg_count] = _hash_prefix(self.segment_dumps(), seg_count, sys_salt, salt)
         return h
 
     def prefix_tokens(self, seg_count: int) -> int:
@@ -403,10 +421,57 @@ def extract_cache_prefix(
     )
 
 
-def _none_result(rc: RequestCache) -> dict[str, Any]:
+def _none_result(rc: RequestCache, min_tok: int, reason: str | None = None) -> dict[str, Any]:
+    """`status: none` with its explanation: no marker at all, every marked prefix below the
+    model's minimum cacheable size, or (`reason` given) a lookup that never happened —
+    `disabled` on routes without the pseudo cache, `throttled` for a rate-limited request.
+    `eligible_prefix_tokens` is always the size of the deepest marked prefix."""
+    eligible = rc.prefix_tokens(rc.breakpoints[-1] + 1) if rc.breakpoints else 0
     return {"status": "none", "cache_read_tokens": 0, "cache_creation_tokens": 0,
             "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
-            "prefix_hash": None, "read_seg_count": 0, "breakpoints": len(rc.breakpoints)}
+            "prefix_hash": None, "read_seg_count": 0, "breakpoints": len(rc.breakpoints),
+            "reason": reason or ("below_minimum" if rc.breakpoints else "no_cache_control"),
+            "minimum_tokens": min_tok, "eligible_prefix_tokens": eligible,
+            "matched_through": 0, "first_changed_path": None}
+
+
+# The request parameters a salt is made of, named the way a diagnosis reports them.
+_SALT_PARAM_PATHS = {"effort": "output_config.effort", "thinking": "thinking",
+                     "tool_choice": "tool_choice", "speed": "speed"}
+
+
+def _changed_salt_param(prev: Any, cur: str | None) -> str | None:
+    """The first parameter whose rendered value differs between two salts (`params.<name>`)."""
+    try:
+        a = json.loads(prev) if isinstance(prev, str) and prev else {}
+        b = json.loads(cur) if cur else {}
+    except (ValueError, TypeError):
+        return "params"
+    for k in sorted(set(a) | set(b)):
+        if a.get(k) != b.get(k):
+            return "params." + _SALT_PARAM_PATHS.get(k, k)
+    return None
+
+
+_SEG_DIGEST = 8  # bytes kept per segment: a 1,000-segment conversation fingerprints in 8 KB
+
+
+def _segment_hashes(dumps: list[str]) -> bytes:
+    """One truncated digest per segment (content only), packed into one bytes value, to
+    locate where two requests diverge."""
+    return b"".join(hashlib.sha256(d.encode("utf-8", "surrogatepass")).digest()[:_SEG_DIGEST]
+                    for d in dumps)
+
+
+def _diverged(prev: bytes, cur: bytes) -> int:
+    """Index of the first segment whose digest differs (= the common length when one is a
+    prefix of the other)."""
+    common = min(len(prev), len(cur)) // _SEG_DIGEST
+    for i in range(common):
+        a, b = i * _SEG_DIGEST, (i + 1) * _SEG_DIGEST
+        if prev[a:b] != cur[a:b]:
+            return i
+    return common
 
 
 class CacheSimulator:
@@ -424,6 +489,15 @@ class CacheSimulator:
         # None = per-model (_min_cacheable_for). Passing an explicit value uses it for all models (e.g. 0 for tests).
         self.min_cacheable_tokens = min_cacheable_tokens
         # hash -> {seg_count, tokens, created_at, last_seen, hits, model, ttl, ttl_seconds}
+        # Hashes pruned from the index (bounded): lets a miss say "ttl_expired".
+        self._expired: dict[str, None] = {}
+        # Per model (bounded), the previous request's fingerprint — per-segment hashes, the
+        # prefix it wrote and its parameter salts: lets a miss say where the prefix changed
+        # (`first_changed_path`) or that the written prefix expired.
+        self._last_request: dict[Any, dict[str, Any]] = {}
+        # Per answered message id (bounded): the fingerprint of the request that produced
+        # it, so a `diagnostics.previous_message_id` compares against that exact request.
+        self._by_message: dict[str, dict[str, Any]] = {}
         self.index: dict[str, dict[str, Any]] = {}
 
     def _ttl_seconds_for(self, ttl: str) -> float:
@@ -450,14 +524,43 @@ class CacheSimulator:
                 if now - e["created_at"] > 2 * e.get("ttl_seconds", self.ttl_seconds)]
         for h in dead:
             del self.index[h]
+            # Remembered (bounded) so a later miss on the same prefix can say "expired".
+            self._expired[h] = None
+            if len(self._expired) > 4096:
+                self._expired.pop(next(iter(self._expired)))
 
-    def observe(self, rc: RequestCache, model: str | None, now: float) -> dict[str, Any]:
+    def none_result(self, rc: RequestCache, model: str | None, reason: str) -> dict[str, Any]:
+        """The `status: none` decision for a request this simulator did not look at
+        (`reason`: `disabled` / `throttled`), in the same shape as `observe()`."""
+        return _none_result(rc, self._min_tokens(model), reason)
+
+    def remember_message(self, message_id: str, fingerprint: dict[str, Any] | None) -> None:
+        """Associate an answered message id with the fingerprint `observe()` returned for
+        its request (`_fingerprint`), for a later `previous_message_id` diagnosis."""
+        if not fingerprint or not message_id:
+            return
+        self._by_message[message_id] = fingerprint
+        while len(self._by_message) > 1024:
+            self._by_message.pop(next(iter(self._by_message)))
+
+    def message_fingerprint(self, message_id: Any) -> dict[str, Any] | None:
+        return self._by_message.get(message_id) if isinstance(message_id, str) else None
+
+    def observe(self, rc: RequestCache, model: str | None, now: float,
+                previous: dict[str, Any] | None = None) -> dict[str, Any]:
         """Observe one request and return the cache decision (multi-breakpoint + prefix match +
         minimum threshold + 20-block lookback).
 
         Returns: {status, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens,
-                  cache_creation_1h_tokens, prefix_hash, read_seg_count, breakpoints}
+                  cache_creation_1h_tokens, prefix_hash, read_seg_count, breakpoints} plus the
+        explanation keys (`reason`, `minimum_tokens`, `eligible_prefix_tokens`,
+        `matched_through`, `first_changed_path`) and `_fingerprint` (private: what to
+        remember for the message this request produces; the caller pops it).
         status: "hit" | "miss" | "none" (no cache_control, or all breakpoints below the minimum threshold).
+
+        A miss is explained against `previous` when given (the fingerprint of the message
+        the client named in `diagnostics.previous_message_id`), else against the previous
+        request seen for the same model.
         """
         self._prune(now)
         min_tok = self._min_tokens(model)
@@ -466,7 +569,7 @@ class CacheSimulator:
         eff_bps = [bp for bp in rc.breakpoints if rc.prefix_tokens(bp + 1) >= min_tok][-_MAX_BREAKPOINTS:]
         if not eff_bps:
             # cache_control is present but all are below threshold → real behavior is non-cached (prevents over-report).
-            return _none_result(rc)
+            return _none_result(rc, min_tok)
 
         n = len(rc.segs)
         pos = rc.positions()
@@ -476,21 +579,36 @@ class CacheSimulator:
         read_hash: str | None = None
         read_entry: dict[str, Any] | None = None
         read_seg = 0
+        # Why a lookup did not read: the longest known prefix that was in the index but dead
+        # (TTL). Unreachable candidates are skipped before they are hashed (a grown index
+        # must not cost one serialization per entry); `lookback` is diagnosed below from
+        # the prefix the previous request wrote.
+        miss_reason: str | None = None
+        miss_seg = 0
         seg_counts = sorted(
             {e["seg_count"] for e in self.index.values() if 0 < e["seg_count"] <= n},
             reverse=True,
         )
-        for sc in seg_counts:
+
+        def reachable(sc: int) -> bool:
             # An entry is readable only from a breakpoint at or after its end (`sc <= bp + 1`)
             # and within 20 lookback positions of it — the position check alone would let a
             # breakpoint early in a collapsed tool run "read" content that comes after it.
-            if not any(sc <= bp + 1 and pos[bp] - pos[sc - 1] <= _LOOKBACK_BLOCKS for bp in eff_bps):
+            return any(sc <= bp + 1 and pos[bp] - pos[sc - 1] <= _LOOKBACK_BLOCKS for bp in eff_bps)
+
+        for sc in seg_counts:
+            if not reachable(sc):
                 continue  # not reachable within 20 positions from any breakpoint → real behavior cannot find it
             h = self._key(model, rc.prefix_hash(sc))
             e = self.index.get(h)
-            if e is not None and e["seg_count"] == sc and self._alive(e, now):
+            if e is None or e["seg_count"] != sc:
+                continue
+            if self._alive(e, now):
                 read_tokens, read_hash, read_entry, read_seg = rc.prefix_tokens(sc), h, e, sc
+                miss_reason = None
                 break  # descending order, so the first match is the longest
+            if miss_reason is None:
+                miss_reason, miss_seg = "ttl_expired", sc
 
         # WRITE target = deepest valid breakpoint. creation = (deepest - read), split by the TTL
         # of the breakpoint that writes each stretch (real billing: 1h writes cost 2x, 5m 1.25x).
@@ -531,8 +649,62 @@ class CacheSimulator:
                 ex["ttl"] = ttl
                 ex["ttl_seconds"] = self._ttl_seconds_for(ttl)
 
+        hit = read_tokens > 0
+        matched_through, first_changed = read_seg, None
+        seg_hashes = _segment_hashes(rc.segment_dumps())
+        nominated = isinstance(previous, dict)
+        if not nominated:
+            previous = self._last_request.get(model)
+        if not hit:
+            # Explain the miss. A dead entry found above wins; else the prefix the previous
+            # request wrote is checked once (expired / pruned / out of lookback reach); else
+            # this request is compared with the previous one segment by segment.
+            if miss_reason is None and self._key(model, rc.prefix_hash(deepest_sc)) in self._expired:
+                miss_reason, miss_seg = "ttl_expired", deepest_sc
+            if miss_reason is None and previous is not None:
+                prev_hashes = previous.get("segments") if isinstance(previous.get("segments"), bytes) else b""
+                diverged = _diverged(prev_hashes, seg_hashes)
+                prev_deep = previous.get("deepest") if isinstance(previous.get("deepest"), int) else 0
+                if 0 < prev_deep <= min(diverged, n):
+                    # The prefix the previous request cached is intact in this one.
+                    h = self._key(model, rc.prefix_hash(prev_deep))
+                    e = self.index.get(h)
+                    if e is not None and e["seg_count"] == prev_deep:
+                        if not self._alive(e, now):
+                            miss_reason, miss_seg = "ttl_expired", prev_deep
+                        elif not reachable(prev_deep):
+                            miss_reason, miss_seg = "lookback", prev_deep
+                    elif h in self._expired:
+                        miss_reason, miss_seg = "ttl_expired", prev_deep
+                if miss_reason is None:
+                    common = min(len(prev_hashes), len(seg_hashes)) // _SEG_DIGEST
+                    changed_param = None
+                    if diverged >= common:
+                        changed_param = (_changed_salt_param(previous.get("sys_salt"), rc.sys_salt)
+                                         or _changed_salt_param(previous.get("salt"), rc.salt))
+                    if changed_param is not None:
+                        # Same content, different rendered parameters (the key salts).
+                        miss_reason, miss_seg, first_changed = "parameters_changed", diverged, changed_param
+                    elif diverged < common and (nominated or diverged != rc.messages_start):
+                        # The requests differ from this segment on: a changed static prefix
+                        # (tools / system) or an edited turn.
+                        miss_reason, miss_seg = "prefix_changed", diverged
+                        first_changed = rc.segs[diverged].get("_path")
+                    else:
+                        # Exactly the static prefix (tools / system) in common with the model's
+                        # previous request — another conversation — or a prefix nobody wrote yet.
+                        miss_reason, miss_seg = "first_seen", diverged if diverged < n else 0
+            if miss_reason is None:
+                miss_reason, miss_seg = "first_seen", 0
+            matched_through = miss_seg
+        fingerprint = {"segments": seg_hashes, "deepest": deepest_sc,
+                       "salt": rc.salt, "sys_salt": rc.sys_salt}
+        self._last_request.pop(model, None)  # re-insert: eviction is least-recently-used
+        self._last_request[model] = fingerprint
+        while len(self._last_request) > 256:
+            self._last_request.pop(next(iter(self._last_request)))
         return {
-            "status": "hit" if read_tokens > 0 else "miss",
+            "status": "hit" if hit else "miss",
             "cache_read_tokens": read_tokens,
             "cache_creation_tokens": creation_tokens,
             "cache_creation_5m_tokens": creation_by_ttl["5m"],
@@ -540,6 +712,13 @@ class CacheSimulator:
             "prefix_hash": read_hash or self._key(model, rc.prefix_hash(deepest_sc)),
             "read_seg_count": read_seg,
             "breakpoints": len(rc.breakpoints),
+            # Explanation (cache-diagnosis): why there was no read, and what did match.
+            "reason": None if hit else miss_reason,
+            "minimum_tokens": min_tok,
+            "eligible_prefix_tokens": deepest_tokens,
+            "matched_through": matched_through,
+            "first_changed_path": first_changed,
+            "_fingerprint": fingerprint,
         }
 
     def entries(self, now: float) -> list[dict[str, Any]]:
@@ -561,3 +740,6 @@ class CacheSimulator:
 
     def reset(self) -> None:
         self.index.clear()
+        self._expired.clear()
+        self._last_request.clear()
+        self._by_message.clear()

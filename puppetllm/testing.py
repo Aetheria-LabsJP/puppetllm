@@ -136,13 +136,16 @@ class Puppet:
 
     # ── transport ──
 
-    def _check(self, r: httpx.Response) -> Any:
+    def _check_status(self, r: httpx.Response) -> None:
         if r.status_code >= 400:
             try:
                 detail = r.json().get("error", r.text)
             except ValueError:
                 detail = r.text
             raise PuppetError(f"{r.request.method} {r.request.url.path} -> {r.status_code}: {detail}")
+
+    def _check(self, r: httpx.Response) -> Any:
+        self._check_status(r)
         return r.json()
 
     def _get(self, path: str, **params: Any) -> Any:
@@ -179,8 +182,16 @@ class Puppet:
 
     # ── the interactive surface ──
 
-    def pending(self) -> list[dict[str, Any]]:
-        return self._get("/_control/pending")["pending"]
+    def pending(self, *, summary: bool = False,
+                fields: list[str] | None = None) -> list[dict[str, Any]]:
+        """The live pendings; `summary=True` returns the short request view, `fields`
+        keeps only those snapshot keys (plus `pending_id`)."""
+        params: dict[str, Any] = {}
+        if summary:
+            params["summary"] = 1
+        elif fields:
+            params["fields"] = ",".join(fields)
+        return self._get("/_control/pending", **params)["pending"]
 
     def wait_pending(self, timeout: float = 30.0) -> dict[str, Any]:
         """Block until a request is pending; returns its snapshot (`pending_id` inside)."""
@@ -277,8 +288,32 @@ class Puppet:
 
     # ── observation ──
 
-    def history(self) -> list[dict[str, Any]]:
-        return self._get("/_control/history")["history"]
+    def history(self, *, since_turn: int | None = None, provider: str | None = None,
+                model: str | None = None, limit: int | None = None,
+                cursor: int | None = None) -> list[dict[str, Any]]:
+        """Recorded exchanges, optionally filtered (`model` is a glob) and limited; the
+        first page only — `history_page` returns the envelope with `next_cursor`."""
+        return self.history_page(since_turn=since_turn, provider=provider, model=model,
+                                 limit=limit, cursor=cursor)["history"]
+
+    def history_page(self, *, since_turn: int | None = None, provider: str | None = None,
+                     model: str | None = None, limit: int | None = None,
+                     cursor: int | None = None) -> dict[str, Any]:
+        """One page of `/_control/history`: `{turn_count, history, count, has_more,
+        next_cursor}`; pass `next_cursor` back as `cursor` for the next page."""
+        params = {k: v for k, v in (("since_turn", since_turn), ("provider", provider),
+                                    ("model", model), ("limit", limit), ("cursor", cursor))
+                  if v is not None}
+        return self._get("/_control/history", **params)
+
+    def history_entry(self, turn: int) -> dict[str, Any]:
+        return self._get(f"/_control/history/{turn}")
+
+    def metrics(self) -> str:
+        """The Prometheus text exposition of `/_control/metrics`."""
+        r = self._http.get("/_control/metrics")
+        self._check_status(r)
+        return r.text
 
     def stats(self) -> dict[str, Any]:
         return self._get("/_control/stats")

@@ -323,6 +323,15 @@ curl -s localhost:8765/_control/cache | jq
 
 # Per-request (request, response, usage, cost, cache) history
 curl -s localhost:8765/_control/history | jq '.history[-1]'
+# Filter and page it: turns after 40, one provider, a model glob, 20 at a time
+curl -s 'localhost:8765/_control/history?since_turn=40&provider=anthropic&model=claude-*&limit=20' | jq
+curl -s 'localhost:8765/_control/history?limit=20&cursor=60' | jq '.next_cursor, .has_more'
+curl -s 'localhost:8765/_control/history?format=jsonl' > history.jsonl   # one entry per line
+curl -s localhost:8765/_control/history/12 | jq                            # one turn
+# Cheap polling: the short view of each pending (no conversation bodies)
+curl -s 'localhost:8765/_control/pending?summary=1' | jq '.pending[].request'
+# Prometheus counters and gauges
+curl -s localhost:8765/_control/metrics
 
 # Cleanup between tests (wipe pending / history / cache)
 curl -s -X POST localhost:8765/_control/clear
@@ -342,6 +351,77 @@ What the pseudo cache reproduces (per the official prompt-caching docs):
 - **Usage shape**: responses carry the full 2026 usage object (`cache_creation`, `output_tokens_details.thinking_tokens`, `server_tool_use`, `service_tier` (`standard` / `batch`), `inference_geo`, `speed` when fast mode was requested), and `message_delta.usage` repeats the cumulative input / cache counts as the real stream does.
 
 Pricing follows the official per-generation table (e.g. Opus 5 $5/$25, Sonnet 5 $2/$10, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5, Fable 5.1 $10/$50 with $0.25 cache reads, Opus 4.1 $15/$75). Unknown Claude ids fall back to Sonnet 4.x pricing; unknown `gpt-*` ids to gpt-5.4.
+
+Every history entry carries the correlation and provenance of the exchange: `seq` (the
+record sequence, in completion order; the history cursor), `request_id` (the id the
+response header carried: `request-id`, `x-amzn-requestid` or `x-request-id`; null for
+batch entries, which carry `batch_id` / `custom_id` or `job_id` / `record_id` instead),
+`path`, `latency_ms` (arrival to answer on the server's clock), `usage_source` (`estimate`
+from the approx tokenizer, `override` when the responder supplied real counts, null on an
+error), `pricing_model` (which price table the cost used) and, when a relay answered,
+`provenance` (`upstream_provider`, `upstream_model`, `translation.dropped_fields`).
+The snapshot keeps an allow-list of request headers — `user-agent`, `anthropic-version`,
+the OpenAI organization / project ids, W3C / B3 / vendor trace ids (`traceparent`,
+`x-cloud-trace-context`, `x-datadog-trace-id`, `sentry-trace`, …; not `tracestate` or
+`baggage`, which carry key=value lists),
+`x-request-id` and the other common request ids, botocore's `amz-sdk-invocation-id`,
+`x-stainless-*` — and nothing else, so a credential, a session or a client address never
+reaches history. `cache` explains a non-hit: `reason`
+is `no_cache_control`, `below_minimum` (with `minimum_tokens` and
+`eligible_prefix_tokens`, the size of the deepest marked prefix), `first_seen`,
+`prefix_changed` (the request differs from the compared one from `first_changed_path`
+on — a changed static prefix such as `system[0]` or `tools[1]`, or an edited turn such as
+`messages[3].content[1]`; `matched_through` is the number of leading segments that were
+unchanged — while a conversation that shares exactly its tools / system with the model's
+previous request is `first_seen`), `parameters_changed` (same content, a prompt-rendered parameter such as
+`params.speed` or `params.thinking` differs), `ttl_expired`, `lookback`, or `disabled` /
+`throttled` on requests the pseudo cache did not look at. A request that sends a
+`diagnostics` object (the cache-diagnosis beta's request shape) gets the same explanation
+back on the Message as `diagnostics.cache_miss_reason` (plus `cache_status`,
+`matched_through`, `first_changed_path`, `minimum_tokens`, `eligible_prefix_tokens` —
+puppetllm's own fields, not the real beta's), in the non-stream body and in
+`message_start`, on the Anthropic route and the Bedrock Mantle alias. The comparison is
+against the message named by `diagnostics.previous_message_id` when the server answered
+it, else against the model's previous request.
+
+`PUPPETLLM_HISTORY_FILE` (or `serve --history-file`) appends every entry to a JSONL file as
+it is recorded (a synchronous append to a local file, in history order; the path is
+checked at start-up — `--history-file` refuses an unusable path, the environment variable
+only warns — and a write error is reported once and never fails the request; client text
+that is legal JSON but not UTF-8, such as a lone surrogate, is escaped there and in every
+JSON response rather than failing them) — a durable log that `/_control/clear` does not
+touch; like the metrics it is append-only, so the
+early answers of a batch create that was rolled back stay in it. `--log-format json` (or
+`PUPPETLLM_LOG_FORMAT=json`) turns stderr into one JSON object per lifecycle event —
+`received`, `matched` (rule / rate limit / default policy / unmatched error / timeout),
+`resolved` (outcome, latency, cost), `rejected` (a request route's 400 before any pending existed — not `count_tokens` or batch-envelope checks),
+`canceled` (clear, disconnect, a cancelled handler, a batch canceled / expired / stopped
+or rolled back, an answer that could not be encoded) — correlated by
+`pending_id`, `request_id` and the batch ids; the default `text` format keeps only the
+adapters' receipt lines. `GET /_control/metrics` is a Prometheus
+text endpoint: cumulative counters (`puppetllm_requests_total{provider,outcome}`,
+`puppetllm_tokens_total{provider,kind}`, `puppetllm_cost_usd_total{provider}`,
+`puppetllm_cache_lookups_total{status}`, `puppetllm_harness_answers_total{source}`,
+`puppetllm_rejected_total{provider}`, `puppetllm_canceled_total{reason}`,
+`puppetllm_latency_seconds_total{provider}` — latency, like `latency_ms`, follows the
+server's clock, so `/_control/clock/advance` while a request waits counts) that survive
+`/_control/clear`, and live gauges
+(`puppetllm_pending`, `puppetllm_turns`, `puppetllm_rules_unconsumed`,
+`puppetllm_clock_offset_seconds`).
+
+Prices come from the built-in family table; `PUPPETLLM_PRICING_FILE` (or `serve
+--pricing-file`) adds your own — `{"<model glob>": {"input": 0.5, "output": 2.0,
+"cache_write"?, "cache_read"?, "cache_write_1h"?}}` in dollars per million tokens,
+consulted before the built-in families (the glob becomes the `model_family` in costs).
+Globs are tried in file order against the whole id (`*claude-*` to catch Bedrock /
+Vertex ids), case-insensitively; rates are JSON numbers up to 1,000,000 with `cache_read`
+at most `input`, no other keys; an empty object clears the table. The fast-mode and
+US-inference multipliers apply to Claude ids only (a built-in Claude table, an unknown id
+that names Claude, or any made-up id arriving on an Anthropic-shaped route) — never to a
+custom table, an OpenAI family or an upstream model a relay prices by that nothing
+matches. A `pricing_model` nothing
+matches is priced by the default family (Sonnet, or gpt-5.4 for `gpt-*`), as an unknown
+inbound id is.
 
 ### 6. Message Batches API
 
@@ -657,7 +737,8 @@ with serve() as puppet:                       # or Puppet("http://127.0.0.1:8765
 ```
 
 `Puppet` also exposes the interactive surface (`wait_pending`, `respond`, `error`,
-`pending`, `history`, `stats`, `cache`, `config`, `advance_clock`, `clear`;
+`pending` (`summary=` / `fields=`), `history` (filters, `history_page` for the cursor
+envelope, `history_entry`), `metrics`, `stats`, `cache`, `config`, `advance_clock`, `clear`;
 `clear(config=True)` also restores the defaults, `reset(baseline)` re-applies a saved
 `baseline()` — configuration plus rules). With `pip install .` the `puppet` pytest fixture
 (one server per session; before and after every test the state is cleared and the
@@ -693,13 +774,15 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 
 - `--kind openai` (default) speaks to **any OpenAI-compatible endpoint** — OpenAI, xAI Grok, Groq, Ollama, OpenRouter, … just point `--target` at its base URL. `--kind anthropic` speaks to the native Anthropic API.
 - Requests are translated from the canonical form (system / messages / tools incl. `strict` and OpenAI `custom` tools / tool_choice / stop / temperature / seed / verbosity / prompt_cache_key / metadata …; image blocks ↔ `image_url` parts in both directions); responses come back as canonical blocks — including `thinking` blocks with the upstream's real signatures, and an OpenAI `refusal` as text with `stop_reason: "refusal"` — with the **real `stop_reason` / `stop_details` and real token usage** (via the `stop_reason` / `stop_details` / `usage` fields of `/_control/respond`, the usage carrying `cache_creation` / `output_tokens_details` / `service_tier` objects intact), so `/_control/stats` aggregates real numbers (history entries get `"usage_overridden": true`). When the upstream omits usage, puppetllm's approximation is kept instead.
-- Towards a real Anthropic upstream, OpenAI-inbound `response_format: json_schema` becomes `output_config.format` and `reasoning_effort` becomes `output_config.effort` (`none` / `minimal` → `low`); `thinking` / `output_config` / `cache_control` / `inference_geo` / `speed` from Anthropic-inbound apps are forwarded as-is, and the app's `anthropic-beta` header (captured as `params.anthropic_beta`) is re-sent to an Anthropic upstream so beta features (fast mode, compaction, …) keep working through the relay. Vendor vocabularies are mapped rather than forwarded: `service_tier` (`standard_only` ↔ `default`, `flex` / `priority` → `auto`), Anthropic `effort: max` → OpenAI `reasoning_effort: xhigh`; `n` is never forwarded (the relay uses one choice, extra samples would only be billed). puppetllm's private canonical keys (`_openai_custom`, `_openai_detail`) never reach a wire. Untranslatable parameters are dropped with a one-time warning.
+- Towards a real Anthropic upstream, OpenAI-inbound `response_format: json_schema` becomes `output_config.format`, `reasoning_effort` becomes `output_config.effort` (`none` / `minimal` → `low`), `parallel_tool_calls: false` becomes `tool_choice.disable_parallel_tool_use` and `user` becomes `metadata.user_id`; `thinking` / `output_config` / `cache_control` / `inference_geo` / `speed` / `mcp_servers` / `fallbacks` from Anthropic-inbound apps are forwarded as-is, and the app's `anthropic-beta` header (captured as `params.anthropic_beta`) is re-sent to an Anthropic upstream so beta features (fast mode, compaction, …) keep working through the relay. Vendor vocabularies are mapped rather than forwarded: `service_tier` (`standard_only` ↔ `default`, `flex` / `priority` → `auto`), Anthropic `effort: max` → OpenAI `reasoning_effort: xhigh`; `n` is never forwarded (the relay uses one choice, extra samples would only be billed). puppetllm's private canonical keys (`_openai_custom`, `_openai_detail`) never reach a wire. Untranslatable parameters are dropped with a one-time warning.
 - `--max-tokens-param` defaults to `auto`: `max_completion_tokens` when the target URL's hostname is exactly `api.openai.com` (where `max_tokens` is deprecated and rejected by reasoning models), `max_tokens` for other OpenAI-compatible backends. Force either value explicitly if a backend disagrees.
 - Upstream API errors are relayed with their status/type/message (and `code`/`param`), so your app's SDK raises the same exception class it would against the real provider.
 - The relay is *just another responder*. **By default it claims every pending it sees**, so it does not share a live queue with a human / AI-agent responder — the swap is sequential: stop the relay and take over by hand. To run them **concurrently**, use `--only "<glob>,…"` so the relay claims only the matching inbound models and leaves the rest for you (or another agent).
 - `--max-concurrency N` caps simultaneous in-flight upstream calls (default: unlimited), so a burst of pendings doesn't fan out and trip upstream rate limits.
+- Every relayed answer and every failure the relay reports once it has resolved the upstream model carries `provenance` into history (`upstream_provider`, `upstream_model` when one was resolved, `usage_source: upstream` when the upstream reported usage, else `estimate`, `translation.dropped_fields`); the 502 the relay falls back to when the control plane refused its payload keeps it unless the provenance itself was what the server refused. `--price-by upstream` prices the recorded cost with the upstream model's table instead of the inbound id (`pricing_model` in the entry says which; the relay warns once when no built-in table matches the upstream model — add one with the server's `--pricing-file`). `--strict-translation` refuses a request (400 to the app, nothing sent upstream) whenever something has no translation for the upstream kind: a parameter (`speed`, `top_k`, `thinking`, `container`, `verbosity`, `n > 1`, an unknown `service_tier`, …) or content the relay would otherwise replace with a placeholder (`document` blocks, unsupported image sources, OpenAI `input_audio` / `file` parts, Anthropic server-side tools, a `tool_choice` form the other API lacks, a `user` longer than `metadata.user_id` allows). Values that only ask for the default (`frequency_penalty: 0`, `logprobs: false`, `logit_bias: {}`, `thinking` set to the model's own default mode without a budget, `verbosity: medium`, …) and parameters that do not change the answer (`cache_control`, `metadata` beyond `user_id`, `anthropic_beta`, `diagnostics`, `store`, `prompt_cache_key`, `safety_identifier`, `stream_options`) are not counted. `--dry-run` translates and logs the upstream request (long strings cut) without sending it; the app gets a 400.
+- Anthropic-inbound `output_config.format` of type `json_schema` is translated to OpenAI `response_format` (the schema and a name; not `strict`, whose schema rules an Anthropic schema need not meet), the mirror of the `response_format` → `output_config` mapping towards Anthropic.
 
-Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE but with first-token latency equal to the full upstream response time; audio / file parts and `document` blocks are not translated (images are); costs are **real** in this mode; `/_control/stats` prices tokens by the *inbound* model id, which may differ from the upstream model's actual pricing.
+Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE but with first-token latency equal to the full upstream response time; audio / file parts and `document` blocks are not translated (images are); costs are **real** in this mode; by default the recorded cost (and so `/_control/stats`) prices tokens by the *inbound* model id, which may differ from the upstream model's actual pricing — `--price-by upstream` switches to the upstream model's table.
 
 ---
 
@@ -708,9 +791,9 @@ Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE
 | Method | Path | Description |
 |---|---|---|
 | GET  | `/_control/health` | Health check (`{"ok","turn_count"}`) |
-| GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`; `deadline` / `timeout_in_seconds` when a pending timeout is configured) |
+| GET  | `/_control/pending` | List of pending requests (`pending[]` + provider; oldest also under `request`; `deadline` / `timeout_in_seconds` when a pending timeout is configured). `?summary=1` replaces each `request` with a short view (turn, model, `message_count`, `tools`, `last_user_text`, `has_tool_result`, ids), `?fields=model,turn` keeps only those snapshot keys |
 | GET  | `/_control/wait_for_pending?timeout=N` | Long-poll for the next pending (default 270s / max 600s; `{"timeout":true}` if none) |
-| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?}` — or `{"text": "..."}` for one text block — into a pending request; `{"responses": [<body with its own target>, ...]}` injects several at once, all validated and resolved before any is applied (a target that vanished in between makes the answer a 409 with per-item `results`). `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking` and the server-side tool blocks (§3); other types are dropped and reported (`dropped`) or refused under `strict_blocks`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode) |
+| POST | `/_control/respond` | Inject a response (`{"content":[...], "pending_id"?, "stop_reason"?, "stop_sequence"?, "stop_details"?, "usage"?, "provenance"?}` — or `{"text": "..."}` for one text block — into a pending request; `{"responses": [<body with its own target>, ...]}` injects several at once, all validated and resolved before any is applied (a target that vanished in between makes the answer a 409 with per-item `results`). `content` blocks: `text` / `tool_use` / `thinking` / `redacted_thinking` and the server-side tool blocks (§3); other types are dropped and reported (`dropped`) or refused under `strict_blocks`. `stop_reason` overrides the auto-derived value (e.g. `"max_tokens"` to exercise truncation branches; mapped to `finish_reason: "length"` on the OpenAI route); `"refusal"` produces `stop_details` (pass `stop_details` to set `category` / `explanation`; extra fields such as `recommended_model` pass through) and, on the OpenAI route, takes OpenAI's refusal shape (`message.refusal` / `delta.refusal`, `content: null`, `finish_reason: "stop"`); `"stop_sequence"` fills `stop_sequence`. `usage` overrides the approx token counts with real ones (any non-empty subset of `input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`, ints in `[0, 1e12]`, plus optional `cache_creation` / `output_tokens_details` / `server_tool_use` objects and `service_tier` / `inference_geo` / `speed` strings — used by relay mode). `provenance` (`{upstream_provider, upstream_model, usage_source, pricing_model, translation.dropped_fields}`, §5) is recorded with the entry; its `pricing_model` picks the price table |
 | POST | `/_control/respond_all` | The same `respond` body (no target) for every live pending, batch entries included — answers a parallel fan-out in one call (`{"ok", "count", "pending_ids"}`; 400 when nothing is pending) |
 | POST | `/_control/auto` | Deprecated alias of `/_control/respond` with `{"text": "..."}` (same targeting); still works |
 | GET  | `/_control/capabilities` | The compatibility matrix (see [Compatibility matrix](#compatibility-matrix)): surfaces with accepted / injectable / streamed / relayed flags, how each content block type travels on each route, and the operations refused on purpose |
@@ -718,8 +801,10 @@ Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE
 | GET / PUT / POST / DELETE | `/_control/rules` | Scenario rules (§8): list with counters (`unconsumed`, `all_consumed`), replace, append, remove all. `PUT` / `DELETE /_control/rules/{id}` act on one rule (a `PUT` that only appends steps under the same match keeps the rule's consumption counters) |
 | GET | `/_control/clock` | The fake clock (`now`, `clock_offset_seconds`) |
 | POST | `/_control/clock/advance` | `{"seconds": N}` — advance the fake clock (cache TTLs, rate-limit window, pending deadlines) |
-| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"? / "after_blocks"?, "content"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.) |
-| GET  | `/_control/history` | (request, response, usage, cost, cache) history |
+| POST | `/_control/error` | Inject an HTTP error response (`{"status","type","message", "code"?, "param"?, "headers"?, "pending_id"?, "after_events"? / "after_blocks"?, "content"?, "provenance"?}` — the last two make a streaming request fail mid-stream, see §4). `headers` (string → string/number) are attached to the error response verbatim — e.g. `{"retry-after": 3}` on a 429, or `anthropic-ratelimit-*` / `x-ratelimit-*` values — to exercise an app's backoff logic (framing headers such as `content-length` / `transfer-encoding`, control characters and non-Latin-1 values are rejected with 400). Every Anthropic-route error body (batches included) carries `request_id`, matching the `request-id` header; the OpenAI route maps Anthropic error `type`s to its own vocabulary (`api_error` → `server_error` by status, etc.). `provenance` is recorded as for `/_control/respond` |
+| GET  | `/_control/history` | (request, response, usage, cost, cache) history, in completion order. Query: `cursor` (entries recorded after that `seq`), `since_turn` (entries with a greater turn), `provider`, `model` (glob), `limit` (1–1000; the answer carries `has_more` and `next_cursor` — the `seq` to continue from, or your cursor back when nothing new was recorded — safe for paging and tailing while requests complete out of turn order), `format=jsonl` (one entry per line; `has_more` / `next_cursor` move to the `x-puppetllm-has-more` / `x-puppetllm-next-cursor` response headers). Entries carry `seq`, `request_id`, `path`, `latency_ms`, `usage_source`, `pricing_model`, `provenance` (§5) |
+| GET  | `/_control/history/{turn}` | One entry (404 when unknown, 400 for a non-integer) |
+| GET  | `/_control/metrics` | Prometheus text: cumulative counters (kept across `clear`) and live gauges (§5) |
 | GET  | `/_control/stats` | Cumulative summary of cost estimates, tokens, cache |
 | GET  | `/_control/cache` | Pseudo prompt-cache index |
 | POST | `/_control/clear` | Empty pending / history / cache / batches / Bedrock batch jobs / rules / rate-limit window / clock offset — the configuration too with body `{"config": true}` (in-flight requests are released with a retryable error: 529 `overloaded_error` on the Anthropic route, 503 on Bedrock / OpenAI; a Bedrock batch job still being created gets a non-retryable 400 `ConflictException`; the S3 store is left alone) |
@@ -732,7 +817,7 @@ On `respond` / `auto` / `error`, batch entries can be addressed with `custom_id`
 
 The request bodies of the `/_control/*` endpoints that take one are typed (`puppetllm/control_models.py`) and published in `/openapi.json` under `components.schemas` (`/docs` renders them), so a client can be generated from the schema. `{"text": "..."}` is accepted by `/_control/respond` (and rule steps) as shorthand for one text block, also next to an empty `content`; unset optional fields sent as `null` are treated as absent, except that `/_control/config` takes `null` as "restore the default" (serialize it with unset fields omitted).
 
-Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`; `/_control/auto` requires `text` to be a string (other keys are still ignored) and, like every request route, malformed `messages` / `system` / `tools` containers are refused with 400 instead of failing later; `/_control/respond` / `auto` / `error` answer `{"ok": true, "dropped": [...]}` instead of a bare `{"ok": true}` when an injected block type was dropped; server-side tool blocks are kept instead of dropped; an unimplemented path under `/v1`, `/anthropic`, `/model`, `/guardrail`, `/async-invoke` or `/chat` answers 404 in the provider's envelope instead of an S3 error, so `chat`, `models`, `guardrail` and `async-invoke` are no longer usable as S3 bucket names; a wrong method on a real path answers 405 whose `Allow` lists only the methods actually served (`HEAD` is not).
+Behavior changes relative to earlier versions (apps or harnesses asserting the old values need updating): the fast-mode and US-inference cost multipliers apply to Claude ids only (never to an OpenAI family, a custom price table or an upstream model a relay prices by; a made-up id on an Anthropic-shaped route still gets them); a request cleared mid-flight now gets `529 overloaded_error` on the Anthropic / Bedrock-Messages routes (was `503 api_error`); OpenAI-route error `type`s follow OpenAI's vocabulary (`server_error`, `service_unavailable_error`, … — was `api_error` / `service_unavailable`); a canonical `refusal` maps to OpenAI's `message.refusal` + `finish_reason: "stop"` (was `finish_reason: "content_filter"` — pass `"content_filter"` as the `stop_reason` to get the filter shape); Bedrock pendings / responses carry the normalized Anthropic model name; `thinking` blocks are kept instead of dropped; the OpenAI usage object bills all `n` choices (in the response, history and stats alike; such pendings carry a `choices` field in the snapshot) and echoes an explicit `service_tier`; costs apply the official 1.1x multiplier when the request carries `inference_geo: "us"`; `/_control/auto` requires `text` to be a string (other keys are still ignored) and, like every request route, malformed `messages` / `system` / `tools` containers are refused with 400 instead of failing later; `/_control/respond` / `auto` / `error` answer `{"ok": true, "dropped": [...]}` instead of a bare `{"ok": true}` when an injected block type was dropped; server-side tool blocks are kept instead of dropped; an unimplemented path under `/v1`, `/anthropic`, `/model`, `/guardrail`, `/async-invoke` or `/chat` answers 404 in the provider's envelope instead of an S3 error, so `chat`, `models`, `guardrail` and `async-invoke` are no longer usable as S3 bucket names; a wrong method on a real path answers 405 whose `Allow` lists only the methods actually served (`HEAD` is not).
 
 ### Parallel requests (multi-pending)
 
@@ -801,6 +886,9 @@ Refused on purpose, in the caller's own error envelope (a 404 naming the method,
 | `PUPPETLLM_SEED` | (none) | Seed for latency jitter |
 | `PUPPETLLM_CONFIG` | (none) | JSON file `{"config": {...}, "rules": [...]}` loaded at startup |
 | `PUPPETLLM_URL` | (none) | Makes the `puppet` pytest fixture use a running server instead of starting one |
+| `PUPPETLLM_HISTORY_FILE` | (none) | Append every history entry to this JSONL file (§5) |
+| `PUPPETLLM_LOG_FORMAT` | `text` | `json` for one JSON event per line on stderr (§5) |
+| `PUPPETLLM_PRICING_FILE` | (none) | JSON price table consulted before the built-in families (§5) |
 
 ---
 
@@ -816,7 +904,8 @@ pip install -r requirements.txt
 python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_extensions \
     puppetllm.tests.test_batches puppetllm.tests.test_conformance \
     puppetllm.tests.test_bedrock_extras puppetllm.tests.test_harness \
-    puppetllm.tests.test_compat puppetllm.tests.test_boto3_interop -v
+    puppetllm.tests.test_compat puppetllm.tests.test_observability \
+    puppetllm.tests.test_boto3_interop -v
 ```
 
 `puppetllm/tests/test_fake_server.py` is an executable specification of the expected behavior; `test_harness.py` covers §8 (rules, policies, timeouts, latency, rate limits, the clock, `count_tokens` / `models`, the CLI and `puppetllm.testing` against an in-process uvicorn).
@@ -840,6 +929,8 @@ puppetllm/
 │   ├── control_models.py   # typed /_control/* request bodies (published in /openapi.json)
 │   ├── capabilities.py     # compatibility matrix (/_control/capabilities) + the catch-all for unimplemented paths
 │   ├── testing.py          # test-side client (Puppet, serve()) — pytest_plugin.py adds the `puppet` fixture
+│   ├── observability.py    # JSON log events + Prometheus metrics (/_control/metrics)
+│   ├── _responses.py       # the JSON response class every route uses (surrogate-safe)
 │   ├── batches.py          # Anthropic Message Batches route + batch control endpoints
 │   ├── cache_sim.py        # pseudo prompt cache
 │   ├── pricing.py          # approximate tokens + pricing

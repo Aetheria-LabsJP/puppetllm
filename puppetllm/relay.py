@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import fnmatch
 import json
 import os
@@ -47,6 +48,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import openai_wire as _oai
+from . import pricing
+from .cache_sim import thinking_default_for as _thinking_default_for
 
 # Upper bound on the quarantine set (see Relay.quarantined). Far above any realistic
 # count of concurrently-failing pendings; keeps a long-running relay from leaking.
@@ -164,8 +167,24 @@ _TIER_TO_ANTHROPIC = {"auto": "auto", "standard_only": "standard_only",
 _warned_dropped: set[str] = set()
 
 
-def _warn_dropped(what: str) -> None:
-    """Log once per parameter that cannot be translated for the upstream kind."""
+def _abbreviate(value: Any, limit: int = 256) -> Any:
+    """A copy with long strings cut (a logged request body must not carry a base64 image)."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + f"... ({len(value)} chars)"
+    if isinstance(value, list):
+        return [_abbreviate(v, limit) for v in value]
+    if isinstance(value, dict):
+        return {k: _abbreviate(v, limit) for k, v in value.items()}
+    return value
+
+
+def _warn_dropped(what: str, sink: list[str] | None = None) -> None:
+    """A parameter that cannot be translated for the upstream kind: collected in `sink`
+    when the caller keeps per-request provenance, else logged once per parameter."""
+    if sink is not None:
+        if what not in sink:
+            sink.append(what)
+        return
     if what not in _warned_dropped:
         _warned_dropped.add(what)
         _log(f"WARNING: {what} cannot be translated for this upstream and is dropped")
@@ -208,7 +227,7 @@ def _tool_choice_to_openai(tc: Any) -> Any:
             return "none"
         if t == "tool":  # Anthropic forced-tool form
             return {"type": "function", "function": {"name": tc.get("name")}}
-        if t == "function" or "function" in tc:  # already OpenAI-style
+        if t in ("function", "custom", "allowed_tools") or "function" in tc:  # already OpenAI-style
             return tc
     return None
 
@@ -233,8 +252,9 @@ def resolve_max_tokens_param(cfg: Any) -> str:
 
 
 def to_openai_request(req: dict[str, Any], model: str,
-                      cfg: Any = None) -> dict[str, Any]:
-    """Canonical snapshot -> OpenAI-compatible chat.completions request body."""
+                      cfg: Any = None, dropped: list[str] | None = None) -> dict[str, Any]:
+    """Canonical snapshot -> OpenAI-compatible chat.completions request body. `dropped`
+    collects the parameters that had no translation (else they are warned about once)."""
     max_tokens_param = resolve_max_tokens_param(cfg)
     messages: list[dict[str, Any]] = []
     system = req.get("system")
@@ -294,6 +314,7 @@ def to_openai_request(req: dict[str, Any], model: str,
                             parts.append(part)
                             has_image = True
                         else:
+                            _warn_dropped("image block (unsupported source; content omitted)", dropped)
                             parts.append({"type": "text",
                                           "text": "[image omitted by relay]"})
                     elif b.get("type") in ("image_url", "input_audio", "file"):
@@ -302,6 +323,7 @@ def to_openai_request(req: dict[str, Any], model: str,
                     elif b.get("type") in ("input_image", "document"):
                         # not translated; keep the turn non-empty so the message
                         # sequence stays valid rather than silently vanishing.
+                        _warn_dropped(f"{b.get('type')} block (content omitted)", dropped)
                         parts.append({"type": "text",
                                       "text": "[non-text content omitted by relay]"})
                 if parts:
@@ -330,6 +352,14 @@ def to_openai_request(req: dict[str, Any], model: str,
                     custom["format"] = t["format"]
                 out_tools.append({"type": "custom", "custom": custom})
                 continue
+            if t.get("type") not in (None, "custom"):
+                # Anthropic server-side / built-in tools (web_search_*, mcp_toolset, bash,
+                # text_editor, ...): nothing an OpenAI function tool can stand in for.
+                _warn_dropped(f"tool type {t.get('type')!r} (no Chat Completions equivalent)", dropped)
+                continue
+            if not t.get("name"):
+                _warn_dropped("tool without a name (omitted)", dropped)
+                continue
             fn: dict[str, Any] = {
                 "name": t.get("name"),
                 "description": t.get("description") or "",
@@ -338,11 +368,15 @@ def to_openai_request(req: dict[str, Any], model: str,
             if t.get("strict") is not None:
                 fn["strict"] = bool(t["strict"])
             out_tools.append({"type": "function", "function": fn})
-        body["tools"] = out_tools
+        if out_tools:
+            body["tools"] = out_tools
     params = req.get("params") or {}
     for k in _OPENAI_PASSTHROUGH_PARAMS:
         if k in params:
             body[k] = params[k]
+    for k in _ANTHROPIC_ONLY_PARAMS:
+        if k in params and not _is_noop(k, params[k], req.get("model")):
+            _warn_dropped(f"{k} (no Chat Completions equivalent)", dropped)
     # Anthropic-inbound effort → OpenAI reasoning_effort (`max` clamps to `xhigh`).
     oc = params.get("output_config")
     if "reasoning_effort" not in body and isinstance(oc, dict) and oc.get("effort"):
@@ -350,28 +384,89 @@ def to_openai_request(req: dict[str, Any], model: str,
         if eff is not None:
             body["reasoning_effort"] = eff
         else:
-            _warn_dropped(f"output_config.effort={oc['effort']!r}")
+            _warn_dropped(f"output_config.effort={oc['effort']!r}", dropped)
+    # Anthropic-inbound structured output → OpenAI response_format (the mirror of the
+    # response_format → output_config mapping on the way to Anthropic).
+    fmt = oc.get("format") if isinstance(oc, dict) else None
+    if "response_format" not in body and isinstance(fmt, dict):
+        if fmt.get("type") == "json_schema" and isinstance(fmt.get("schema"), dict):
+            # Not `strict`: OpenAI's strict mode needs every property required and
+            # `additionalProperties: false` throughout, which an Anthropic schema need not
+            # satisfy — a forced strict flag would turn a working request into a 400.
+            body["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": str(fmt.get("name") or "response"), "schema": fmt["schema"]}}
+        elif fmt.get("type") == "json_schema":
+            _warn_dropped("output_config.format (json_schema without a schema)", dropped)
+        else:
+            _warn_dropped(f"output_config.format.type={fmt.get('type')!r}", dropped)
     tier = params.get("service_tier")
     if isinstance(tier, str):
         if tier in _TIER_TO_OPENAI:
             body["service_tier"] = _TIER_TO_OPENAI[tier]
         else:
-            _warn_dropped(f"service_tier={tier!r}")
+            _warn_dropped(f"service_tier={tier!r}", dropped)
     if params.get("speed") == "fast":
-        _warn_dropped("speed=fast (Anthropic fast mode has no Chat Completions equivalent)")
+        _warn_dropped("speed=fast (Anthropic fast mode has no Chat Completions equivalent)", dropped)
     if "stop_sequences" in params:
         body["stop"] = params["stop_sequences"]
     elif "stop" in params:
         body["stop"] = params["stop"]
+    if isinstance(oc, dict) and oc.get("task_budget") is not None:
+        _warn_dropped("output_config.task_budget (no Chat Completions equivalent)", dropped)
+    if isinstance(params.get("n"), int) and params["n"] > 1:
+        _warn_dropped("n (the relay forwards one choice)", dropped)
     tc = _tool_choice_to_openai(params.get("tool_choice"))
+    if tc is None and params.get("tool_choice") is not None:
+        _warn_dropped(f"tool_choice {_tc_kind(params['tool_choice'])} (no Chat Completions equivalent)", dropped)
+    elif tc is not None and not body.get("tools") and tc != "none":
+        # Every tool was omitted (or none was offered): a tool_choice without tools is
+        # refused upstream, and a forced tool would name one the upstream never saw.
+        _warn_dropped("tool_choice (its tools have no Chat Completions equivalent)", dropped)
+        tc = None
     if tc is not None:
         body["tool_choice"] = tc
     return body
 
 
+def _tc_kind(tc: Any) -> str:
+    return repr(tc.get("type")) if isinstance(tc, dict) else repr(tc)
+
+
 # Chat Completions parameters forwarded verbatim from the snapshot when present.
 # (`n` is deliberately NOT forwarded — the relay uses one choice, so extra samples would
 # only be billed; `service_tier` is mapped, not forwarded.)
+# Anthropic-inbound parameters a Chat Completions request cannot carry (reported as
+# dropped; `cache_control` and `metadata` are not — nothing is lost by omitting them).
+_ANTHROPIC_ONLY_PARAMS = ("top_k", "thinking", "container", "mcp_servers", "context_management",
+                          "fallbacks", "inference_geo")
+# OpenAI-inbound parameters the Messages API cannot carry. (`store`, `prompt_cache_key`,
+# `safety_identifier` and `stream_options` are omitted silently: they do not change the
+# answer.)
+_OPENAI_ONLY_PARAMS = ("frequency_penalty", "presence_penalty", "logit_bias", "logprobs",
+                       "top_logprobs", "seed", "prediction", "modalities", "audio",
+                       "web_search_options", "verbosity")
+
+
+def _is_noop(key: str, value: Any, model: Any = None) -> bool:
+    """A value that asks for the default behaviour — clients send `frequency_penalty: 0`,
+    `logprobs: false`, `logit_bias: {}` or `thinking: {"type": "disabled"}` unconditionally
+    — so omitting it loses nothing. A `seed` of 0 is a real seed."""
+    if value is None:
+        return True
+    if key == "thinking":
+        # The model's own default mode (`adaptive` on the current models, `disabled`
+        # elsewhere — see `cache_sim.thinking_default_for`) asks for nothing; an explicit
+        # budget or a non-default mode is a real setting.
+        return isinstance(value, dict) and value.get("budget_tokens") is None \
+            and value.get("type") == _thinking_default_for(model).get("type")
+    if key == "verbosity":
+        return value == "medium"
+    if key == "modalities":
+        return value == ["text"]
+    if key == "seed":
+        return False
+    return value in (0, 0.0, False, {}, [], "")
+
 _OPENAI_PASSTHROUGH_PARAMS = (
     "temperature", "top_p", "response_format", "parallel_tool_calls", "reasoning_effort",
     "seed", "frequency_penalty", "presence_penalty", "logit_bias", "logprobs",
@@ -454,20 +549,22 @@ def _tool_choice_to_anthropic(tc: Any) -> Any:
         t = tc.get("type")
         if t == "function":  # OpenAI forced-tool form
             return {"type": "tool", "name": (tc.get("function") or {}).get("name")}
+        if t == "custom":  # OpenAI forced custom-tool form
+            return {"type": "tool", "name": (tc.get("custom") or {}).get("name")}
         if t in ("auto", "any", "none", "tool"):  # already Anthropic-style
             return tc
     return None
 
 
 def to_anthropic_request(req: dict[str, Any], model: str,
-                         cfg: Any = None) -> dict[str, Any]:
+                         cfg: Any = None, dropped: list[str] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
         # /v1/messages requires max_tokens; OpenAI-route inbound may not have one.
         "max_tokens": req.get("max_tokens") or 4096,
         # puppetllm-private keys (`_openai_custom`, `_openai_detail`) never go on the wire:
         # the real Messages API rejects unknown fields.
-        "messages": _oai.strip_private(req.get("messages") or []),
+        "messages": copy.deepcopy(_oai.strip_private(req.get("messages") or [])),
     }
     if req.get("system"):
         body["system"] = _oai.strip_private(req["system"])
@@ -488,17 +585,23 @@ def to_anthropic_request(req: dict[str, Any], model: str,
     # round-trips. (Mixing responders mid-conversation — fake signatures from a human
     # responder, then relay — would still 400 upstream.)
     for k in ("temperature", "top_p", "top_k", "stop_sequences", "thinking", "output_config",
-              "cache_control", "inference_geo", "container", "context_management", "speed"):
+              "cache_control", "inference_geo", "container", "context_management", "speed",
+              "mcp_servers", "fallbacks"):
         if k in params:
             body[k] = params[k]
     if not isinstance(body.get("output_config"), dict):
         body.pop("output_config", None)  # a malformed value must not crash the relay
+    for k in _OPENAI_ONLY_PARAMS:
+        if k in params and not _is_noop(k, params[k]):
+            _warn_dropped(f"{k} (no Messages API equivalent)", dropped)
+    if isinstance(params.get("n"), int) and params["n"] > 1:
+        _warn_dropped("n (the relay forwards one choice)", dropped)
     tier = params.get("service_tier")
     if isinstance(tier, str):
         if tier in _TIER_TO_ANTHROPIC:
             body["service_tier"] = _TIER_TO_ANTHROPIC[tier]
         else:
-            _warn_dropped(f"service_tier={tier!r}")
+            _warn_dropped(f"service_tier={tier!r}", dropped)
     # OpenAI-inbound structured output / effort → the Anthropic equivalents.
     rf = params.get("response_format")
     if isinstance(rf, dict) and "output_config" not in body:
@@ -507,13 +610,13 @@ def to_anthropic_request(req: dict[str, Any], model: str,
             body["output_config"] = {"format": {"type": "json_schema",
                                                 "schema": rf["json_schema"]["schema"]}}
         elif rf.get("type") in ("json_object", "json_schema"):
-            _warn_dropped(f"response_format.type={rf.get('type')} (without a schema)")
+            _warn_dropped(f"response_format.type={rf.get('type')} (without a schema)", dropped)
     effort = _effort_to_anthropic(params.get("reasoning_effort"))
     if effort is not None and "effort" not in (body.get("output_config") or {}):
         body.setdefault("output_config", {})
         body["output_config"] = {**body["output_config"], "effort": effort}
     elif params.get("reasoning_effort") is not None and effort is None:
-        _warn_dropped(f"reasoning_effort={params.get('reasoning_effort')!r}")
+        _warn_dropped(f"reasoning_effort={params.get('reasoning_effort')!r}", dropped)
     if body.get("output_config") == {}:
         del body["output_config"]
     # metadata: Anthropic only accepts {"user_id": str}. An OpenAI-inbound app may attach an
@@ -522,11 +625,32 @@ def to_anthropic_request(req: dict[str, Any], model: str,
     md = params.get("metadata")
     if isinstance(md, dict) and md.get("user_id") is not None:
         body["metadata"] = {"user_id": md["user_id"]}
+    elif isinstance(params.get("user"), str) and params["user"]:
+        if len(params["user"]) <= 256:  # the Messages API's metadata.user_id limit
+            body["metadata"] = {"user_id": params["user"]}  # OpenAI's end-user id
+        else:
+            _warn_dropped("user (longer than the 256 characters metadata.user_id allows)", dropped)
+    for m in body["messages"]:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for j, part in enumerate(content):
+                if isinstance(part, dict) and part.get("type") in ("input_audio", "file"):
+                    # OpenAI-only parts: the Messages API rejects them, so keep the turn
+                    # valid and say what was lost.
+                    _warn_dropped(f"{part['type']} part (no Messages API equivalent; content omitted)", dropped)
+                    content[j] = {"type": "text", "text": "[non-text content omitted by relay]"}
     # OpenAI-inbound apps put stop sequences under "stop" (str or list).
     if "stop_sequences" not in body and "stop" in params:
         stop = params["stop"]
         body["stop_sequences"] = [stop] if isinstance(stop, str) else stop
     tc = _tool_choice_to_anthropic(params.get("tool_choice"))
+    if tc is None and params.get("tool_choice") is not None:
+        _warn_dropped(f"tool_choice {_tc_kind(params['tool_choice'])} (no Messages API equivalent)", dropped)
+    if params.get("parallel_tool_calls") is False and body.get("tools") \
+            and (tc or {}).get("type") != "none" and "disable_parallel_tool_use" not in (tc or {}):
+        # OpenAI `parallel_tool_calls: false` is Anthropic `disable_parallel_tool_use`
+        # (an explicit inbound flag is left alone).
+        tc = {**(tc or {"type": "auto"}), "disable_parallel_tool_use": True}
     if tc is not None:
         body["tool_choice"] = tc
     return body
@@ -599,6 +723,7 @@ class Relay:
         # entries are safe to evict once the set grows past a generous cap.
         self.quarantined: OrderedDict[str, None] = OrderedDict()
         self._warned_empty_model = False
+        self._warned_fallback_price = False
         self._warned_foreign = False
         self._tasks: set[asyncio.Task] = set()  # strong refs (create_task is weakly held)
         self.handled = 0
@@ -665,14 +790,42 @@ class Relay:
             _log(f"{pid}: inject {path} undeliverable (control plane unreachable) — "
                  f"quarantining + falling back to 502")
         # Either the server rejected our payload (400) or we could not deliver it at all.
-        # In both cases: never re-forward to the upstream. Quarantine + fall back to a 502.
+        # In both cases: never re-forward to the upstream. Quarantine + fall back to a
+        # minimal 502 — also when the rejected payload was itself an error injection
+        # (one of its optional fields was refused): the app's request must still end.
+        # The fallback keeps the provenance (the upstream was called and billed) unless
+        # that is what the server refused, in which case it goes bare.
         self._quarantine(pid)
-        if path != "/_control/error":
-            await self._post_ctl("/_control/error", {
-                "pending_id": pid, "status": 502, "type": "api_error",
-                "message": "relay: could not deliver upstream response "
-                           "(control plane rejected the payload or was unreachable)"})
+        fallback = {"pending_id": pid, "status": 502, "type": "api_error",
+                    "message": "relay: could not deliver upstream response "
+                               "(control plane rejected the payload or was unreachable)"}
+        prov = payload.get("provenance")
+        if prov and not (r is not None and "provenance" in r.text):
+            r2 = await self._post_ctl("/_control/error", {**fallback, "provenance": prov})
+            if r2 is None or r2.status_code != 400:
+                return True  # delivered, or undeliverable (a bare retry would not help)
+        await self._post_ctl("/_control/error", fallback)
         return True
+
+    def _provenance(self, model: str, dropped: list[str]) -> dict[str, Any]:
+        """What the server records about this upstream call. With `--price-by upstream`
+        the cost is computed with the upstream model's price table."""
+        out: dict[str, Any] = {"upstream_provider": self.cfg.kind,
+                               "translation": {"dropped_fields": list(dropped)}}
+        if model:  # an empty resolved model is not a value the server accepts
+            out["upstream_model"] = model
+        if getattr(self.cfg, "price_by", "inbound") == "upstream" and model:
+            out["pricing_model"] = model
+            if not self._warned_fallback_price and pricing.is_fallback_family(model):
+                self._warned_fallback_price = True
+                _log(f"WARNING: --price-by upstream: no built-in price table matches {model!r}; "
+                     f"unless the server's --pricing-file has an entry for it, costs use the "
+                     f"default family")
+        return out
+
+    @staticmethod
+    def _prov(provenance: dict[str, Any] | None) -> dict[str, Any]:
+        return {"provenance": provenance} if provenance else {}
 
     def _request_headers(self, req: dict[str, Any]) -> dict[str, str]:
         """Per-request upstream headers. Towards Anthropic, the betas the app asked for
@@ -698,12 +851,14 @@ class Relay:
         return any(fnmatch.fnmatch(model, g) for g in self.only)
 
     async def handle(self, pid: str, pending: dict[str, Any]) -> None:
+        provenance: dict[str, Any] | None = None
         try:
             # Everything that can raise lives inside the try, so the pending is ALWAYS
             # resolved (never a permanent ghost) — including request-shape access / mapping.
             req = pending["request"]
             inbound_model = req.get("model")
             model = map_model(inbound_model, self.cfg.model, self.model_map)
+            provenance = self._provenance(model, [])  # a failure before translation still names the upstream
             if not model and not self._warned_empty_model:
                 # Empty target model (no inbound model and no --model/--model-map). The
                 # upstream will 400; warn once so the cause isn't mistaken for a relay bug.
@@ -719,10 +874,32 @@ class Relay:
                 _log(f"WARNING: forwarding model {model!r} verbatim to a {self.cfg.kind} "
                      f"endpoint — it names a different vendor and will likely be rejected; "
                      f"pass --model or --model-map to route it")
+            dropped: list[str] = []
             if self.cfg.kind == "anthropic":
-                body = to_anthropic_request(req, model, self.cfg)
+                body = to_anthropic_request(req, model, self.cfg, dropped)
             else:
-                body = to_openai_request(req, model, self.cfg)
+                body = to_openai_request(req, model, self.cfg, dropped)
+            for what in dropped:
+                _warn_dropped(what)  # still logged once per parameter
+            provenance = self._provenance(model, dropped)
+            if dropped and getattr(self.cfg, "strict_translation", False):
+                _log(f"{pid}: --strict-translation: refusing (dropped: {', '.join(dropped)})")
+                await self._inject(pid, "/_control/error", {
+                    "status": 400, "type": "invalid_request_error",
+                    "message": "relay --strict-translation: the request carries parameters "
+                               f"the {self.cfg.kind} upstream cannot express: {', '.join(dropped)}",
+                    "provenance": provenance})
+                return
+            if getattr(self.cfg, "dry_run", False):
+                _log(f"{pid}: --dry-run: upstream request not sent:\n"
+                     + json.dumps(_abbreviate(body), ensure_ascii=False, indent=2))
+                # A 400 is final for the SDKs (a 5xx would be retried, logging the same
+                # request three times).
+                await self._inject(pid, "/_control/error", {
+                    "status": 400, "type": "invalid_request_error",
+                    "message": "relay --dry-run: the upstream request was translated and logged, "
+                               "not sent", "provenance": provenance})
+                return
             r = await self.http.post(self.upstream_url, json=body,
                                      headers=self._request_headers(req))
             try:
@@ -732,7 +909,7 @@ class Relay:
             if r.status_code >= 400:
                 fields = _upstream_error_fields(r.status_code, data)
                 _log(f"{pid}: upstream {r.status_code} ({fields['type']}) — relaying")
-                await self._inject(pid, "/_control/error", fields)
+                await self._inject(pid, "/_control/error", {**fields, "provenance": provenance})
                 return
             valid = (isinstance(data, dict) and (
                 isinstance(data.get("choices"), list) and data["choices"]
@@ -747,10 +924,12 @@ class Relay:
                 await self._inject(pid, "/_control/error", {
                     "status": 502, "type": "api_error",
                     "message": f"relay: unexpected upstream response shape: "
-                               f"{str(data)[:200]}"})
+                               f"{str(data)[:200]}", **self._prov(provenance)})
                 return
             payload = (from_anthropic_response(data) if self.cfg.kind == "anthropic"
                        else from_openai_response(data))
+            payload["provenance"] = {**provenance,
+                                     "usage_source": "upstream" if payload.get("usage") else "estimate"}
             n_tools = sum(1 for b in payload["content"]
                           if isinstance(b, dict) and b.get("type") == "tool_use")
             out_tokens = payload["usage"]["output_tokens"] if payload["usage"] else "?"
@@ -763,7 +942,7 @@ class Relay:
             _log(f"{pid}: upstream unreachable: {e!r}")
             await self._inject(pid, "/_control/error", {
                 "status": 502, "type": "api_error",
-                "message": f"relay: upstream unreachable: {e!r}"[:400]})
+                "message": f"relay: upstream unreachable: {e!r}"[:400], **self._prov(provenance)})
         except Exception as e:
             # Any other failure (unexpected shape, mapping error, ...) must still resolve the
             # pending — otherwise the app's request hangs forever. Surface as a 502.
@@ -771,7 +950,7 @@ class Relay:
             try:
                 await self._inject(pid, "/_control/error", {
                     "status": 502, "type": "api_error",
-                    "message": f"relay: internal error: {e!r}"[:400]})
+                    "message": f"relay: internal error: {e!r}"[:400], **self._prov(provenance)})
             except Exception:
                 pass
         finally:
@@ -875,6 +1054,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-concurrency", type=int, default=0,
                    help="cap simultaneous in-flight upstream calls (0 = unlimited); "
                         "protects against a burst fanning out and tripping upstream rate limits")
+    p.add_argument("--price-by", choices=("inbound", "upstream"), default="inbound",
+                   help="which model prices the cost puppetllm records: the inbound id "
+                        "(default) or the upstream model actually called")
+    p.add_argument("--strict-translation", action="store_true",
+                   help="refuse (400 to the app) any request carrying a parameter the "
+                        "upstream cannot express, instead of dropping it with a warning")
+    p.add_argument("--dry-run", action="store_true",
+                   help="translate and log the upstream request without sending it; the "
+                        "app gets a 400")
     p.add_argument("--only", default=None,
                    help='claim only pendings whose inbound model matches one of these globs '
                         '(comma-separated), leaving the rest for a human / AI-agent responder — '
