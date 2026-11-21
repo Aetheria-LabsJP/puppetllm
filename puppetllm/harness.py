@@ -107,6 +107,16 @@ def _public(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     lat = payload.get("_latency")
     if lat:
         out.update(lat)
+    # The injection extras a respond body may carry, back under their public names so a
+    # `GET /_control/config` → `POST /_control/config` round trip keeps them.
+    if payload.get("_choices"):
+        out["choices"] = [{k: c[k] for k in ("content", "stop_reason", "logprobs") if c.get(k) is not None}
+                          for c in payload["_choices"]]
+        out.pop("content", None)  # derived from the first choice; `choices` carries it
+    for private, public in (("_logprobs", "logprobs"), ("_provider_response", "provider_response"),
+                            ("_provenance", "provenance")):
+        if payload.get(private):
+            out[public] = payload[private]
     return out
 
 
@@ -249,6 +259,8 @@ class Harness:
     def __init__(self) -> None:
         self.config = Config()
         self.rules: list[Rule] = []
+        # Prompt-management fixtures: prompt ARN -> {system?, messages?, tools?} template.
+        self.prompts: dict[str, dict[str, Any]] = {}
         self.clock_offset: float = 0.0
         self._rng = random.Random()
         # [timestamp, input_tokens, output_tokens, counts_as_request] per record in the
@@ -261,6 +273,7 @@ class Harness:
     def reset(self) -> None:
         """What `/_control/clear` resets: scenario state, not server configuration."""
         self.rules.clear()
+        self.prompts.clear()
         self.clock_offset = 0.0
         self._window.clear()
         if self.config.seed is not None:

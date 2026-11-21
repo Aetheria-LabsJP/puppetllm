@@ -32,7 +32,9 @@ Bedrock routes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -214,6 +216,8 @@ _FINISH_REASON_MAP = {
     # (OpenAI's shape); `content_filter` is reserved for omitted-by-filter and can still
     # be requested verbatim by a responder.
     "refusal": "stop",
+    # Bedrock's guardrail stop: Chat Completions' name for an answer a filter cut.
+    "guardrail_intervened": "content_filter",
     "pause_turn": "stop",
     "model_context_window_exceeded": "length",
 }
@@ -290,6 +294,90 @@ def service_tier_out(requested: Any) -> str:
     return requested if isinstance(requested, str) and requested not in ("", "auto") else "default"
 
 
+_TOKEN_RE = re.compile(r"\s*\S+|\s+")
+
+
+def _fake_logprobs(text: str, top_k: int) -> list[dict[str, Any]]:
+    """A deterministic `logprobs.content` for a text answer: whitespace-attached pieces as
+    tokens, a logprob in [-2, 0) derived from each token, `top_k` alternatives per token
+    (the token itself first, then made-up variants at lower probability)."""
+    out: list[dict[str, Any]] = []
+    for tok in _TOKEN_RE.findall(text):
+        h = int(hashlib.sha256(tok.encode("utf-8", "surrogatepass")).hexdigest()[:8], 16)
+        lp = -round((h % 2000) / 1000.0, 6)
+        out.append({"token": tok, "logprob": lp, "top_logprobs": [
+            {"token": tok.rstrip() + "_" * i if i else tok, "logprob": round(lp - 0.5 * i, 6)}
+            for i in range(top_k)]})
+    return _with_bytes(out, top_k)
+
+
+def _with_bytes(entries: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+    """Logprob entries in the wire shape (`bytes` filled in, `top_logprobs` cut to what
+    the request asked for)."""
+    out: list[dict[str, Any]] = []
+    for e in entries:
+        item: dict[str, Any] = {"token": e["token"], "logprob": e["logprob"],
+                                "bytes": list(e["token"].encode("utf-8", "replace")),
+                                "top_logprobs": []}
+        if top_k > 0:
+            tops = e.get("top_logprobs") or [{"token": e["token"], "logprob": e["logprob"]}]
+            item["top_logprobs"] = [{"token": t["token"], "logprob": t["logprob"],
+                                     "bytes": list(t["token"].encode("utf-8", "replace"))}
+                                    for t in tops[:top_k]]
+        out.append(item)
+    return out
+
+
+def _logprob_entries(text: str, injected: list[dict[str, Any]] | None, top_k: int) -> list[dict[str, Any]]:
+    return (_with_bytes(injected, top_k) if injected else _fake_logprobs(text, top_k)) if text else []
+
+
+def _choice_logprobs(text: str, injected: list[dict[str, Any]] | None,
+                     requested: tuple[bool, int], refusal: bool = False) -> dict[str, Any] | None:
+    """The `logprobs` field of a choice: None unless the request asked; else the injected
+    fixture or deterministic values for the text — under `content`, or under `refusal`
+    when the answer is a refusal (the real API's shape)."""
+    wanted, top_k = requested
+    if not wanted or not text:
+        return None
+    return _logprobs_field(_logprob_entries(text, injected, top_k), refusal)
+
+
+def _logprobs_field(entries: list[dict[str, Any]], refusal: bool) -> dict[str, Any]:
+    return {"content": None, "refusal": entries} if refusal else {"content": entries, "refusal": None}
+
+
+def _logprobs_request_error(body: dict[str, Any]) -> str | None:
+    """The real API's rules: `logprobs` is a boolean; `top_logprobs` only with
+    `logprobs: true`, an integer 0..20."""
+    if body.get("logprobs") is not None and not isinstance(body["logprobs"], bool):
+        return "logprobs must be a boolean"
+    top = body.get("top_logprobs")
+    if top is None:
+        return None
+    if not body.get("logprobs"):
+        return "top_logprobs is only allowed when logprobs is enabled"
+    if isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= 20:
+        return "top_logprobs must be an integer between 0 and 20"
+    return None
+
+
+def _choice_sets(content_blocks: list[dict[str, Any]], stop_reason: str | None, n: int,
+                 choices: list[dict[str, Any]] | None, logprobs: list[dict[str, Any]] | None
+                 ) -> list[tuple[list[dict[str, Any]], str | None, list[dict[str, Any]] | None]]:
+    """(blocks, stop_reason, injected logprobs) per choice index: the individually
+    injected choices, else the one answer repeated n times."""
+    if choices:
+        return [(c["content_blocks"], c.get("stop_reason") or stop_reason, c.get("logprobs") or logprobs)
+                for c in choices]
+    return [(content_blocks, stop_reason, logprobs)] * max(1, n)
+
+
+def _text_of_blocks(blocks: list[dict[str, Any]]) -> str:
+    return "".join(str(b.get("text", "")) for b in blocks
+                   if isinstance(b, dict) and b.get("type") == "text")
+
+
 def build_non_stream_response(
     completion_id: str,
     model: str,
@@ -299,21 +387,28 @@ def build_non_stream_response(
     stop_reason: str | None = None,
     n: int = 1,
     service_tier: Any = None,
+    choices: list[dict[str, Any]] | None = None,
+    logprobs: list[dict[str, Any]] | None = None,
+    logprobs_requested: tuple[bool, int] = (False, 0),
 ) -> dict[str, Any]:
-    message, finish = _to_chat_message(content_blocks, refusal=(stop_reason == "refusal"))
-    if stop_reason is not None:
-        finish = finish_reason_for(stop_reason)
-    # n>1: the real API returns n independent samples, but the fake duplicates the same
-    # injected content (for index compatibility with apps that read choices[i]; it does
-    # not simulate content diversity).
+    # n>1: the real API returns n independent samples; the fake returns the individually
+    # injected `choices` when the responder supplied them, else the same answer at every
+    # index (for index compatibility with apps that read choices[i]).
+    out_choices = []
+    for i, (blocks, stop, lp) in enumerate(_choice_sets(content_blocks, stop_reason, n, choices, logprobs)):
+        message, finish = _to_chat_message(blocks, refusal=(stop == "refusal"))
+        if stop is not None:
+            finish = finish_reason_for(stop)
+        out_choices.append({"index": i, "message": message,
+                            "logprobs": _choice_logprobs(_text_of_blocks(blocks), lp, logprobs_requested,
+                                                         refusal=(stop == "refusal")),
+                            "finish_reason": finish})
     return {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [{"index": i, "message": message,
-                     "logprobs": None, "finish_reason": finish}
-                    for i in range(max(1, n))],
+        "choices": out_choices,
         "usage": _usage_out(usage),
         "service_tier": service_tier_out(service_tier),
         "system_fingerprint": None,
@@ -330,6 +425,9 @@ def stream_chunk_dicts(
     stop_reason: str | None = None,
     n: int = 1,
     service_tier: Any = None,
+    choices: list[dict[str, Any]] | None = None,
+    logprobs: list[dict[str, Any]] | None = None,
+    logprobs_requested: tuple[bool, int] = (False, 0),
 ) -> list[dict[str, Any]]:
     """Build the sequence of chunk dicts for the OpenAI streaming protocol.
 
@@ -337,65 +435,88 @@ def stream_chunk_dicts(
     delta, a tool call is "leading delta of id+name → following delta of arguments",
     and the terminating delta is empty + finish_reason. When include_usage is set,
     every chunk carries `usage: null`, and after termination a usage-only chunk (empty
-    choices) is sent (per the real API spec). With n>1 the same delta sequence is
-    emitted once per choice index (interleaved), mirroring the non-stream duplication.
+    choices) is sent (per the real API spec). With n>1 each choice index streams its own
+    answer (the individually injected `choices`, else the same one), interleaved by
+    position. A content delta carries the logprobs of its tokens when the request asked.
     """
     tier = service_tier_out(service_tier)
-    refusal = stop_reason == "refusal"
 
-    def chunk(delta: dict[str, Any], finish: str | None = None, index: int = 0) -> dict[str, Any]:
+    def chunk(delta: dict[str, Any], finish: str | None = None, index: int = 0,
+              lp: dict[str, Any] | None = None) -> dict[str, Any]:
         c = {
             "id": completion_id, "object": "chat.completion.chunk",
             "created": created, "model": model,
             "service_tier": tier, "system_fingerprint": None,
             "choices": [{"index": index, "delta": delta,
-                         "logprobs": None, "finish_reason": finish}],
+                         "logprobs": lp, "finish_reason": finish}],
         }
         if include_usage:
             c["usage"] = None
         return c
 
-    # Build the per-choice delta sequence once, then fan it out over the n indices.
-    deltas: list[dict[str, Any]] = [{"role": "assistant", "content": "", "refusal": None}]
-    finish = "stop"
-    tc_index = 0
-    for b in content_blocks:
-        btype = b.get("type") if isinstance(b, dict) else None
-        if btype == "text":
-            text = str(b.get("text", ""))
-            pieces = [text[i:i + _TEXT_CHUNK]
-                      for i in range(0, len(text), _TEXT_CHUNK)] or [""]
-            for p in pieces:
-                # a refusal streams as `delta.refusal` (OpenAI's shape), never as content
-                deltas.append({"refusal": p} if refusal else {"content": p})
-        elif btype == "tool_use":
-            finish = "tool_calls"
-            call = tool_call_from_canonical(b)
-            if call["type"] == "custom":
-                deltas.append({"tool_calls": [{
-                    "index": tc_index, "id": call["id"], "type": "custom",
-                    "custom": {"name": call["custom"]["name"], "input": ""}}]})
-                deltas.append({"tool_calls": [{
-                    "index": tc_index, "custom": {"input": call["custom"]["input"]}}]})
-            else:
-                deltas.append({"tool_calls": [{
-                    "index": tc_index, "id": call["id"], "type": "function",
-                    "function": {"name": call["function"]["name"], "arguments": ""},
-                }]})
-                deltas.append({"tool_calls": [{
-                    "index": tc_index,
-                    "function": {"arguments": call["function"]["arguments"]},
-                }]})
-            tc_index += 1
-        # Skip other blocks (thinking etc. have no Chat Completions representation).
-    if stop_reason is not None:
-        finish = finish_reason_for(stop_reason)
-    n = max(1, n)
+    def deltas_for(blocks: list[dict[str, Any]], stop: str | None,
+                   injected: list[dict[str, Any]] | None
+                   ) -> tuple[list[tuple[dict[str, Any], dict[str, Any] | None]], str]:
+        refusal = stop == "refusal"
+        wanted, top_k = logprobs_requested
+        # The whole answer's logprobs, handed out piece by piece as the text streams.
+        whole_text = _text_of_blocks(blocks)
+        entries = _logprob_entries(whole_text, injected, top_k) if wanted else []
+        pos = 0  # next entry to hand out
+        out: list[tuple[dict[str, Any], dict[str, Any] | None]] = [
+            ({"role": "assistant", "content": "", "refusal": None}, None)]
+        finish = "stop"
+        tc_index = 0
+        for b in blocks:
+            btype = b.get("type") if isinstance(b, dict) else None
+            if btype == "text":
+                text = str(b.get("text", ""))
+                pieces = [text[i:i + _TEXT_CHUNK]
+                          for i in range(0, len(text), _TEXT_CHUNK)] or [""]
+                for p in pieces:
+                    lp = None
+                    if wanted:
+                        start, covered = pos, 0
+                        while pos < len(entries) and covered < len(p):
+                            covered += len(entries[pos]["token"])
+                            pos += 1
+                        lp = _logprobs_field(entries[start:pos], refusal)
+                    # a refusal streams as `delta.refusal` (OpenAI's shape), never as content
+                    out.append(({"refusal": p} if refusal else {"content": p}, lp))
+            elif btype == "tool_use":
+                finish = "tool_calls"
+                call = tool_call_from_canonical(b)
+                if call["type"] == "custom":
+                    out.append(({"tool_calls": [{
+                        "index": tc_index, "id": call["id"], "type": "custom",
+                        "custom": {"name": call["custom"]["name"], "input": ""}}]}, None))
+                    out.append(({"tool_calls": [{
+                        "index": tc_index, "custom": {"input": call["custom"]["input"]}}]}, None))
+                else:
+                    out.append(({"tool_calls": [{
+                        "index": tc_index, "id": call["id"], "type": "function",
+                        "function": {"name": call["function"]["name"], "arguments": ""},
+                    }]}, None))
+                    out.append(({"tool_calls": [{
+                        "index": tc_index,
+                        "function": {"arguments": call["function"]["arguments"]},
+                    }]}, None))
+                tc_index += 1
+            # Skip other blocks (thinking etc. have no Chat Completions representation).
+        if stop is not None:
+            finish = finish_reason_for(stop)
+        return out, finish
+
+
+    per_choice = [deltas_for(blocks, stop, lp)
+                  for blocks, stop, lp in _choice_sets(content_blocks, stop_reason, n, choices, logprobs)]
     out: list[dict[str, Any]] = []
-    for d in deltas:
-        for i in range(n):
-            out.append(chunk(d, index=i))
-    for i in range(n):
+    for pos in range(max(len(d) for d, _f in per_choice)):
+        for i, (deltas, _finish) in enumerate(per_choice):
+            if pos < len(deltas):
+                d, lp = deltas[pos]
+                out.append(chunk(d, index=i, lp=lp))
+    for i, (_deltas, finish) in enumerate(per_choice):
         out.append(chunk({}, finish=finish, index=i))
     if include_usage:
         out.append({
@@ -493,6 +614,11 @@ def build_router() -> APIRouter:
                              path=request.url.path)
             return _openai_error_response(400, "invalid_request_error",
                                           "tools: must be a list", headers=headers, param="tools")
+        lp_err = _logprobs_request_error(body)
+        if lp_err is not None:
+            fs.note_rejected("openai", model, headers["x-request-id"], lp_err, path=request.url.path)
+            return _openai_error_response(400, "invalid_request_error", lp_err, headers=headers,
+                                          param="logprobs" if lp_err.startswith("logprobs") else "top_logprobs")
         canonical = normalize_chat_body(body)
 
         try:
@@ -524,6 +650,8 @@ def build_router() -> APIRouter:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         stop_reason = result.get("stop_reason")
+        logprobs_requested = (bool(body.get("logprobs")), body.get("top_logprobs") or 0)
+        choices, injected_logprobs = result.get("choices"), result.get("logprobs")
 
         if is_stream:
             so = body.get("stream_options")
@@ -533,7 +661,7 @@ def build_router() -> APIRouter:
                 for c in stream_chunk_dicts(
                     completion_id, model_out, result["content_blocks"],
                     result["usage"], created, include_usage, stop_reason, n,
-                    body.get("service_tier"))
+                    body.get("service_tier"), choices, injected_logprobs, logprobs_requested)
             ]
             payloads.append(b"data: [DONE]\n\n")
 
@@ -548,7 +676,8 @@ def build_router() -> APIRouter:
                                      headers=_finish_headers())
         return JSONResponse(build_non_stream_response(
             completion_id, model_out, result["content_blocks"],
-            result["usage"], created, stop_reason, n, body.get("service_tier")),
+            result["usage"], created, stop_reason, n, body.get("service_tier"),
+            choices, injected_logprobs, logprobs_requested),
             headers=_finish_headers())
 
     return router

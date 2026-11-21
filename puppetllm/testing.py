@@ -34,7 +34,12 @@ from .harness import LATENCY_KEYS
 
 
 class PuppetError(RuntimeError):
-    """A control call was refused (the server's error message is the text)."""
+    """A control call was refused (the server's error message is the text; `status` is
+    the HTTP status)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class PuppetAssertionError(AssertionError):
@@ -60,18 +65,21 @@ class Expectation:
 
     def respond(self, text: str | None = None, *, content: list[dict[str, Any]] | None = None,
                 stop_reason: str | None = None, usage: dict[str, Any] | None = None,
+                choices: list[dict[str, Any]] | None = None,
+                logprobs: list[dict[str, Any]] | None = None,
+                provider_response: dict[str, Any] | None = None,
                 **latency: int) -> "Expectation":
         body: dict[str, Any] = {}
         if content is not None:
             body["content"] = content
         elif text is not None:
             body["text"] = text
-        else:
+        elif not choices:
             body["content"] = []
-        if stop_reason is not None:
-            body["stop_reason"] = stop_reason
-        if usage is not None:
-            body["usage"] = usage
+        for k, v in (("stop_reason", stop_reason), ("usage", usage), ("choices", choices),
+                     ("logprobs", logprobs), ("provider_response", provider_response)):
+            if v is not None:
+                body[k] = v
         return self._add({"respond": body, **_latency_only(latency)})
 
     def error(self, status: int = 500, *, type: str | None = None, message: str | None = None,
@@ -142,7 +150,8 @@ class Puppet:
                 detail = r.json().get("error", r.text)
             except ValueError:
                 detail = r.text
-            raise PuppetError(f"{r.request.method} {r.request.url.path} -> {r.status_code}: {detail}")
+            raise PuppetError(f"{r.request.method} {r.request.url.path} -> {r.status_code}: {detail}",
+                              status=r.status_code)
 
     def _check(self, r: httpx.Response) -> Any:
         self._check_status(r)
@@ -212,12 +221,23 @@ class Puppet:
             body["content"] = content
         elif text is not None:
             body["text"] = text
-        else:
+        elif not body.get("choices"):
             body["content"] = []
         for k, v in (("pending_id", pending_id), ("custom_id", custom_id), ("batch_id", batch_id)):
             if v is not None:
                 body[k] = v
         self._post("/_control/respond", body)
+
+    def prompts(self, templates: dict[str, dict[str, Any]] | None = None, *,
+                replace: bool = False) -> dict[str, dict[str, Any]]:
+        """Prompt-management fixtures (`/_control/prompts`): with `templates`, add them
+        (or replace the whole set with `replace=True`); always returns the current set."""
+        if templates is not None:
+            if replace:
+                self._put("/_control/prompts", {"prompts": templates})
+            else:
+                self._post("/_control/prompts", {"prompts": templates})
+        return self._get("/_control/prompts")["prompts"]
 
     def respond_all(self, text: str | None = None, *, content: list[dict[str, Any]] | None = None,
                     **extra: Any) -> list[str]:
@@ -330,9 +350,18 @@ class Puppet:
         """The configuration and rules as they are now (`{"config", "rules"}`), in the
         form `reset()` re-applies — take it once the server has started to preserve what
         the environment / a `--config` file set up."""
-        return {"config": self.config(),
-                "rules": [{k: r[k] for k in ("id", "match", "steps", "repeat")}
-                          for r in self.rules()["rules"]]}
+        out: dict[str, Any] = {"config": self.config(),
+                               "rules": [{k: r[k] for k in ("id", "match", "steps", "repeat")}
+                                         for r in self.rules()["rules"]]}
+        try:
+            prompts = self.prompts()
+        except PuppetError as e:  # an older server without /_control/prompts
+            if e.status != 404:
+                raise
+            prompts = {}
+        if prompts:
+            out["prompts"] = prompts
+        return out
 
     def reset(self, baseline: dict[str, Any] | None = None) -> None:
         """`clear()` plus the configuration and rules set back to `baseline` (a
@@ -341,11 +370,13 @@ class Puppet:
         self.clear(config=True)
         if not baseline:
             return
-        if "config" in baseline or "rules" in baseline:
+        if "config" in baseline or "rules" in baseline or "prompts" in baseline:
             if baseline.get("config"):
                 self.config(**baseline["config"])
             if baseline.get("rules"):
                 self.set_rules(baseline["rules"])
+            if baseline.get("prompts"):
+                self.prompts(baseline["prompts"], replace=True)
         else:
             self.config(**baseline)
 

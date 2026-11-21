@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import json
 import time
 import uuid
@@ -455,20 +456,86 @@ def _inference_config(inf: Any) -> dict[str, Any]:
     return out
 
 
-_PROMPT_ARN_RE = re.compile(r"^arn:aws(?:-[a-z-]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:prompt/")
+# `arn:aws[-partition]:bedrock:<region>:<account>:prompt/<id>[:<version>]`
+PROMPT_ARN_RE = re.compile(
+    r"^(?P<base>arn:aws(?:-[a-z-]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:prompt/[A-Za-z0-9]+)(?::(?P<version>[A-Za-z0-9]+))?$")
 
 
 def is_prompt_arn(model_id: str) -> bool:
     """A prompt-management ARN in the model-id position (`arn:…:prompt/ID[:version]`)."""
-    return bool(_PROMPT_ARN_RE.match(model_id or ""))
+    return bool(PROMPT_ARN_RE.match(model_id or ""))
 
 
-def to_canonical(body: dict[str, Any], *, prompt_arn: bool = False) -> dict[str, Any]:
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}")
+
+
+def prompt_template_for(prompts: dict[str, dict[str, Any]], model_id: str) -> dict[str, Any] | None:
+    """The registered template for a prompt ARN: the exact ARN, else the ARN without its
+    `:version` suffix (a template registered by base ARN serves every version)."""
+    m = PROMPT_ARN_RE.match(model_id or "")
+    if m is None:
+        return None
+    if model_id in prompts:
+        return prompts[model_id]
+    return prompts.get(m.group("base")) if m.group("version") else None
+
+
+def prompt_variables(body: dict[str, Any]) -> dict[str, str]:
+    """`promptVariables` as name -> text, validated as the real API does
+    (`{"name": {"text": "..."}}`)."""
+    raw = body.get("promptVariables")
+    if raw is None:
+        return {}
+    _require(isinstance(raw, dict), "promptVariables: must be an object of name -> {text}")
+    out: dict[str, str] = {}
+    for name, v in raw.items():
+        _require(isinstance(v, dict) and isinstance(v.get("text"), str) and set(v) == {"text"},
+                 f"promptVariables.{name}: must be {{\"text\": \"...\"}}")
+        out[str(name)] = v["text"]
+    return out
+
+
+def render_prompt_template(template: dict[str, Any], variables: dict[str, str]) -> dict[str, Any]:
+    """A registered prompt-management template (`/_control/prompts`) with every `{{name}}`
+    in its prompt text — the system text, message text and tool descriptions, not schemas
+    or ids — replaced by the variable's text; unknown names stay."""
+    def fill(text: Any) -> Any:
+        return _PLACEHOLDER_RE.sub(lambda m: variables.get(m.group(1), m.group(0)), text)
+
+    def fill_blocks(content: Any) -> Any:
+        if isinstance(content, str):
+            return fill(content)
+        if isinstance(content, list):
+            out_blocks = []
+            for b in content:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    b = {**b, "text": fill(b["text"])}
+                elif isinstance(b, dict) and b.get("type") == "tool_result" and "content" in b:
+                    b = {**b, "content": fill_blocks(b["content"])}  # a tool result's own text
+                out_blocks.append(b)
+            return out_blocks
+        return content
+    out = copy.deepcopy(template)
+    if "system" in out:
+        out["system"] = fill_blocks(out["system"])
+    if isinstance(out.get("messages"), list):
+        out["messages"] = [{**m, "content": fill_blocks(m["content"])} if isinstance(m, dict) and "content" in m else m
+                           for m in out["messages"]]
+    if isinstance(out.get("tools"), list):
+        out["tools"] = [{**t, "description": fill(t["description"])} if isinstance(t, dict) and isinstance(t.get("description"), str) else t
+                        for t in out["tools"]]
+    return out
+
+
+def to_canonical(body: dict[str, Any], *, prompt_arn: bool = False,
+                 prompt_template: dict[str, Any] | None = None) -> dict[str, Any]:
     """Converse request body -> canonical (Anthropic Messages-style) body.
 
     Raises ConverseValidationError for shapes the real API rejects with ValidationException.
     Cache points are resolved over the flattened tools -> system -> messages sequence, the
-    order in which the real API evaluates checkpoints.
+    order in which the real API evaluates checkpoints. With a prompt-management ARN as the
+    model id and a registered `prompt_template`, the template rendered with the request's
+    `promptVariables` supplies the system / messages / tools the request leaves out.
     """
     _require(isinstance(body, dict), "request body must be a JSON object")
     unknown = sorted(k for k in body if k not in _REQUEST_MEMBERS)
@@ -476,13 +543,23 @@ def to_canonical(body: dict[str, Any], *, prompt_arn: bool = False) -> dict[str,
     sink = _CachePointSink()
     tools, tool_choice = _tools_to_canonical(body.get("toolConfig"), sink)
     system = _system_to_canonical(body.get("system"), sink)
-    if prompt_arn and body.get("messages") is None and isinstance(body.get("promptVariables"), dict):
+    variables = prompt_variables(body) if prompt_arn else {}
+    rendered = render_prompt_template(prompt_template, variables) if prompt_arn and prompt_template else None
+    if rendered is not None:
+        tools = tools or list(rendered.get("tools") or [])
+        if not system and rendered.get("system"):
+            system = rendered["system"] if isinstance(rendered["system"], list) \
+                else [{"type": "text", "text": rendered["system"]}]
+    if rendered is not None and body.get("messages") is None and rendered.get("messages"):
+        messages: list[dict[str, Any]] = rendered["messages"]  # the template's are the request's
+    elif prompt_arn and body.get("messages") is None and (
+            rendered is not None or body.get("promptVariables") is not None):
         # A prompt-management ARN as `modelId`: the stored prompt supplies the messages and
         # the request carries only `promptVariables`, so `messages` is legitimately absent
         # (the model requires `modelId` alone). The responder sees an empty list plus
         # `converse.promptVariables`. With an ordinary model id `messages` stays required —
         # a request that sends prompt-management fields there is a production mistake.
-        messages: list[dict[str, Any]] = []
+        messages = []
     else:
         messages = _messages_to_canonical(body.get("messages"), sink)
     out: dict[str, Any] = {"messages": messages}
@@ -743,13 +820,22 @@ def build_response(result: dict[str, Any], model: str, snapshot: dict[str, Any],
         resp["performanceConfig"] = {"latency": extras["performanceConfig"].get("latency") or "standard"}
     if isinstance(extras.get("serviceTier"), dict) and extras["serviceTier"].get("type"):
         resp["serviceTier"] = {"type": extras["serviceTier"]["type"]}
+    trace = converse_trace(result)
+    if trace is not None:
+        resp["trace"] = trace
     return resp
+
+
+def converse_trace(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The injected `provider_response.converse.trace` (guardrail / prompt-router trace)."""
+    return ((result.get("provider_response") or {}).get("converse") or {}).get("trace")
 
 
 def stream_events(content_blocks: list[dict[str, Any]], stop_reason: str,
                   usage: dict[str, Any] | None, latency_ms: int,
                   extras: dict[str, Any] | None = None,
-                  additional: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
+                  additional: dict[str, Any] | None = None,
+                  trace: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
     """(event name, payload) sequence of a ConverseStream response. `usage=None` omits the
     trailing metadata (used for partial streams that end in an exception)."""
     out: list[tuple[str, dict[str, Any]]] = [("messageStart", {"role": "assistant"})]
@@ -799,6 +885,8 @@ def stream_events(content_blocks: list[dict[str, Any]], stop_reason: str,
         meta["performanceConfig"] = {"latency": extras["performanceConfig"].get("latency") or "standard"}
     if isinstance(extras.get("serviceTier"), dict) and extras["serviceTier"].get("type"):
         meta["serviceTier"] = {"type": extras["serviceTier"]["type"]}
+    if trace is not None:
+        meta["trace"] = trace
     out.append(("metadata", meta))
     return out
 
@@ -826,8 +914,12 @@ async def _receive(model_id: str, request: Request, *, is_stream: bool, req_id: 
         fs.note_rejected("bedrock", model.canonical, req_id, errmsg, path=request.url.path)
         return _error(400, "ValidationException", errmsg, req_id)
     try:
-        canonical = to_canonical(body, prompt_arn=is_prompt_arn(model_id))
+        template = prompt_template_for(fs.harness.prompts, model_id)
+        canonical = to_canonical(body, prompt_arn=is_prompt_arn(model_id), prompt_template=template)
         extras = converse_extras(body)
+        if is_prompt_arn(model_id):
+            extras["prompt_arn"] = model_id
+            extras["prompt_rendered"] = bool(template and template.get("messages")) and body.get("messages") is None
         additional_fields({}, extras.get("additionalModelResponseFieldPaths"))  # pointer syntax check
         snapshot, fut = await fs.register_request(
             "bedrock", model.canonical, canonical, is_stream=is_stream,
@@ -889,7 +981,8 @@ def build_router() -> APIRouter:
                 spec = inp["converse"]
                 if not isinstance(spec, dict):
                     raise ConverseValidationError("input.converse must be an object")
-                canonical = to_canonical(spec, prompt_arn=is_prompt_arn(model_id))
+                canonical = to_canonical(spec, prompt_arn=is_prompt_arn(model_id),
+                                         prompt_template=prompt_template_for(fs.harness.prompts, model_id))
             n = fs.count_input_tokens(canonical, model.canonical)
         except (ConverseValidationError, fs.RequestValidationError) as e:
             return _error(400, "ValidationException", str(e), req_id)
@@ -961,10 +1054,11 @@ def build_router() -> APIRouter:
                 return _error(400, "ValidationException", str(e), req_id)
             # The metrics event closes the stream: its latency includes the simulated
             # pacing of every frame before it (counted once the events exist).
-            events = stream_events(blocks, stop_reason, result["usage"], 0, extras, additional)
+            trace = converse_trace(result)
+            events = stream_events(blocks, stop_reason, result["usage"], 0, extras, additional, trace)
             _first, total_ms = _bedrock.stream_latencies(result, snapshot, len(events))
             events = stream_events(blocks, stop_reason, result["usage"], total_ms, extras,
-                                   additional)
+                                   additional, trace)
             frames = [eventstream.encode_event(name, data) for name, data in events]
 
         pace = fs.frame_pacer(result)

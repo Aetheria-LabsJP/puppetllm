@@ -60,6 +60,39 @@ class Provenance(BaseModel):
     translation: Translation | None = None
 
 
+class TopLogprob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token: str
+    logprob: float = Field(le=0, allow_inf_nan=False)
+
+
+class LogprobEntry(TopLogprob):
+    """One token of an OpenAI `logprobs` fixture."""
+    top_logprobs: list[TopLogprob] | None = None
+
+
+class Choice(BaseModel):
+    """One of the `n` answers of an OpenAI request (`choices` on a respond body)."""
+    model_config = ConfigDict(extra="forbid")
+    text: str | None = None
+    content: list[ContentBlock] = Field(default_factory=list)
+    stop_reason: str | None = None
+    logprobs: list[LogprobEntry] | None = None
+
+
+class TraceExtras(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trace: dict[str, Any] | None = Field(
+        default=None, description="Converse `trace` (guardrail / promptRouter) or InvokeModel `amazon-bedrock-trace` (guardrail), verbatim")
+
+
+class ProviderResponse(BaseModel):
+    """Response extras one wire format carries and the canonical answer has no field for."""
+    model_config = ConfigDict(extra="forbid")
+    converse: TraceExtras | None = None
+    invoke: TraceExtras | None = None
+
+
 class Target(BaseModel):
     """Which pending an injection addresses (omit all when exactly one is pending)."""
     pending_id: str | None = None
@@ -75,6 +108,11 @@ class RespondBody(Target, Latency):
     stop_details: dict[str, Any] | None = None
     usage: Usage | None = None
     provenance: Provenance | None = None
+    choices: list[Choice] | None = Field(
+        default=None, description="OpenAI n > 1: one answer per choice (the first stands for `content`)")
+    logprobs: list[LogprobEntry] | None = Field(
+        default=None, description="OpenAI logprobs fixture for the text answer")
+    provider_response: ProviderResponse | None = None
     responses: list[dict[str, Any]] | None = Field(
         default=None, description="bulk form: a list of respond bodies, each with its own target")
 
@@ -128,6 +166,20 @@ class Rule(BaseModel):
 
 class RulesBody(BaseModel):
     rules: list[Rule]
+
+
+class PromptTemplate(BaseModel):
+    """A prompt-management fixture: Anthropic-shaped `system` / `messages` / `tools` whose
+    text may hold `{{variable}}` placeholders."""
+    model_config = ConfigDict(extra="forbid")
+    system: str | list[dict[str, Any]] | None = None
+    messages: list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
+
+
+class PromptsBody(BaseModel):
+    """`PUT` / `POST /_control/prompts` — prompt ARN -> template."""
+    prompts: dict[str, PromptTemplate]
 
 
 class RateLimit(BaseModel):

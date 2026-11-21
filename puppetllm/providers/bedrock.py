@@ -96,7 +96,27 @@ def _invoke_options(request: Request) -> tuple[dict[str, str], str | None]:
         if latency not in _LATENCIES:
             return out, f"X-Amzn-Bedrock-PerformanceConfig-Latency: must be one of {list(_LATENCIES)}"
         out["latency"] = latency
+    guardrail = request.headers.get("x-amzn-bedrock-guardrailidentifier")
+    if guardrail:
+        out["guardrail_identifier"] = guardrail  # the answer then reports the guardrail's action
     return out, None
+
+
+def invoke_trace(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The injected `provider_response.invoke.trace` — InvokeModel's `amazon-bedrock-trace`."""
+    return ((result.get("provider_response") or {}).get("invoke") or {}).get("trace")
+
+
+def guardrail_action(snapshot: dict[str, Any], stop_reason: Any) -> str | None:
+    """The body field `amazon-bedrock-guardrailAction` of an InvokeModel answer: INTERVENED
+    when the responder stopped with `guardrail_intervened`, NONE when the request
+    configured a guardrail that let the answer through, absent when no guardrail was
+    involved. (The real service reports it in the body only — never as a header.)"""
+    if stop_reason == "guardrail_intervened":
+        return "INTERVENED"
+    if (snapshot.get("bedrock_options") or {}).get("guardrail_identifier"):
+        return "NONE"
+    return None
 
 
 def _option_headers(snapshot: dict[str, Any]) -> dict[str, str]:
@@ -363,16 +383,19 @@ def build_router() -> APIRouter:
         # message JSON, whose `model` is the Anthropic-side name). Like real Bedrock,
         # attach requestid, token-count and latency headers (approximate values).
         usage = result["usage"]
-        return JSONResponse(
-            fs._build_non_stream_response(
-                result["message_id"], model.canonical, result["content_blocks"], usage,
-                result.get("stop_reason"), result.get("stop_sequence"),
-                result.get("stop_details"), snapshot.get("params"),
-            ),
-            headers={"x-amzn-requestid": req_id,
-                     **_option_headers(snapshot),
-                     **_token_headers(usage, _latency_ms(snapshot))},
+        body_out = fs._build_non_stream_response(
+            result["message_id"], model.canonical, result["content_blocks"], usage,
+            result.get("stop_reason"), result.get("stop_sequence"),
+            result.get("stop_details"), snapshot.get("params"),
         )
+        action = guardrail_action(snapshot, result.get("stop_reason"))
+        if action is not None:
+            body_out["amazon-bedrock-guardrailAction"] = action
+        trace = invoke_trace(result)
+        if trace is not None:
+            body_out["amazon-bedrock-trace"] = trace
+        return JSONResponse(body_out, headers={"x-amzn-requestid": req_id, **_option_headers(snapshot),
+                                               **_token_headers(usage, _latency_ms(snapshot))})
 
     @router.post("/model/{model_id:path}/invoke-with-response-stream")
     async def invoke_stream(model_id: str, request: Request) -> Any:
@@ -428,10 +451,16 @@ def build_router() -> APIRouter:
         # invocation latency is stamped when the last frame is built.
         usage = result["usage"]
         first_byte_ms, total_ms = stream_latencies(result, snapshot, len(events))
+        action = guardrail_action(snapshot, result.get("stop_reason"))
+        trace = invoke_trace(result)
         for _name, data in events:
             if data.get("type") == "message_stop":
                 data["amazon-bedrock-invocationMetrics"] = _invocation_metrics(
                     usage, total_ms, first_byte_ms)
+                if action is not None:
+                    data["amazon-bedrock-guardrailAction"] = action
+                if trace is not None:
+                    data["amazon-bedrock-trace"] = trace
         frames = [eventstream.encode_chunk(data) for _name, data in events]
 
         pace = fs.frame_pacer(result)

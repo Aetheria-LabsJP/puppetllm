@@ -292,7 +292,8 @@ def _apply_batch_discount(cost: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]],
-                   *, pricing_model: str | None = None) -> tuple[dict, dict]:
+                   *, pricing_model: str | None = None,
+                   choice_blocks: list[list[dict[str, Any]]] | None = None) -> tuple[dict, dict]:
     """Build usage and an estimated cost from the snapshot (input) and the response content_blocks.
 
     Follows Anthropic usage semantics:
@@ -316,8 +317,12 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
     # saw neither the call nor a search: no tokens, no count, no fee).
     carries = _carries_server_tools(snapshot)
     billable = _GENERATED_BLOCK_TYPES if carries else ("text", "tool_use", "thinking", "redacted_thinking")
-    generated = [b for b in content_blocks if isinstance(b, dict) and b.get("type") in billable]
-    output = pricing.estimate_output_tokens(generated) * n
+    # Individually injected choices are billed each for its own content; otherwise the one
+    # answer is duplicated n times.
+    sets = choice_blocks if choice_blocks else [content_blocks] * n
+    n = len(sets)
+    output = sum(pricing.estimate_output_tokens(
+        [b for b in cb if isinstance(b, dict) and b.get("type") in billable]) for cb in sets)
     server_tool_use = _server_tool_requests(content_blocks) if carries else None
     geo, speed = _geo_and_speed(snapshot)
     cost = pricing.compute_cost(
@@ -339,7 +344,7 @@ def _compute_usage(snapshot: dict[str, Any], content_blocks: list[dict[str, Any]
         # Real-API breakdown of cache writes by TTL.
         "cache_creation": {"ephemeral_5m_input_tokens": creation_5m,
                            "ephemeral_1h_input_tokens": creation_1h},
-        "output_tokens_details": {"thinking_tokens": _thinking_tokens(content_blocks) * n},
+        "output_tokens_details": {"thinking_tokens": sum(_thinking_tokens(cb) for cb in sets)},
         "server_tool_use": ({k: v * n for k, v in server_tool_use.items()}
                             if server_tool_use else None),
         # Anthropic Message Batches carry `batch_id`; Bedrock batch inference carries
@@ -510,6 +515,8 @@ async def _record_and_reset(
     provenance: dict[str, Any] | None = None,
     pricing_model: str | None = None,
     generation: int | None = None,
+    choices: list[dict[str, Any]] | None = None,
+    provider_response: dict[str, Any] | None = None,
 ) -> None:
     """Append one entry to history and remove that pending from the registry.
 
@@ -542,6 +549,12 @@ async def _record_and_reset(
     if provenance:
         # What a relay knew about the upstream call (provider, model, dropped fields).
         entry["provenance"] = provenance
+    if choices and request_snapshot.get("provider") == "openai":
+        # Individually injected OpenAI choices (response_blocks holds the first).
+        entry["choices"] = [{"content_blocks": c["content_blocks"], "stop_reason": c.get("stop_reason")}
+                            for c in choices]
+    if provider_response:
+        entry["provider_response"] = provider_response
     if injected_error is not None:
         entry["injected_error"] = injected_error
     if usage_overridden:
@@ -1125,7 +1138,19 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         # providers) all agree. (The encoders also skip unknown blocks defensively, but this
         # is what makes usage and /_control/history reflect exactly what the caller receives.)
         content_blocks = _normalize_blocks(content_blocks)
-        usage, cost = _compute_usage(snapshot, content_blocks, pricing_model=pricing_model)
+        choice_results = None
+        injected_choices = response_payload.get("_choices")
+        if injected_choices:
+            # One answer per OpenAI choice, cycled / cut to the n the request asked for.
+            want = _choices(snapshot)
+            picked = [copy.deepcopy(injected_choices[i % len(injected_choices)]) for i in range(want)]
+            choice_results = [{"content_blocks": _normalize_blocks(c["content"]),
+                               "stop_reason": c.get("stop_reason"), "logprobs": c.get("logprobs")}
+                              for c in picked]
+            content_blocks = choice_results[0]["content_blocks"]
+        usage, cost = _compute_usage(
+            snapshot, content_blocks, pricing_model=pricing_model,
+            choice_blocks=[c["content_blocks"] for c in choice_results] if choice_results else None)
         # Optional usage override from /_control/respond (validated there): real token
         # counts, e.g. relayed from an upstream API. Partial overrides are allowed —
         # provided keys replace the approx values; cost is recomputed from the result.
@@ -1133,7 +1158,9 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         usage_overridden = bool(override)
         if usage_overridden:
             override = dict(override)
-            n = _choices(snapshot)
+            # Individually injected choices are already n answers: an override then
+            # describes all of them and is not scaled.
+            n = 1 if choice_results else _choices(snapshot)
             if n > 1:
                 # The override describes ONE generated answer (a relay never forwards `n`);
                 # the fake hands out n copies, so bill n like the real API would. Only the
@@ -1189,21 +1216,32 @@ async def await_resolution(snapshot: dict[str, Any], fut: asyncio.Future,
         # The message id can name this request as `diagnostics.previous_message_id` later.
         fingerprint = (state.pending.get(snapshot.get("pending_id")) or {}).get("fingerprint")
         state.cache.remember_message(message_id, fingerprint)
+        provider_response = response_payload.get("_provider_response")
         await _record_and_reset(snapshot, response_blocks=content_blocks, usage=usage,
                                 cost=cost, usage_overridden=usage_overridden, batch=is_batch,
                                 harness_meta=harness_meta, provenance=provenance,
-                                pricing_model=pricing_model, generation=generation)
+                                pricing_model=pricing_model, generation=generation,
+                                choices=choice_results, provider_response=provider_response)
         return {
             "kind": "ok",
             "_latency": latency,
             "content_blocks": content_blocks,
+            # Individually injected OpenAI choices (None: every choice repeats content_blocks),
+            # an injected logprobs fixture, and the Bedrock traces of `provider_response`.
+            "choices": choice_results,
+            "logprobs": response_payload.get("_logprobs"),
+            "provider_response": provider_response,
             "usage": usage,
             "cost": cost,
             "model": model,
             "message_id": message_id,
             # stop_reason override specified by the responder via /_control/respond (None if absent
             # = each encoder auto-determines it from whether tool_use is present).
-            "stop_reason": response_payload.get("stop_reason"),
+            # (On a single-answer route the first choice is the answer, its stop_reason
+            # included; the OpenAI route reads each choice's own.)
+            "stop_reason": response_payload.get("stop_reason") or (
+                choice_results[0]["stop_reason"]
+                if choice_results and snapshot.get("provider") != "openai" else None),
             "stop_sequence": response_payload.get("stop_sequence"),
             "stop_details": response_payload.get("stop_details"),
         }
@@ -1303,6 +1341,8 @@ def stream_event_dicts(
     start_usage = dict(final_usage)
     start_usage["output_tokens"] = 1
     delta_usage = dict(final_usage)
+    if stop_reason == "guardrail_intervened":  # Bedrock-only: the Anthropic body ends normally
+        stop_reason = "end_turn"
     stop_reason, stop_sequence, stop_details = _resolve_stop(
         content_blocks, stop_reason, stop_sequence, stop_details, params)
 
@@ -1464,6 +1504,8 @@ def _build_non_stream_response(
     # yields the same content whether the caller used stream=True or not.
     content_blocks = [b for b in content_blocks
                       if isinstance(b, dict) and b.get("type") in _MODELED_BLOCK_TYPES]
+    if stop_reason == "guardrail_intervened":  # Bedrock-only: the Anthropic body ends normally
+        stop_reason = "end_turn"
     stop_reason, stop_sequence, stop_details = _resolve_stop(
         content_blocks, stop_reason, stop_sequence, stop_details, params)
     return {
@@ -1888,6 +1930,21 @@ def _respond_payload(body: dict[str, Any], *, strict: bool | None = None,
         if not isinstance(body["text"], str):
             return None, _plain_400("text must be a string")
         body = {**body, "content": [{"type": "text", "text": body["text"]}]}
+    choices, ch_err = _choices_of(body, strict)
+    if ch_err is not None:
+        return None, _plain_400(ch_err)
+    if choices:
+        if body.get("content"):
+            return None, _plain_400("choices replaces content / text: give one or the other")
+        # The first choice stands for the answer everywhere a single one is expected; its
+        # stop_reason stays its own (a top-level stop_reason applies to every choice).
+        body = {**body, "content": choices[0]["content"]}
+    logprobs, lp_err = _logprobs_of(body.get("logprobs"))
+    if lp_err is not None:
+        return None, _plain_400(lp_err)
+    provider_response, pr_err = _provider_response_of(body.get("provider_response"))
+    if pr_err is not None:
+        return None, _plain_400(pr_err)
     content = body.get("content", [])
     # Validate the shape here and return 400 (if the encoder crashes after the future is
     # resolved, history records a success while the calling SDK gets a 500 — an inconsistency).
@@ -1945,6 +2002,8 @@ def _respond_payload(body: dict[str, Any], *, strict: bool | None = None,
     if lat_err is not None:
         return None, _plain_400(lat_err)
     dropped = dropped_block_types(content)
+    for c in choices or []:
+        dropped += [d for d in c.pop("_dropped", []) if d not in dropped]
     if dropped and (harness.config.strict_blocks if strict is None else strict):
         return None, _plain_400(_dropped_message(dropped))
     provenance, prov_err = _provenance_of(body)
@@ -1952,8 +2011,89 @@ def _respond_payload(body: dict[str, Any], *, strict: bool | None = None,
         return None, _plain_400(prov_err)
     return {"content": content, "stop_reason": stop_reason, "stop_sequence": stop_sequence,
             "stop_details": stop_details, "usage": usage, "_dropped": dropped,
-            "_provenance": provenance,
+            "_provenance": provenance, "_choices": choices, "_logprobs": logprobs,
+            "_provider_response": provider_response,
             "_latency": {k: body[k] for k in _harness.LATENCY_KEYS if body.get(k) is not None}}, None
+
+
+def _choices_of(body: dict[str, Any], strict: bool | None
+                ) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """`choices`: one answer per OpenAI choice (`n > 1`), each a respond body limited to
+    `text` / `content` / `stop_reason` / `logprobs`."""
+    raw = body.get("choices")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list) or not raw or not all(isinstance(c, dict) for c in raw):
+        return None, "choices must be a non-empty list of objects"
+    out: list[dict[str, Any]] = []
+    for i, c in enumerate(raw):
+        unknown = sorted(k for k in c if k not in ("text", "content", "stop_reason", "logprobs"))
+        if unknown:
+            return None, f"choices[{i}]: unknown key(s) {unknown}; allowed: text, content, stop_reason, logprobs"
+        payload, err = _respond_payload(c, strict=strict)
+        if err is not None:
+            return None, f"choices[{i}]: " + (json.loads(bytes(err.body).decode()).get("error") or "invalid")
+        out.append({"content": payload["content"], "stop_reason": payload["stop_reason"],
+                    "logprobs": payload["_logprobs"], "_dropped": payload["_dropped"]})
+    return out, None
+
+
+def _logprobs_of(raw: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """`logprobs`: a fixture for the OpenAI route — one entry per token of the text answer
+    (`{"token", "logprob", "top_logprobs"?: [{"token", "logprob"}]}`); replaces the
+    deterministic values the route makes up when the request asked for logprobs."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list) or not all(isinstance(e, dict) for e in raw):
+        return None, "logprobs must be a list of {token, logprob} objects"
+
+    def number(v: Any) -> bool:
+        return not isinstance(v, bool) and isinstance(v, (int, float)) and -1e308 <= v <= 0
+    out: list[dict[str, Any]] = []
+    for i, e in enumerate(raw):
+        unknown = sorted(k for k in e if k not in ("token", "logprob", "top_logprobs"))
+        if unknown:
+            return None, f"logprobs[{i}]: unknown key(s) {unknown}; allowed: token, logprob, top_logprobs"
+        if not isinstance(e.get("token"), str) or not number(e.get("logprob")):
+            return None, f"logprobs[{i}]: token must be a string and logprob a finite number <= 0"
+        entry: dict[str, Any] = {"token": e["token"], "logprob": float(e["logprob"])}
+        top = e.get("top_logprobs")
+        if top is not None:
+            if not isinstance(top, list) or not all(
+                    isinstance(t, dict) and set(t) <= {"token", "logprob"}
+                    and isinstance(t.get("token"), str) and number(t.get("logprob"))
+                    for t in top):
+                return None, f"logprobs[{i}].top_logprobs must be a list of {{token, logprob}} objects"
+            entry["top_logprobs"] = [{"token": t["token"], "logprob": float(t["logprob"])} for t in top]
+        out.append(entry)
+    return out, None
+
+
+def _provider_response_of(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """`provider_response`: response extras one wire format carries and the canonical
+    answer has no field for: `{"converse": {"trace": {...}}}` (Converse `trace`) and
+    `{"invoke": {"trace": {...}}}` (InvokeModel `amazon-bedrock-trace`), verbatim."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "provider_response must be an object"
+    unknown = [k for k in raw if k not in ("converse", "invoke")]
+    if unknown:
+        return None, f"provider_response: unknown key(s) {unknown}; allowed: converse, invoke"
+    out: dict[str, Any] = {}
+    for api in ("converse", "invoke"):
+        sub = raw.get(api)
+        if sub is None:
+            continue
+        if not isinstance(sub, dict) or sorted(k for k in sub if k != "trace"):
+            return None, f"provider_response.{api} must be an object with only 'trace'"
+        trace = sub.get("trace")
+        if trace is None:
+            continue
+        if not isinstance(trace, dict):
+            return None, f"provider_response.{api}.trace must be an object"
+        out[api] = {"trace": trace}
+    return (out or None), None
 
 
 _PROVENANCE_KEYS = ("upstream_provider", "upstream_model", "usage_source", "pricing_model",
@@ -2432,7 +2572,7 @@ async def cache_index() -> dict[str, Any]:
 async def clear(request: Request) -> Any:
     """Reset the server. Optional body `{"config": true}` also restores the harness
     configuration to its defaults (a test fixture's full teardown); by default the
-    configuration is kept and only scenario state (rules, rate window, clock) goes."""
+    configuration is kept and only scenario state (rules, prompts, rate window, clock) goes."""
     reset_config = False
     raw = await request.body()
     if raw.strip():
@@ -2571,6 +2711,64 @@ def _rules_view(new_rules: list[Any] | None = None) -> dict[str, Any]:
         # Block types the rules just posted will silently lose (unless strict_blocks).
         out["dropped"] = dropped
     return out
+
+
+def _validate_prompts(raw: Any) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
+    """`{"<prompt ARN>": {"system"?, "messages"?, "tools"?}}`: Anthropic-shaped templates
+    whose text may hold `{{variable}}` placeholders, rendered with the request's
+    `promptVariables` when a Converse request names the ARN as its model id."""
+    if not isinstance(raw, dict):
+        return None, "prompts must be an object of prompt ARN -> template"
+    from .providers.converse import is_prompt_arn  # the route's own notion of a prompt ARN
+    out: dict[str, dict[str, Any]] = {}
+    for arn, tmpl in raw.items():
+        if not isinstance(arn, str) or not is_prompt_arn(arn):
+            return None, (f"prompts: {arn!r} is not a prompt-management ARN "
+                          "(arn:aws:bedrock:<region>:<account>:prompt/<id>[:<version>])")
+        if not isinstance(tmpl, dict):
+            return None, f"prompts[{arn!r}] must be a template object"
+        unknown = sorted(k for k in tmpl if k not in ("system", "messages", "tools"))
+        if unknown:
+            return None, f"prompts[{arn!r}]: unknown key(s) {unknown}; allowed: system, messages, tools"
+        shape_err = _request_shape_error(tmpl.get("system"), tmpl.get("tools"), tmpl.get("messages") or [])
+        if shape_err is not None:
+            return None, f"prompts[{arn!r}]: {shape_err}"
+        out[arn] = tmpl
+    return out, None
+
+
+@app.get("/_control/prompts")
+async def prompts_get() -> dict[str, Any]:
+    """The prompt-management fixtures: prompt ARN -> template."""
+    return {"prompts": harness.prompts}
+
+
+@app.put("/_control/prompts", openapi_extra=_cm.schema_of(_cm.PromptsBody))
+@app.post("/_control/prompts", openapi_extra=_cm.schema_of(_cm.PromptsBody))
+async def prompts_set(request: Request) -> Any:
+    """`{"prompts": {"arn:aws:bedrock:...:prompt/ID": {"system"?, "messages"?, "tools"?}}}`:
+    PUT replaces the prompt fixtures, POST adds to them. A Converse request whose model id
+    is a registered ARN gets the template rendered with its `promptVariables`, so rules
+    and responders see the real prompt."""
+    body, errmsg = await _parse_json_body(request)
+    if errmsg is not None:
+        return _plain_400(errmsg)
+    prompts, err = _validate_prompts(body.get("prompts"))
+    if err is not None:
+        return _plain_400(err)
+    async with state.lock:
+        if request.method == "PUT":
+            harness.prompts.clear()
+        harness.prompts.update(prompts)
+        count = len(harness.prompts)
+    return {"ok": True, "count": count}
+
+
+@app.delete("/_control/prompts")
+async def prompts_delete() -> dict[str, Any]:
+    async with state.lock:
+        harness.prompts.clear()
+    return {"ok": True}
 
 
 @app.get("/_control/rules")
@@ -3076,14 +3274,15 @@ app.openapi = _openapi_with_control_schemas  # type: ignore[method-assign]
 
 
 def load_config_file(path: str) -> None:
-    """A JSON file `{"config": {...}, "rules": [...]}` (either key optional; a bare list
-    is taken as rules). Applied at startup (`--config` / `PUPPETLLM_CONFIG`)."""
+    """A JSON file `{"config": {...}, "rules": [...], "prompts": {...}}` (every key
+    optional; a bare list is taken as rules). Applied at startup (`--config` /
+    `PUPPETLLM_CONFIG`)."""
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
     if isinstance(doc, list):
         doc = {"rules": doc}
     if not isinstance(doc, dict):
-        raise ValueError(f"{path}: expected an object with 'config' and/or 'rules'")
+        raise ValueError(f"{path}: expected an object with 'config', 'rules' and/or 'prompts'")
     if doc.get("config") is not None:
         err_msg = apply_config(doc["config"])
         if err_msg is not None:
@@ -3093,6 +3292,11 @@ def load_config_file(path: str) -> None:
         if err is not None:
             raise ValueError(f"{path}: rules: {json.loads(bytes(err.body).decode()).get('error')}")
         harness.set_rules(rules)
+    if doc.get("prompts") is not None:
+        prompts, perr = _validate_prompts(doc["prompts"])
+        if perr is not None:
+            raise ValueError(f"{path}: prompts: {perr}")
+        harness.prompts = prompts
 
 
 def load_rules_file(path: str) -> None:
