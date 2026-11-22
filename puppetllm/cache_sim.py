@@ -1,6 +1,6 @@
 """Pseudo prompt cache (for debugging).
 
-Formal spec: README.md
+Formal spec: docs/control-api.md
 
 Purpose: observe via hashing "whether the app is sending requests structured so that prompt
 caching can take effect". It holds no real cache (responses always go through control).
@@ -50,21 +50,21 @@ _LOOKBACK_BLOCKS = 20  # a breakpoint looks back at most 20 positions for a prio
 _MAX_BREAKPOINTS = 4   # cache_control per request is at most 4 (real-API limit)
 # Minimum cacheable prefix per model (tokens). Real behavior silently does not cache a prefix
 # below this (cache_creation=0). Per Anthropic's prompt-caching docs:
-#   Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5 = 512; Opus 4.8 = 1024; Opus 4.7 = 2048;
-#   Opus 4.6 / 4.5 = 4096; Opus 4.1 / 4 = 1024; Sonnet 5 / 4.6 / 4.5 / 4 = 1024;
-#   Haiku 4.5 = 4096; Haiku 3.5 = 2048.
+#   Fable / Mythos 5 / 5.1 / 5.2, Opus 5 / 5.5, Sonnet 5.5, Haiku 5.5 = 512;
+#   Opus 4.8 = 1024; Opus 4.7, Mythos Preview = 2048; Opus 4.6 / 4.5 = 4096;
+#   Opus 4.1 / 4 = 1024; Sonnet 5 / 4.6 / 4.5 / 4 = 1024; Haiku 4.5 = 4096; Haiku 3.5 = 2048.
 # Matched by substring on the lowercased model id, most specific first (generation-aware —
 # unlike pricing families, the minimum differs between Opus generations).
 # NOTE: this sim's tokens are approximate (≈4 chars/token, underestimating Japanese), so
 # decisions near the threshold are inaccurate. The main goal is to prevent over-counting
 # clearly small prefixes.
 _MIN_CACHEABLE_ORDER: tuple[tuple[str, int], ...] = (
-    ("fable", 512), ("mythos", 512),
+    ("mythos-preview", 2048), ("fable", 512), ("mythos", 512),
     ("opus-5", 512), ("opus-4-8", 1024), ("opus-4-7", 2048),
     ("opus-4-6", 4096), ("opus-4-5", 4096),
-    ("opus-4-1", 1024), ("opus-4-20", 1024), ("opus-4-0", 1024),
-    ("sonnet", 1024),
-    ("haiku-4-5", 4096), ("3-5-haiku", 2048),
+    ("opus-4-1", 1024), ("opus-4-20", 1024), ("opus-4@", 1024), ("opus-4-0", 1024),
+    ("sonnet-5-5", 512), ("sonnet", 1024),
+    ("haiku-5-5", 512), ("haiku-4-5", 4096), ("3-5-haiku", 2048),
     ("opus", 4096), ("haiku", 4096),  # conservative fallbacks for unknown generations
 )
 _DEFAULT_MIN_CACHEABLE = 1024

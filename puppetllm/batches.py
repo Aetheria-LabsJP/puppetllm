@@ -1,6 +1,6 @@
 """Anthropic Message Batches compatible adapter + batch control endpoints.
 
-Formal spec: README.md
+Formal spec: docs/batches.md
 
 Implements the Message Batches surface (`/v1/messages/batches*`) on top of the
 canonical core. Each batch sub-request (custom_id) is registered as a **normal

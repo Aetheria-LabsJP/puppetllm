@@ -46,7 +46,7 @@ curl -s -X POST localhost:8765/_control/config -d '{"pending_timeout_s": 30,
 |---|---|---|
 | POST | `/v1/messages/count_tokens` | Anthropic の `count_tokens`: `{"input_tokens": N}`。`/v1/messages` がそのリクエスト全体に課金する概算（`usage.input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`）と同じ値 |
 | POST | `/model/{modelId}/count-tokens` | Bedrock の `CountTokens`（`{"input": {"invokeModel": {"body": <blob>}}}` — Messages リクエスト。boto3 が送るとおりワイヤ上は base64。生の JSON も受け付ける — または `{"input": {"converse": {...}}}` → `{"inputTokens": N}`） |
-| GET  | `/v1/models`、`/v1/models/{id}` | カタログ（`pricing.KNOWN_MODELS`）。Anthropic 形式（`x-api-key` か `anthropic-version` がある、または認可ヘッダなし。`limit` / `after_id` / `before_id` でページング）か OpenAI 形式（素の `Authorization: Bearer`）。情報提供用: リクエスト経路はどんなモデル ID でも受け付け、未掲載の ID は拒否せず合成して返す |
+| GET  | `/v1/models`、`/v1/models/{id}` | カタログ（`puppetllm/catalog.py`）。Anthropic 形式（`x-api-key` か `anthropic-version` がある、または認可ヘッダなし。各モデルに `max_input_tokens`、`max_tokens`、`line`、`lifecycle` / `deprecated_at` / `retires_at`、`capabilities` を付ける。`limit` / `after_id` / `before_id` でページング。`lifecycle`（複数指定可。`lifecycle[]` とも書ける）は `active` / `deprecated` / `retired` で絞り込み、既定では廃止済みのモデルを含めない）か OpenAI 形式（素の `Authorization: Bearer`）。`lifecycle` フィールドはプロバイダが公表した状態で、カタログに固定で持つ（`retires_at` を過ぎても廃止済みにはならない）。廃止済みのモデルは `capabilities` なしで載る。`created_at` / `created` は全モデル共通の固定値で、公開日ではない。情報提供用: リクエスト経路はどんなモデル ID でも受け付け、未掲載の ID は拒否せず（`active`、上限と capabilities なしで）合成して返す |
 
 **Python のテストから** — `puppetllm.testing` が制御 API を包む。`serve()` は空きポートでサーバをインプロセス起動する:
 

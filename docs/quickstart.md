@@ -58,7 +58,7 @@ client = anthropic.Anthropic(base_url="http://localhost:8765", api_key="sk-mock-
 
 # blocks until a response is injected
 msg = client.messages.create(
-    model="claude-sonnet-4-5", max_tokens=1024,
+    model="claude-sonnet-5-5", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 print(msg.content)          # → the injected content blocks
@@ -77,7 +77,7 @@ A pending waits as long as the responder takes, so raise the SDK's `timeout` (th
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-mock-anything")
 msg = client.chat.completions.create(
-    model="gpt-5.4", max_tokens=1024,
+    model="gpt-6.2-sol", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 ```

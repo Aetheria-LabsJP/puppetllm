@@ -8,7 +8,7 @@ Anthropic Message Batches サーフェス（`/v1/messages/batches*`）も提供�
 
 ```python
 batch = client.messages.batches.create(requests=[
-    {"custom_id": "r1", "params": {"model": "claude-sonnet-4-5", "max_tokens": 64,
+    {"custom_id": "r1", "params": {"model": "claude-sonnet-5-5", "max_tokens": 64,
                                    "messages": [{"role": "user", "content": "hi"}]}},
     {"custom_id": "r2", "params": {...}},
 ])

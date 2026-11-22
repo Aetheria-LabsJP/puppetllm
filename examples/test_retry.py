@@ -20,7 +20,7 @@ def test_sdk_retries_a_rate_limit(puppet):
     puppet.expect(model="claude-*").respond(text="second time lucky")
 
     client = anthropic.Anthropic(base_url=puppet.url, api_key="sk-mock", max_retries=2)
-    msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=32,
+    msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=32,
                                  messages=[{"role": "user", "content": "hello"}])
 
     assert msg.content[0].text == "second time lucky"
@@ -34,7 +34,7 @@ def test_without_retries_the_error_surfaces(puppet):
 
     client = anthropic.Anthropic(base_url=puppet.url, api_key="sk-mock", max_retries=0)
     try:
-        client.messages.create(model="claude-sonnet-4-5", max_tokens=32,
+        client.messages.create(model="claude-sonnet-5-5", max_tokens=32,
                                messages=[{"role": "user", "content": "hello"}])
     except anthropic.RateLimitError as e:
         assert e.status_code == 429

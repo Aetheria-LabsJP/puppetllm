@@ -1128,8 +1128,19 @@ class TestCountTokensAndModels(_Base):
                     if not page["has_more"]:
                         break
                     after = page["last_id"]
-                from puppetllm import pricing
-                self.assertEqual(seen, [m for m, _ in pricing.KNOWN_MODELS["anthropic"]])
+                from puppetllm import catalog
+                listed = [m.id for m in catalog.CLAUDE_MODELS if m.lifecycle != "retired"]
+                self.assertEqual((len(listed), len(catalog.CLAUDE_MODELS)), (19, 25))
+                self.assertEqual(seen, listed)
+                # the filter applies before paging: cursors walk the filtered list
+                retired = [m.id for m in catalog.CLAUDE_MODELS if m.lifecycle == "retired"]
+                page = (await c.get("/v1/models", params={"lifecycle": "retired", "limit": 2}, headers=h)).json()
+                self.assertEqual(([m["id"] for m in page["data"]], page["has_more"]), (retired[:2], True))
+                page = (await c.get("/v1/models", params={"lifecycle": "retired", "limit": 2,
+                                                          "after_id": page["last_id"]}, headers=h)).json()
+                self.assertEqual([m["id"] for m in page["data"]], retired[2:4])
+                r = await c.get("/v1/models", params={"lifecycle": "retired", "after_id": seen[0]}, headers=h)
+                self.assertEqual(r.status_code, 400)
                 last = (await c.get("/v1/models", params={"limit": 3, "before_id": seen[4]}, headers=h)).json()
                 self.assertEqual([m["id"] for m in last["data"]], seen[1:4])
                 self.assertTrue(last["has_more"])
@@ -1147,11 +1158,80 @@ class TestCountTokensAndModels(_Base):
                 r = await c.get("/v1/models", headers={"x-api-key": "k", "anthropic-version": "2023-06-01"})
                 self.assertEqual(r.status_code, 200)
                 data = r.json()
-                self.assertFalse(data["has_more"])
                 self.assertEqual(data["data"][0]["type"], "model")
                 ids = [m["id"] for m in data["data"]]
                 self.assertIn("claude-sonnet-5", ids)
+                self.assertEqual(ids[0], "claude-fable-5-2")
                 self.assertEqual(data["first_id"], ids[0])
+                h = {"x-api-key": "k"}
+                everything = (await c.get("/v1/models", params=[
+                    ("limit", "1000"), ("lifecycle", "active"), ("lifecycle[]", "deprecated"),
+                    ("lifecycle", "retired")], headers=h)).json()
+                self.assertFalse(everything["has_more"])
+                by_id = {m["id"]: m for m in everything["data"]}
+                from puppetllm import catalog
+                self.assertEqual(list(by_id), [m.id for m in catalog.CLAUDE_MODELS])
+                self.assertEqual({m["created_at"] for m in everything["data"]}, {"2026-01-01T00:00:00Z"})
+                opus = by_id["claude-opus-5-5"]
+                self.assertEqual((opus["line"], opus["max_input_tokens"], opus["max_tokens"], opus["lifecycle"]),
+                                 ("opus", 1_000_000, 128_000, "active"))
+                self.assertEqual((opus["deprecated_at"], opus["retires_at"]), (None, None))
+                types = opus["capabilities"]["thinking"]["types"]
+                self.assertEqual({k: v["supported"] for k, v in types.items()},
+                                 {"adaptive": True, "between_tools": False, "disabled": False, "enabled": False})
+                self.assertTrue(by_id["claude-sonnet-5-5"]["capabilities"]["thinking"]["types"]["between_tools"]["supported"])
+                haiku = by_id["claude-haiku-4-5-20251001"]
+                self.assertEqual((haiku["max_input_tokens"], haiku["max_tokens"]), (200_000, 64_000))
+                self.assertFalse(haiku["capabilities"]["effort"]["supported"])
+                self.assertFalse(haiku["capabilities"]["code_execution"]["supported"])
+                self.assertEqual(by_id["claude-opus-4-6"]["capabilities"]["effort"]["xhigh"], {"supported": False})
+                # deprecated models are listed by default, retired ones only on request
+                # and without capabilities
+                preview, gone = by_id["claude-mythos-preview"], by_id["claude-opus-4-1-20250805"]
+                self.assertEqual((preview["lifecycle"], preview["deprecated_at"], preview["retires_at"]),
+                                 ("deprecated", "2026-06-09T00:00:00Z", None))
+                caps = preview["capabilities"]
+                self.assertEqual({k: v["supported"] for k, v in caps["thinking"]["types"].items()},
+                                 {"adaptive": True, "between_tools": False, "disabled": False, "enabled": True})
+                self.assertEqual((caps["effort"]["max"], caps["effort"]["xhigh"]),
+                                 ({"supported": True}, {"supported": False}))
+                old = by_id["claude-sonnet-4-5-20250929"]
+                self.assertEqual((old["lifecycle"], old["retires_at"]), ("deprecated", "2026-11-30T00:00:00Z"))
+                self.assertEqual((gone["lifecycle"], gone["retires_at"], gone["max_tokens"], gone["capabilities"]),
+                                 ("retired", "2026-08-05T00:00:00Z", 32_000, None))
+                self.assertEqual([m["id"] for m in everything["data"] if m["capabilities"] is None],
+                                 [m["id"] for m in everything["data"] if m["lifecycle"] == "retired"])
+                self.assertIn("claude-mythos-preview", ids)
+                self.assertNotIn("claude-opus-4-1-20250805", ids)
+                r = await c.get("/v1/models", params={"lifecycle": "deprecated"}, headers=h)
+                self.assertTrue(r.headers["request-id"].startswith("req_"))
+                self.assertEqual([m["id"] for m in r.json()["data"]],
+                                 ["claude-mythos-preview", "claude-sonnet-4-5-20250929"])
+                active = (await c.get("/v1/models", params={"lifecycle": "active", "limit": 100}, headers=h)).json()
+                self.assertEqual({m["lifecycle"] for m in active["data"]}, {"active"})
+                self.assertEqual(len(active["data"]), 17)
+                retired = (await c.get("/v1/models", params={"lifecycle[]": "retired"}, headers=h)).json()
+                self.assertEqual([m["id"] for m in retired["data"]],
+                                 ["claude-opus-4-1-20250805", "claude-opus-4-20250514", "claude-sonnet-4-20250514",
+                                  "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"])
+                for bad in ([("lifecycle", "gone")], [("lifecycle", "active")] * 4):
+                    r = await c.get("/v1/models", params=bad, headers=h)
+                    self.assertEqual(r.status_code, 400, bad)
+                # an alias resolves to its dated id; an unlisted id is synthesized without limits
+                r = await c.get("/v1/models/claude-sonnet-4-5", headers=h)
+                self.assertEqual(r.json()["id"], "claude-sonnet-4-5-20250929")
+                self.assertTrue(r.headers["request-id"].startswith("req_"))
+                for alias, dated, state in (("claude-opus-4-5", "claude-opus-4-5-20251101", "active"),
+                                            ("claude-haiku-4-5", "claude-haiku-4-5-20251001", "active"),
+                                            ("claude-opus-4-1", "claude-opus-4-1-20250805", "retired"),
+                                            ("claude-opus-4-0", "claude-opus-4-20250514", "retired"),
+                                            ("claude-3-haiku-20240307", "claude-3-haiku-20240307", "retired")):
+                    got = (await c.get(f"/v1/models/{alias}", headers=h)).json()
+                    self.assertEqual((got["id"], got["lifecycle"]), (dated, state), alias)
+                unknown = (await c.get("/v1/models/claude-next", headers=h)).json()
+                self.assertEqual((unknown["id"], unknown["capabilities"], unknown["max_input_tokens"],
+                                  unknown["line"], unknown["lifecycle"]),
+                                 ("claude-next", None, None, None, "active"))
                 r = await c.get("/v1/models", params={"limit": 2}, headers={"x-api-key": "k"})
                 self.assertEqual(len(r.json()["data"]), 2)
                 self.assertTrue(r.json()["has_more"])
@@ -1159,6 +1239,7 @@ class TestCountTokensAndModels(_Base):
                 self.assertEqual(r.json()["object"], "list")
                 self.assertEqual(r.json()["data"][0]["object"], "model")
                 self.assertIn("gpt-5.4", [m["id"] for m in r.json()["data"]])
+                self.assertEqual(r.json()["data"][0]["id"], "gpt-6.2-astra")
                 # the Anthropic SDK's OAuth flavour: Bearer plus anthropic-version → Anthropic
                 r = await c.get("/v1/models", headers={"authorization": "Bearer t",
                                                        "anthropic-version": "2023-06-01"})
@@ -1578,8 +1659,12 @@ class TestTestingHelpers(unittest.TestCase):
             model="claude-sonnet-5", messages=[{"role": "user", "content": "ping"}]).input_tokens,
             msg.usage.input_tokens)
         self.assertIn("claude-sonnet-5", [m.id for m in client.models.list()])
-        from puppetllm import pricing
-        self.assertEqual(len(list(client.models.list(limit=3))), len(pricing.KNOWN_MODELS["anthropic"]))
+        from puppetllm import catalog
+        self.assertEqual(len(list(client.models.list(limit=3))),
+                         sum(m.lifecycle != "retired" for m in catalog.CLAUDE_MODELS))
+        retired = list(client.models.list(extra_query={"lifecycle": "retired"}))
+        self.assertEqual((len(retired), retired[0].id, retired[0].capabilities),
+                         (6, "claude-opus-4-1-20250805", None))
         self.assertEqual(client.models.retrieve("claude-sonnet-5").display_name, "Claude Sonnet 5")
         p.config(rate_limit={"rpm": 1})
         p.expect().respond(text="x").repeat()

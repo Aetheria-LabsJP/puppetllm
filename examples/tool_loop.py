@@ -39,7 +39,7 @@ def main() -> None:
         client = anthropic.Anthropic(base_url=puppet.url, api_key="sk-mock", max_retries=0)
         messages = [{"role": "user", "content": "What is the weather in Tokyo?"}]
         while True:
-            msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=256,
+            msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=256,
                                          tools=TOOLS, messages=messages)
             if msg.stop_reason != "tool_use":
                 break

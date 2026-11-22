@@ -57,6 +57,21 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(pricing.resolve_family("claude-fable-5-1"), "fable-5-1")
         self.assertEqual(pricing.resolve_family("claude-fable-5"), "fable")
         self.assertEqual(pricing.resolve_family("claude-mythos-5-1"), "mythos-5-1")
+        self.assertEqual(pricing.resolve_family("global.anthropic.claude-fable-5-2"), "fable-5-2")
+        # a generation key does not match the head of a date suffix
+        self.assertEqual(pricing.resolve_family("claude-fable-5-20260101"), "fable")
+        self.assertEqual(pricing.resolve_family("claude-fable-5-2-20260901"), "fable-5-2")
+        self.assertEqual(pricing.resolve_family("claude-sonnet-5-20260101"), "sonnet-5")
+        self.assertEqual(pricing.resolve_family("claude-opus-4-20250514"), "opus-4-20")
+        self.assertEqual(pricing.resolve_family("anthropic.claude-opus-4-1-20250805-v1:0"), "opus-4-1")
+        # Vertex spells the date after "@"
+        self.assertEqual(pricing.price_for("claude-opus-4@20250514").input, 15.0)
+        self.assertEqual(pricing.price_for("claude-opus-4-1@20250805").input, 15.0)
+        self.assertEqual(pricing.price_for("claude-opus-4-5@20251101").input, 5.0)
+        self.assertEqual(pricing.resolve_family("claude-mythos-5-2"), "mythos-5-2")
+        self.assertEqual(pricing.resolve_family("anthropic.claude-opus-5-5"), "opus-5-5")
+        self.assertEqual(pricing.resolve_family("claude-sonnet-5-5"), "sonnet-5-5")
+        self.assertEqual(pricing.resolve_family("claude-haiku-5-5"), "haiku-5-5")
         # unknown falls back to the default (sonnet)
         self.assertEqual(pricing.resolve_family("mystery-model"), "sonnet")
         self.assertEqual(pricing.resolve_family(None), "sonnet")
@@ -64,6 +79,10 @@ class TestPricing(unittest.TestCase):
     def test_claude_prices(self) -> None:
         # official per-Mtok prices: input / output / cache read / 5m write / 1h write
         cases = {
+            "claude-fable-5-2": (8.0, 40.0, 0.2, 10.0, 16.0),
+            "claude-opus-5-5": (4.0, 20.0, 0.2, 5.0, 8.0),
+            "claude-sonnet-5-5": (2.0, 10.0, 0.1, 2.5, 4.0),
+            "claude-haiku-5-5": (0.1, 0.5, 0.01, 0.125, 0.2),
             "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
             "claude-fable-5": (10.0, 50.0, 1.0, 12.5, 20.0),
             "claude-opus-5": (5.0, 25.0, 0.5, 6.25, 10.0),
@@ -82,6 +101,54 @@ class TestPricing(unittest.TestCase):
                                  cache_write_1h_tokens=1_000_000)
         self.assertAlmostEqual(c["cache_write_usd"], 6.25 + 10.0, places=6)
 
+    def test_long_context_pricing_covers_the_whole_request(self) -> None:
+        # Haiku 5.5: the prompt is every input token, cached or not; over 100,000 → $0.50 / $2.50
+        short = pricing.compute_cost("claude-haiku-5-5", input_tokens=40_000, cache_read_tokens=60_000,
+                                     output_tokens=1_000_000)
+        self.assertFalse(short["long_context"])
+        self.assertAlmostEqual(short["output_usd"], 0.50, places=6)
+        long = pricing.compute_cost("claude-haiku-5-5", input_tokens=40_000, cache_read_tokens=60_001,
+                                    output_tokens=1_000_000)
+        self.assertTrue(long["long_context"])
+        self.assertAlmostEqual(long["output_usd"], 2.50, places=6)
+        self.assertAlmostEqual(long["input_usd"], 40_000 * 0.50 / 1e6, places=6)
+        self.assertAlmostEqual(long["cache_read_usd"], 60_001 * 0.05 / 1e6, places=6)
+        # the US-inference multiplier applies on top of the long card
+        geo = pricing.compute_cost("claude-haiku-5-5", input_tokens=200_000, inference_geo="us")
+        self.assertAlmostEqual(geo["input_usd"], 200_000 * 0.50 * 1.1 / 1e6, places=6)
+        # OpenAI: over 272K input tokens; xAI: 200k or more
+        self.assertFalse(pricing.compute_cost("gpt-6.2-sol", input_tokens=272_000)["long_context"])
+        gpt = pricing.compute_cost("gpt-6.2-sol", input_tokens=272_001, output_tokens=1_000_000)
+        self.assertEqual((gpt["long_context"], gpt["output_usd"]), (True, 15.0))
+        self.assertFalse(pricing.compute_cost("grok-4.7", input_tokens=199_999)["long_context"])
+        grok = pricing.compute_cost("grok-4.7", input_tokens=200_000, output_tokens=1_000_000)
+        self.assertEqual((grok["long_context"], grok["input_usd"], grok["output_usd"]), (True, 0.8, 12.0))
+        # cache writes count toward the prompt length too
+        writes = pricing.compute_cost("claude-haiku-5-5", input_tokens=1, cache_write_tokens=50_000,
+                                      cache_write_1h_tokens=50_000)
+        self.assertTrue(writes["long_context"])
+        self.assertAlmostEqual(writes["cache_write_usd"], 50_000 * (0.625 + 1.0) / 1e6, places=6)
+        self.assertFalse(pricing.compute_cost("claude-haiku-5-5", cache_write_tokens=50_000,
+                                              cache_write_1h_tokens=50_000)["long_context"])
+        # savings follow the card the request was billed on
+        self.assertAlmostEqual(pricing.cache_savings_usd("claude-haiku-5-5", 1_000_000), 0.09, places=6)
+        self.assertAlmostEqual(pricing.cache_savings_usd("claude-haiku-5-5", 1_000_000, long_context=True),
+                               0.45, places=6)
+        self.assertAlmostEqual(pricing.cache_savings_usd("claude-opus-5-5", 1_000_000, long_context=True),
+                               3.8, places=6)
+        # the pro tiers have a long card; GPT-5.4 mini / nano and earlier models do not
+        for model in ("gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.5", "gpt-5.4"):
+            self.assertFalse(pricing.compute_cost(model, input_tokens=272_000)["long_context"], model)
+            self.assertTrue(pricing.compute_cost(model, input_tokens=272_001)["long_context"], model)
+        for model in ("gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.2", "gpt-5.3-codex"):
+            self.assertIsNone(pricing.price_for(model).long, model)
+        # the Anthropic billing multipliers never reach a Grok row
+        grok = pricing.compute_cost("grok-4.7", input_tokens=1000, speed="fast", inference_geo="us",
+                                    inbound_anthropic=True)
+        self.assertEqual((grok["speed_multiplier"], grok["geo_multiplier"]), (1.0, 1.0))
+        # models without a long card are flat
+        self.assertFalse(pricing.compute_cost("claude-opus-5-5", input_tokens=900_000)["long_context"])
+
     def test_resolve_family_openai(self) -> None:
         self.assertEqual(pricing.resolve_family("gpt-5.4-2026-03-01"), "gpt-5.4")
         self.assertEqual(pricing.resolve_family("gpt-5.4-mini"), "gpt-5.4-mini")
@@ -93,7 +160,17 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(pricing.resolve_family("gpt-5.2"), "gpt-5.2")
         self.assertEqual(pricing.resolve_family("gpt-5.2-pro"), "gpt-5.2-pro")
         self.assertEqual(pricing.resolve_family("gpt-5-pro"), "gpt-5-pro")
-        self.assertEqual(pricing.resolve_family("gpt-6-astra"), "gpt-6")
+        self.assertEqual(pricing.resolve_family("gpt-6-astra"), "gpt-6-astra")
+        # an unlisted gpt-6 id is an unknown GPT, not the top tier
+        self.assertEqual(pricing.resolve_family("gpt-6.3-sol"), "gpt-6.2-sol")
+        self.assertTrue(pricing.is_fallback_family("gpt-6.3-sol"))
+        self.assertEqual(pricing.resolve_family("gpt-6.2-astra"), "gpt-6.2-astra")
+        self.assertEqual(pricing.resolve_family("gpt-6.2-sol"), "gpt-6.2-sol")
+        self.assertEqual(pricing.resolve_family("gpt-6.1-terra"), "gpt-6.1-terra")
+        self.assertEqual(pricing.resolve_family("gpt-6-luna"), "gpt-6-luna")
+        self.assertEqual(pricing.resolve_family("grok-4.7"), "grok")
+        self.assertEqual(pricing.resolve_family("grok-4.20-0309-reasoning"), "grok-4.20")
+        self.assertEqual(pricing.resolve_family("grok-build-0.1"), "grok-build")
         self.assertEqual(pricing.resolve_family("gpt-5.6-luna"), "gpt-5.6-luna")
         self.assertEqual(pricing.resolve_family("gpt-5.6"), "gpt-5.6")
         self.assertEqual(pricing.resolve_family("chat-latest"), "chat-latest")
@@ -104,20 +181,36 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(pricing.resolve_family("o1-2024-12-17"), "o1")
         # o-series keys only match on token boundaries (no "o1" inside "gpt-4o1-x")
         self.assertEqual(pricing.resolve_family("gpt-4o1-x"), "gpt-4o")
-        # unknown but containing gpt → current mid tier (gpt-5.4); otherwise sonnet as before
-        self.assertEqual(pricing.resolve_family("gpt-9-experimental"), "gpt-5.4")
+        # unknown but containing gpt → current mid tier (gpt-6.2-sol); otherwise the default (sonnet)
+        self.assertEqual(pricing.resolve_family("gpt-9-experimental"), "gpt-6.2-sol")
         self.assertEqual(pricing.resolve_family("mystery-model"), "sonnet")
 
     def test_compute_cost_openai(self) -> None:
-        c = pricing.compute_cost("gpt-5.4", input_tokens=1_000_000, output_tokens=1_000_000)
+        c = pricing.compute_cost("gpt-5.4", input_tokens=100_000, output_tokens=1_000_000)
         self.assertEqual(c["model_family"], "gpt-5.4")
-        self.assertAlmostEqual(c["input_usd"], 2.50, places=6)
+        self.assertAlmostEqual(c["input_usd"], 0.25, places=6)
         self.assertAlmostEqual(c["output_usd"], 15.0, places=6)
-        # OpenAI has no cache-write surcharge (= input unit price); read uses the official cached input price
-        c2 = pricing.compute_cost("gpt-5.5", cache_write_tokens=1_000_000)
-        self.assertAlmostEqual(c2["cache_write_usd"], 5.0, places=6)
-        c3 = pricing.compute_cost("gpt-5.5", cache_read_tokens=1_000_000)
-        self.assertAlmostEqual(c3["cache_read_usd"], 0.50, places=6)
+        prices = {m: (pricing.price_for(m).input, pricing.price_for(m).cache_read, pricing.price_for(m).output)
+                  for m in ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6-sol",
+                            "grok-4.7", "grok-4.5", "grok-4.3")}
+        self.assertEqual(prices, {
+            "gpt-6.2-astra": (8.0, 0.4, 40.0), "gpt-6.2-sol": (2.0, 0.1, 10.0),
+            "gpt-6.1-terra": (1.0, 0.05, 5.0), "gpt-6-luna": (0.1, 0.01, 0.5),
+            "gpt-6-sol": (2.0, 0.2, 10.0), "grok-4.7": (2.0, 0.5, 6.0),
+            "grok-4.5": (2.0, 0.3, 6.0), "grok-4.3": (1.25, 0.2, 2.5)})
+        # up to GPT-5.5 a cache write costs the input price; GPT-6.x and GPT-5.6 charge
+        # 1.25x (30-minute retention) and 2.5x (12-hour), on the long card as well
+        c2 = pricing.compute_cost("gpt-5.5", cache_write_tokens=100_000)
+        self.assertAlmostEqual(c2["cache_write_usd"], 0.5, places=6)
+        for model, (w30, w12h, long30, long12h) in {
+                "gpt-6.2-astra": (10.0, 20.0, 20.0, 40.0), "gpt-6-luna": (0.125, 0.25, 0.25, 0.5),
+                "gpt-6-astra": (12.5, 25.0, 25.0, 50.0), "gpt-5.6-terra": (2.5, 5.0, 5.0, 10.0),
+                "gpt-5.4": (2.5, 2.5, 5.0, 5.0), "grok-4.7": (2.0, 2.0, 4.0, 4.0)}.items():
+            p = pricing.price_for(model)
+            self.assertEqual((p.cache_write, p.cache_write_1h, p.long.cache_write, p.long.cache_write_1h),
+                             (w30, w12h, long30, long12h), model)
+        c3 = pricing.compute_cost("gpt-5.5", cache_read_tokens=100_000)
+        self.assertAlmostEqual(c3["cache_read_usd"], 0.05, places=6)
 
     def test_approx_tokens(self) -> None:
         self.assertEqual(pricing.approx_tokens(""), 0)

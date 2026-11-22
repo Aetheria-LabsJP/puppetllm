@@ -572,10 +572,20 @@ class TestProvenanceAndPricing(_Base):
                 await t
                 e = await self._ctl(c, "get", "/_control/history/4")
                 self.assertEqual(e["cost"]["speed_multiplier"], 1.0)
-                expected = pricing.compute_cost("gpt-5.4", input_tokens=1000, output_tokens=1000, cache_read_tokens=1_000_000)
-                self.assertAlmostEqual(e["cost"]["total_usd"], expected["total_usd"], places=9)
+                # a 1,001,000-token prompt is over gpt-5.4's 272K threshold: the long card
+                # ($5 input, $0.50 cached, $22.50 output) prices the request and its savings
+                self.assertTrue(e["cost"]["long_context"])
+                self.assertAlmostEqual(e["cost"]["total_usd"], 0.005 + 0.5 + 0.0225, places=9)
                 stats = await self._ctl(c, "get", "/_control/stats")
-                self.assertAlmostEqual(stats["totals"]["cache_savings_usd"], pricing.cache_savings_usd("gpt-5.4", 1_000_000), places=6)
+                self.assertAlmostEqual(stats["totals"]["cache_savings_usd"], 4.5, places=6)
+                # fast mode and US inference scale the saving as they scale the prices
+                t = await self._pending(c, "/v1/messages", {**_MSG, "model": "claude-fable-5-2",
+                                                            "speed": "fast", "inference_geo": "us"})
+                await self._ctl(c, "post", "/_control/respond", json={
+                    "text": "x", "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 1_000_000}})
+                await t
+                stats = await self._ctl(c, "get", "/_control/stats")
+                self.assertAlmostEqual(stats["totals"]["cache_savings_usd"], 4.5 + (8.0 - 0.2) * 2.2, places=6)
         _run(go())
 
     def test_pricing_file(self) -> None:
@@ -623,11 +633,16 @@ class TestProvenanceAndPricing(_Base):
                     pricing.load_pricing_file(f.name)
             finally:
                 os.unlink(f.name)
-        # a glob that happens to spell a built-in family name prices only ids it matches
+        # a glob that happens to spell a built-in family name prices only ids it matches;
+        # a custom entry is flat, replacing the built-in long-context card as well
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"sonnet": {"input": 99, "output": 99}}, f)
+            json.dump({"sonnet": {"input": 99, "output": 99},
+                       "claude-haiku-5-*": {"input": 1, "output": 2}}, f)
         try:
             pricing.load_pricing_file(f.name)
+            flat = pricing.compute_cost("claude-haiku-5-5", input_tokens=500_000)
+            self.assertEqual((flat["long_context"], flat["input_usd"]), (False, 0.5))
+            self.assertAlmostEqual(pricing.cache_savings_usd("claude-haiku-5-5", 1_000_000, long_context=True), 0.9)
             self.assertEqual(pricing.price_for("sonnet").input, 99)
             self.assertEqual(pricing.price_for("claude-sonnet-4-5").input, pricing._FAMILY_PRICES["sonnet"].input)
             self.assertEqual(pricing.compute_cost("claude-sonnet-4-5", input_tokens=1_000_000, output_tokens=0)["total_usd"],
@@ -829,6 +844,28 @@ class TestRelayProvenance(_Base):
         self.assertEqual(e["cost"]["model_family"], pricing.resolve_family("gpt-5.4"))
         # the inbound fast-mode multiplier does not reach an OpenAI price table
         self.assertEqual(e["cost"]["speed_multiplier"], 1.0)
+        # an xAI upstream: 200k prompt tokens put the request on Grok's doubled card, and
+        # reported cache writes count toward the prompt but carry no surcharge there
+        def grok(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 200_000, "completion_tokens": 1000,
+                          "prompt_tokens_details": {"cached_tokens": 100_000, "cache_write_tokens": 50_000}}})
+        e = self._drive(_relay_cfg(model="grok-4.7", price_by="upstream"), grok, inbound)
+        self.assertEqual((e["cost"]["model_family"], e["cost"]["long_context"]), ("grok", True))
+        self.assertAlmostEqual(e["cost"]["total_usd"],
+                               (50_000 * 4.0 + 50_000 * 4.0 + 100_000 * 1.0 + 1000 * 12.0) / 1e6, places=9)
+        # GPT-6.x charges for the cache writes an upstream reports, at the 30-minute rate
+        def gpt6(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 100,
+                          "prompt_tokens_details": {"cached_tokens": 200, "cache_write_tokens": 300}}})
+        e = self._drive(_relay_cfg(model="gpt-6.2-sol", price_by="upstream"), gpt6, inbound)
+        self.assertEqual((e["usage"]["input_tokens"], e["usage"]["cache_creation_input_tokens"],
+                          e["usage"]["cache_read_input_tokens"]), (500, 300, 200))
+        self.assertAlmostEqual(e["cost"]["cache_write_usd"], 300 * 2.5 / 1e6, places=9)
+        self.assertAlmostEqual(e["cost"]["total_usd"], (500 * 2.0 + 300 * 2.5 + 200 * 0.1 + 100 * 10.0) / 1e6, places=9)
         e = self._drive(_relay_cfg(model="gpt-5.4"), upstream, {**_MSG, "model": "claude-haiku-4-5"})
         self.assertNotIn("pricing_model", e["provenance"])
         self.assertEqual(e["pricing_model"], "claude-haiku-4-5")

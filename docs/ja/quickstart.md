@@ -56,7 +56,7 @@ client = anthropic.Anthropic(base_url="http://localhost:8765", api_key="sk-mock-
 
 # 応答が注入されるまでブロックする
 msg = client.messages.create(
-    model="claude-sonnet-4-5", max_tokens=1024,
+    model="claude-sonnet-5-5", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 print(msg.content)          # → 注入された content blocks
@@ -75,7 +75,7 @@ pending は responder が応答するまで待ち続けるので、SDK の `time
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-mock-anything")
 msg = client.chat.completions.create(
-    model="gpt-5.4", max_tokens=1024,
+    model="gpt-6.2-sol", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 ```

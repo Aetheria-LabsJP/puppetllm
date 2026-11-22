@@ -13,7 +13,8 @@ provider 非依存の canonical core + アダプタ:
 - `puppetllm/providers/openai.py` — OpenAI 経路 `POST /v1/chat/completions`（リクエストは canonical（Anthropic 風）に正規化し、レスポンスは `chat.completion` JSON / SSE chunk に変換）
 - `puppetllm/batches.py` — Anthropic Message Batches 経路 `/v1/messages/batches*`（各 custom_id を通常の pending として保持。バッチのライフサイクルは `/_control/batch/*` から注入可能）
 - `puppetllm/cache_sim.py` — 擬似プロンプトキャッシュ（multi-breakpoint + トップレベル `cache_control` の自動キャッシュ + 前方一致 + 世代別最小閾値 + 5m / 1h TTL + 20-block lookback + effort / thinking / tool_choice による無効化）
-- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude は Fable / Mythos / Sonnet 5 / Opus 4.1 を含む世代別、GPT / o 系ファミリ。公式料金ページに準拠）と `/v1/models` のカタログ
+- `puppetllm/pricing.py` — 概算トークン + 料金表（Claude の世代別、GPT / o 系・Grok ファミリ、ロングコンテキスト料金つき。公式料金ページに準拠）
+- `puppetllm/catalog.py` — `/v1/models` のカタログ（ID、上限、ライフサイクル、capabilities）
 - `puppetllm/harness.py` — テストハーネス層: シナリオルール・未マッチ時ポリシー・pending タイムアウト・レイテンシ / ジッタ・レートリミット窓・擬似クロック。`puppetllm/control_models.py` は `/openapi.json` に載せる `/_control/*` の型付きリクエストボディ
 - `puppetllm/testing.py` + `puppetllm/pytest_plugin.py` — テスト側クライアント（`Puppet`、`serve()`）と pytest の `puppet` フィクスチャ
 
@@ -77,6 +78,7 @@ puppetllm/
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/* + count_tokens / models
 │   ├── harness.py          # シナリオルール・未マッチ時ポリシー・レイテンシ・レートリミット・擬似クロック
 │   ├── control_models.py   # /_control/* の型付きリクエストボディ（/openapi.json に載る）
+│   ├── catalog.py          # /v1/models のカタログ
 │   ├── capabilities.py     # 互換性マトリクス（/_control/capabilities）+ 未実装パスのキャッチオール
 │   ├── __main__.py         # `puppetllm serve|relay|wait` コマンドライン
 │   ├── testing.py          # テスト側クライアント（Puppet、serve()）

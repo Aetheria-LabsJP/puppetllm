@@ -7,16 +7,16 @@
 ```bash
 # Anthropic SDK のアプリを xAI Grok で動かす:
 python -m puppetllm.relay --target https://api.x.ai/v1 \
-    --api-key-env XAI_API_KEY --model grok-3
+    --api-key-env XAI_API_KEY --model grok-4.7
 
 # OpenAI SDK のアプリを実 Claude で動かす:
-python -m puppetllm.relay --kind anthropic --model claude-sonnet-4-5
+python -m puppetllm.relay --kind anthropic --model claude-sonnet-5-5
 
 # モデル単位のルーティング (単一強制でなく):
-python -m puppetllm.relay --model-map "claude-*=grok-3,gpt-*=grok-3-mini"
+python -m puppetllm.relay --model-map "claude-*=grok-4.7,gpt-*=grok-4.3"
 
 # OpenAI モデルのリクエストだけ relay し、残りは手動で答える（モデルで分割した並行運用）:
-python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
+python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-4.7
 ```
 
 - `--kind openai`（既定）は **OpenAI 互換の任意エンドポイント**に対応 — OpenAI / xAI Grok / Groq / Ollama / OpenRouter など、`--target` に base URL を向けるだけ。`--kind anthropic` は本家 Anthropic API。

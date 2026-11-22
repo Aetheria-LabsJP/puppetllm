@@ -65,6 +65,8 @@ class TestCacheSimConformance(unittest.TestCase):
             "claude-sonnet-5": 1024, "claude-sonnet-4-6": 1024,
             "claude-haiku-4-5": 4096, "claude-3-5-haiku-20241022": 2048,
             "anthropic.claude-opus-5": 512, "mystery": 1024,
+            "claude-opus-5-5": 512, "claude-fable-5-2": 512, "claude-sonnet-5-5": 512,
+            "claude-haiku-5-5": 512, "claude-mythos-preview": 2048,
         }
         for model, n in cases.items():
             self.assertEqual(_min_cacheable_for(model), n, model)

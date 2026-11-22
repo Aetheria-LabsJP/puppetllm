@@ -1,6 +1,6 @@
 """Anthropic / Bedrock / OpenAI compatible fake server (for debug/regression).
 
-See **README.md** for the formal spec, usage examples, and design decisions.
+See **README.md** and `docs/` for the formal spec, usage examples, and design decisions.
 
 The Anthropic SDK honors the `ANTHROPIC_BASE_URL` environment variable, so pointing
 it at localhost lets a human or another agent supply the response while still exercising
@@ -50,7 +50,6 @@ import json
 import math
 import os
 import sys
-import time
 import uuid
 from typing import Any
 
@@ -59,6 +58,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from . import __version__
 from . import capabilities as _capabilities
+from . import catalog as _catalog
 from . import control_models as _cm
 from . import harness as _harness
 from . import observability as _obs
@@ -95,7 +95,7 @@ _CACHE_TTL = _parse_cache_ttl(os.environ.get("PUPPETLLM_CACHE_TTL"))
 _CACHE_TTL_1H = (_parse_cache_ttl(os.environ.get("PUPPETLLM_CACHE_TTL_1H"))
                  if os.environ.get("PUPPETLLM_CACHE_TTL_1H") else _CACHE_TTL * 12)
 _CACHE_HONOR_TTL = os.environ.get("PUPPETLLM_CACHE_HONOR_TTL", "1") != "0"
-# Minimum cacheable threshold. Unset/invalid/negative = per-model (Opus 4096/Sonnet 1024 etc.). `0` disables it (cache all prefixes).
+# Minimum cacheable threshold. Unset/invalid/negative = per-model (see cache_sim). `0` disables it (cache all prefixes).
 def _parse_cache_min(v: str | None) -> int | None:
     if v is None:
         return None
@@ -2513,12 +2513,15 @@ async def stats() -> dict[str, Any]:
         totals["total_usd"] += float(cost.get("total_usd", 0.0))
 
         read = int(usage.get("cache_read_input_tokens", 0))
-        # Batch entries are billed at 50%, so the amount a cache hit saved is halved
-        # too — otherwise savings would be overstated for batch traffic (the discount
-        # factor is recorded on the entry's cost by _apply_batch_discount).
-        savings_factor = float(cost.get("batch_discount", 1.0))
+        # The saving scales with whatever scaled the entry's prices: the batch discount
+        # (recorded on the cost by _apply_batch_discount) and the fast-mode /
+        # US-inference multipliers.
+        savings_factor = (float(cost.get("batch_discount", 1.0))
+                          * float(cost.get("geo_multiplier", 1.0))
+                          * float(cost.get("speed_multiplier", 1.0)))
         totals["cache_savings_usd"] += pricing.cache_savings_usd(
-            e.get("pricing_model") or model, read) * savings_factor
+            e.get("pricing_model") or model, read,
+            long_context=bool(cost.get("long_context"))) * savings_factor
 
         cstatus = cache.get("status")
         if cstatus == "hit":
@@ -3090,19 +3093,6 @@ def _catalogue_dialect(request: Request) -> str:
     return "anthropic"
 
 
-# A fixed creation timestamp so the catalogue is stable across restarts.
-_CATALOGUE_CREATED = 1_767_225_600  # 2026-01-01T00:00:00Z
-
-
-def _model_entry(dialect: str, model_id: str, display_name: str | None) -> dict[str, Any]:
-    if dialect == "openai":
-        return {"id": model_id, "object": "model", "created": _CATALOGUE_CREATED,
-                "owned_by": "puppetllm"}
-    return {"type": "model", "id": model_id,
-            "display_name": display_name or model_id,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_CATALOGUE_CREATED))}
-
-
 @app.get("/_control/capabilities")
 async def capabilities() -> dict[str, Any]:
     """The compatibility matrix: every surface with accepted / injectable / streamed /
@@ -3124,17 +3114,23 @@ async def get_model_root(model_id: str, request: Request) -> Any:
 
 @app.get("/v1/models")
 async def list_models(request: Request) -> Any:
-    """The model catalogue (`pricing.KNOWN_MODELS`), in the dialect of the caller. It is
+    """The model catalogue (`catalog`), in the dialect of the caller. It is
     informational: `/v1/messages` accepts any model id whether listed or not. The
-    Anthropic shape pages with `limit` / `after_id` / `before_id` like the real endpoint,
-    so an SDK's auto-pagination terminates."""
-    dialect = _catalogue_dialect(request)
-    family = "openai" if dialect == "openai" else "anthropic"
-    entries = [_model_entry(dialect, mid, name) for mid, name in pricing.KNOWN_MODELS[family]]
-    if dialect == "openai":
-        return {"object": "list", "data": entries}
+    Anthropic shape pages with `limit` / `after_id` / `before_id` and filters by
+    `lifecycle` (active and deprecated models unless asked otherwise) like the real
+    endpoint, so an SDK's auto-pagination terminates."""
+    if _catalogue_dialect(request) == "openai":
+        return {"object": "list",
+                "data": [_catalog.openai_entry(mid) for mid in _catalog.OPENAI_MODELS]}
     qp = request.query_params
     headers = {"request-id": _new_request_id()}
+    lifecycles = qp.getlist("lifecycle") + qp.getlist("lifecycle[]") or ["active", "deprecated"]
+    if len(lifecycles) > 3 or any(value not in _catalog.LIFECYCLES for value in lifecycles):
+        return _anthropic_error(400, "invalid_request_error",
+                                "lifecycle: expected up to three of active, deprecated, retired",
+                                headers=headers)
+    entries = [_catalog.anthropic_entry(m.id) for m in _catalog.CLAUDE_MODELS
+               if m.lifecycle in lifecycles]
     raw_limit = qp.get("limit")
     limit = 20
     if raw_limit is not None:
@@ -3181,9 +3177,10 @@ async def get_model(model_id: str, request: Request) -> Any:
     if not model_id:
         # `/v1/models/` — an empty id is nothing to synthesize.
         return await _capabilities.refuse(request, "openai" if dialect == "openai" else "anthropic")
-    family = "openai" if dialect == "openai" else "anthropic"
-    names = dict(pricing.KNOWN_MODELS[family])
-    return _model_entry(dialect, model_id, names.get(model_id))
+    if dialect == "openai":
+        return _catalog.openai_entry(model_id)
+    return JSONResponse(_catalog.anthropic_entry(model_id),
+                        headers={"request-id": _new_request_id()})
 
 
 # ── Registering the provider adapters ────────────────────────────────

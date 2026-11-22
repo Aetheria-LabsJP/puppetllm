@@ -11,7 +11,7 @@ from anthropic import AnthropicBedrock
 client = AnthropicBedrock(base_url="http://localhost:8765", aws_region="us-east-1",
                           aws_access_key="dummy", aws_secret_key="dummy")
 msg = client.messages.create(
-    model="anthropic.claude-3-5-sonnet-20241022-v2:0", max_tokens=1024,
+    model="anthropic.claude-sonnet-5-5", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
@@ -20,7 +20,7 @@ Requires the bedrock extra for SigV4 signing: `pip install 'anthropic[bedrock]'`
 
 Bedrock-route specifics (all decided from the URL path, no mode switch):
 
-- **Model-id normalization**: `anthropic.claude-haiku-4-5-20251001-v1:0`, suffix-less current ids (`anthropic.claude-opus-5`), cross-region inference profiles (`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … prefixes) and foundation-model / inference-profile ARNs (any partition: `aws`, `aws-cn`, `aws-us-gov`) are mapped to the Anthropic-side name (`claude-haiku-4-5-20251001`), which is what the pending snapshot's `model`, the response `model` field and `/_control/stats` `by_model` use — so Bedrock and direct-Anthropic traffic for the same model aggregate into one row, and relay's `--model-map` / `--only` globs match `claude-*`. The raw id is kept on the snapshot / history entry as `bedrock_model_id`. Ids without an `anthropic.` segment pass through unchanged.
+- **Model-id normalization**: `anthropic.claude-haiku-4-5-20251001-v1:0`, suffix-less current ids (`anthropic.claude-opus-5-5`), cross-region inference profiles (`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … prefixes) and foundation-model / inference-profile ARNs (any partition: `aws`, `aws-cn`, `aws-us-gov`) are mapped to the Anthropic-side name (`claude-haiku-4-5-20251001`), which is what the pending snapshot's `model`, the response `model` field and `/_control/stats` `by_model` use — so Bedrock and direct-Anthropic traffic for the same model aggregate into one row, and relay's `--model-map` / `--only` globs match `claude-*`. The raw id is kept on the snapshot / history entry as `bedrock_model_id`. Ids without an `anthropic.` segment pass through unchanged.
 - **`anthropic_version` is validated** for Anthropic model ids: missing or anything other than `bedrock-2023-05-31` is rejected up front with `400 ValidationException` (no pending is created) — catches hand-rolled clients early. Other vendors' ids (`meta.llama…`, `amazon.titan…`) have their own body shapes and pass through unchecked. Malformed `cache_control` layouts (see [Observe cost / tokens / cache](control-api.md#observe-cost--tokens--cache)) are rejected the same way.
 - **SigV4 is not verified**: `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` are ignored.
 - **Response headers**: non-stream responses carry `X-Amzn-Bedrock-Input-Token-Count` (non-cached input only, like Converse's `inputTokens`) / `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency` (+ `x-amzn-requestid`); streams carry `amazon-bedrock-invocationMetrics` (incl. `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`) on the final chunk and `X-Amzn-Bedrock-Content-Type`, as real Bedrock does. The options boto3 sends as **request headers** — `serviceTier=` (`X-Amzn-Bedrock-Service-Tier`, `priority | default | flex | reserved`) and `performanceConfigLatency=` (`X-Amzn-Bedrock-PerformanceConfig-Latency`) — are validated, echoed back in the same response headers on both routes (`default` when no tier was asked for), and the tier is made visible to the responder as canonical `service_tier` (`priority` / `flex` → `auto`, `default` / `reserved` → `standard_only`, the relay's vocabulary).
@@ -37,11 +37,11 @@ rt = boto3.client("bedrock-runtime", region_name="us-east-1",
                   aws_access_key_id="dummy", aws_secret_access_key="dummy",
                   endpoint_url="http://localhost:8765")
 
-rt.converse(modelId="anthropic.claude-opus-5",
+rt.converse(modelId="anthropic.claude-opus-5-5",
             messages=[{"role": "user", "content": [{"text": "hello"}]}],
             inferenceConfig={"maxTokens": 1024})
 
-for event in rt.converse_stream(modelId="anthropic.claude-opus-5",
+for event in rt.converse_stream(modelId="anthropic.claude-opus-5-5",
                                 messages=[{"role": "user", "content": [{"text": "hello"}]}])["stream"]:
     print(event)          # messageStart / contentBlockDelta / … / metadata
 ```
@@ -118,7 +118,7 @@ s3.create_bucket(Bucket="batch-in"); s3.create_bucket(Bucket="batch-out")
 s3.put_object(Bucket="batch-in", Key="jobs/input.jsonl", Body=b'''{"recordId": "r1", "modelInput": {...}}\n''')
 
 job = bedrock.create_model_invocation_job(
-    jobName="myjob", modelId="anthropic.claude-opus-5",
+    jobName="myjob", modelId="anthropic.claude-opus-5-5",
     roleArn="arn:aws:iam::123456789012:role/BatchRole",
     inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://batch-in/jobs/input.jsonl"}},
     outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://batch-out/results/"}})

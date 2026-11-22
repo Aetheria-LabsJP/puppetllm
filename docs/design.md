@@ -13,7 +13,8 @@ A provider-agnostic canonical core + adapters:
 - `puppetllm/providers/openai.py` — OpenAI route `POST /v1/chat/completions` (requests are normalized to the canonical Anthropic-style form; responses are converted back to `chat.completion` JSON / SSE chunks).
 - `puppetllm/batches.py` — Anthropic Message Batches route `/v1/messages/batches*` (each custom_id is held as an ordinary pending; batch lifecycle is injectable via `/_control/batch/*`).
 - `puppetllm/cache_sim.py` — pseudo prompt cache (multi-breakpoint + top-level automatic `cache_control` + prefix match + generation-aware minimum threshold + 5m / 1h TTLs + 20-block lookback + effort / thinking / tool_choice invalidation).
-- `puppetllm/pricing.py` — approximate tokens + price table (Claude generations incl. Fable / Mythos / Sonnet 5 / Opus 4.1, and GPT / o-series families, per the official pricing pages) and the `/v1/models` catalogue.
+- `puppetllm/pricing.py` — approximate tokens + price tables (Claude generations, GPT / o-series and Grok families, with long-context cards, per the official pricing pages).
+- `puppetllm/catalog.py` — the `/v1/models` catalogue: ids, limits, lifecycle and capabilities.
 - `puppetllm/harness.py` — test-harness layer: scenario rules, unmatched policy, pending timeout, latency / jitter, rate-limit window, fake clock. `puppetllm/control_models.py` holds the typed `/_control/*` request bodies published in `/openapi.json`.
 - `puppetllm/testing.py` + `puppetllm/pytest_plugin.py` — the test-side client (`Puppet`, `serve()`) and the `puppet` pytest fixture.
 
@@ -80,6 +81,7 @@ puppetllm/
 │   ├── fake_server.py      # canonical core + Anthropic /v1/messages + /_control/* + count_tokens / models
 │   ├── harness.py          # scenario rules, unmatched policy, latency, rate limit, fake clock
 │   ├── control_models.py   # typed /_control/* request bodies (published in /openapi.json)
+│   ├── catalog.py          # the /v1/models catalogue
 │   ├── capabilities.py     # compatibility matrix (/_control/capabilities) + the catch-all for unimplemented paths
 │   ├── __main__.py         # the `puppetllm serve|relay|wait` command line
 │   ├── testing.py          # test-side client (Puppet, serve())

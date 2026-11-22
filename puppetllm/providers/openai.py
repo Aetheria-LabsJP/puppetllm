@@ -1,6 +1,6 @@
 """OpenAI Chat Completions compatible adapter.
 
-Formal spec: README.md
+Formal spec: docs/design.md and docs/control-api.md
 
 Pointing the base_url of the `openai` SDK (or any OpenAI-compatible client) at
 `http://<host>:<port>/v1` makes `POST /v1/chat/completions` arrive on this route.

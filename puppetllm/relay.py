@@ -19,8 +19,8 @@ AI-agent responder run concurrently (partitioned by model, not the same request)
 
 Usage:
   python -m puppetllm.relay --target https://api.x.ai/v1 \\
-      --api-key-env XAI_API_KEY --model grok-3
-  python -m puppetllm.relay --kind anthropic --model claude-sonnet-4-5
+      --api-key-env XAI_API_KEY --model grok-4.7
+  python -m puppetllm.relay --kind anthropic --model claude-sonnet-5-5
   python -m puppetllm.relay --kind agent-sdk --model sonnet
 
 Notes:
@@ -1284,7 +1284,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="force this upstream model for every request")
     p.add_argument("--model-map", default=None,
                    help='glob mapping "pat=model,pat2=model2", e.g. '
-                        '"claude-*=grok-3,gpt-*=grok-3" (first match wins; '
+                        '"claude-*=grok-4.7,gpt-*=grok-4.7" (first match wins; '
                         '--model takes precedence)')
     p.add_argument("--max-tokens-param",
                    choices=("auto", "max_tokens", "max_completion_tokens"), default="auto",

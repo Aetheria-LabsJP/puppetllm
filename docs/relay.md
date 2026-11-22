@@ -7,16 +7,16 @@
 ```bash
 # An Anthropic-SDK app running on xAI Grok:
 python -m puppetllm.relay --target https://api.x.ai/v1 \
-    --api-key-env XAI_API_KEY --model grok-3
+    --api-key-env XAI_API_KEY --model grok-4.7
 
 # An OpenAI-SDK app running on real Claude:
-python -m puppetllm.relay --kind anthropic --model claude-sonnet-4-5
+python -m puppetllm.relay --kind anthropic --model claude-sonnet-5-5
 
 # Per-model routing instead of a single forced model:
-python -m puppetllm.relay --model-map "claude-*=grok-3,gpt-*=grok-3-mini"
+python -m puppetllm.relay --model-map "claude-*=grok-4.7,gpt-*=grok-4.3"
 
 # Relay only OpenAI-model requests; answer the rest by hand (concurrent, partitioned by model):
-python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
+python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-4.7
 ```
 
 - `--kind openai` (default) speaks to **any OpenAI-compatible endpoint** — OpenAI, xAI Grok, Groq, Ollama, OpenRouter, … just point `--target` at its base URL. `--kind anthropic` speaks to the native Anthropic API.

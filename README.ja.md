@@ -23,7 +23,7 @@ curl -s localhost:8765/_control/health     # → {"ok":true,"turn_count":0}
 # ターミナル 1 — アプリ。base_url 以外はそのまま（答えが注入されるまでブロックする）
 import anthropic
 client = anthropic.Anthropic(base_url="http://localhost:8765", api_key="sk-mock")
-msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=256,
+msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=256,
                              messages=[{"role": "user", "content": "東京の天気は？"}])
 print(msg.content[0].text, msg.usage)
 ```

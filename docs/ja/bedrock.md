@@ -11,7 +11,7 @@ from anthropic import AnthropicBedrock
 client = AnthropicBedrock(base_url="http://localhost:8765", aws_region="us-east-1",
                           aws_access_key="dummy", aws_secret_key="dummy")
 msg = client.messages.create(
-    model="anthropic.claude-3-5-sonnet-20241022-v2:0", max_tokens=1024,
+    model="anthropic.claude-sonnet-5-5", max_tokens=1024,
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
@@ -20,7 +20,7 @@ SigV4 署名のため bedrock extra が必要: `pip install 'anthropic[bedrock]'
 
 Bedrock 経路固有の挙動（すべて URL パスから判定。モード切替は不要）:
 
-- **モデル ID の正規化**: `anthropic.claude-haiku-4-5-20251001-v1:0`、サフィックスなしの現行 ID（`anthropic.claude-opus-5`）、クロスリージョン推論プロファイル（`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … プレフィックス）、foundation-model / inference-profile の ARN（`aws` / `aws-cn` / `aws-us-gov` の全パーティション）を Anthropic 側の名前（`claude-haiku-4-5-20251001`）にマップする。pending snapshot の `model`・応答の `model` フィールド・`/_control/stats` の `by_model` はこの正規名を使うので、同じモデルの Bedrock 経由と Anthropic 直の呼び出しが 1 行に合流し、relay の `--model-map` / `--only` の glob も `claude-*` でマッチする。生の ID は snapshot / history エントリの `bedrock_model_id` に保持する。`anthropic.` セグメントを含まない ID はそのまま素通しする。
+- **モデル ID の正規化**: `anthropic.claude-haiku-4-5-20251001-v1:0`、サフィックスなしの現行 ID（`anthropic.claude-opus-5-5`）、クロスリージョン推論プロファイル（`us.` / `eu.` / `apac.` / `jp.` / `au.` / `global.` / `us-gov.` … プレフィックス）、foundation-model / inference-profile の ARN（`aws` / `aws-cn` / `aws-us-gov` の全パーティション）を Anthropic 側の名前（`claude-haiku-4-5-20251001`）にマップする。pending snapshot の `model`・応答の `model` フィールド・`/_control/stats` の `by_model` はこの正規名を使うので、同じモデルの Bedrock 経由と Anthropic 直の呼び出しが 1 行に合流し、relay の `--model-map` / `--only` の glob も `claude-*` でマッチする。生の ID は snapshot / history エントリの `bedrock_model_id` に保持する。`anthropic.` セグメントを含まない ID はそのまま素通しする。
 - **`anthropic_version` を検証する**（Anthropic モデル ID のみ）: 欠落、または `bedrock-2023-05-31` 以外の値は受付時点で `400 ValidationException` として弾く（pending は作られない）— 自前実装クライアントのミスを早期に検出する。他ベンダーの ID（`meta.llama…`、`amazon.titan…`）はボディ形式が異なるため検証せず素通しする。不正な `cache_control` 配置（[コスト / トークン / キャッシュを観測する](control-api.md#コスト--トークン--キャッシュを観測する) 参照）も同じ形で弾く。
 - **SigV4 は検証しない**: `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` は無視する。
 - **レスポンスヘッダ**: 非ストリーミング応答には `X-Amzn-Bedrock-Input-Token-Count`（Converse の `inputTokens` と同様、非キャッシュ分のみ）/ `X-Amzn-Bedrock-Output-Token-Count` / `X-Amzn-Bedrock-Cache-Read-Input-Token-Count` / `X-Amzn-Bedrock-Cache-Write-Input-Token-Count` / `X-Amzn-Bedrock-Invocation-Latency`（+ `x-amzn-requestid`）を付与する。ストリーミングは実 Bedrock と同様に最終チャンクの `amazon-bedrock-invocationMetrics`（`cacheReadInputTokenCount` / `cacheWriteInputTokenCount` 込み）に載せ、`X-Amzn-Bedrock-Content-Type` を付ける。boto3 が**リクエストヘッダ**で送るオプション — `serviceTier=`（`X-Amzn-Bedrock-Service-Tier`、`priority | default | flex | reserved`）と `performanceConfigLatency=`（`X-Amzn-Bedrock-PerformanceConfig-Latency`）— は検証した上で両経路の応答ヘッダにそのまま echo し（ティア未指定なら `default`）、ティアは responder に canonical の `service_tier` として見える（`priority` / `flex` → `auto`、`default` / `reserved` → `standard_only`。relay と同じ語彙）。
@@ -37,11 +37,11 @@ rt = boto3.client("bedrock-runtime", region_name="us-east-1",
                   aws_access_key_id="dummy", aws_secret_access_key="dummy",
                   endpoint_url="http://localhost:8765")
 
-rt.converse(modelId="anthropic.claude-opus-5",
+rt.converse(modelId="anthropic.claude-opus-5-5",
             messages=[{"role": "user", "content": [{"text": "hello"}]}],
             inferenceConfig={"maxTokens": 1024})
 
-for event in rt.converse_stream(modelId="anthropic.claude-opus-5",
+for event in rt.converse_stream(modelId="anthropic.claude-opus-5-5",
                                 messages=[{"role": "user", "content": [{"text": "hello"}]}])["stream"]:
     print(event)          # messageStart / contentBlockDelta / … / metadata
 ```
@@ -115,7 +115,7 @@ s3.create_bucket(Bucket="batch-in"); s3.create_bucket(Bucket="batch-out")
 s3.put_object(Bucket="batch-in", Key="jobs/input.jsonl", Body=b'''{"recordId": "r1", "modelInput": {...}}\n''')
 
 job = bedrock.create_model_invocation_job(
-    jobName="myjob", modelId="anthropic.claude-opus-5",
+    jobName="myjob", modelId="anthropic.claude-opus-5-5",
     roleArn="arn:aws:iam::123456789012:role/BatchRole",
     inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://batch-in/jobs/input.jsonl"}},
     outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://batch-out/results/"}})

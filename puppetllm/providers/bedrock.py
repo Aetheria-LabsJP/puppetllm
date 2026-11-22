@@ -1,6 +1,6 @@
 """Bedrock (InvokeModel / InvokeModelWithResponseStream) compatible adapter.
 
-Formal spec: README.md
+Formal spec: docs/bedrock.md
 
 When the base_url of the `AnthropicBedrock` SDK / boto3 `bedrock-runtime` is pointed
 at the fake server, requests arrive in the following form (differences from the

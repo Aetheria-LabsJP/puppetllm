@@ -8,7 +8,7 @@ The Anthropic Message Batches surface (`/v1/messages/batches*`) is also served, 
 
 ```python
 batch = client.messages.batches.create(requests=[
-    {"custom_id": "r1", "params": {"model": "claude-sonnet-4-5", "max_tokens": 64,
+    {"custom_id": "r1", "params": {"model": "claude-sonnet-5-5", "max_tokens": 64,
                                    "messages": [{"role": "user", "content": "hi"}]}},
     {"custom_id": "r2", "params": {...}},
 ])
