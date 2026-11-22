@@ -30,3 +30,5 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 - Anthropic-inbound `output_config.format` of type `json_schema` is translated to OpenAI `response_format` (the schema and a name; not `strict`, whose schema rules an Anthropic schema need not meet), the mirror of the `response_format` → `output_config` mapping towards Anthropic.
 
 Caveats: the upstream call is non-streaming, so a streaming app sees correct SSE but with first-token latency equal to the full upstream response time; audio / file parts and `document` blocks are not translated (images are); costs are **real** in this mode; by default the recorded cost (and so `/_control/stats`) prices tokens by the *inbound* model id, which may differ from the upstream model's actual pricing — `--price-by upstream` switches to the upstream model's table.
+
+An experimental third kind, `--kind agent-sdk`, answers pendings through the Claude Agent SDK instead of a plain API call; it has its own guide: [Agent SDK conversion mode](agent-sdk.md).

@@ -61,6 +61,7 @@ with serve() as puppet:                      # in-process server on a free port
 | [Bedrock](docs/bedrock.md) | InvokeModel, Converse, guardrail and prompt-management fixtures, batch inference with the bundled S3 emulation |
 | [Message Batches API](docs/batches.md) | The Anthropic batch lifecycle and how to drive it |
 | [Relay mode](docs/relay.md) | Forwarding pendings to a real Anthropic / OpenAI-compatible upstream across SDKs |
+| [Agent SDK conversion mode](docs/agent-sdk.md) | Experimental: a relay that answers pendings through the Claude Agent SDK, with its Docker services, status watchdog and safeguards |
 | [Design notes](docs/design.md) | Architecture, the compatibility matrix, tests, layout |
 
 The responder's own instructions (for Claude Code / Codex playing the model) live in [`responder/`](responder/).

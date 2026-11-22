@@ -30,3 +30,5 @@ python -m puppetllm.relay --only "gpt-*,o3-*" --model grok-3
 - `--max-concurrency N` で同時 in-flight な上流呼び出し数を上限化（既定: 無制限）。pending がバーストしても一気にファンアウトして上流のレート制限を踏まない。
 
 注意: 上流呼び出しは非ストリーミングのため、ストリーミングアプリの SSE は正しく動くが最初のトークンまでの遅延が上流の完全応答時間になる。音声 / ファイルパートと `document` ブロックは未変換（画像は変換する）。このモードは**実課金**が発生する。既定では記録するコスト（したがって `/_control/stats`）は*受信側* model id 基準なので、上流モデルの実際の価格とはずれうる — `--price-by upstream` で上流モデルの表に切り替えられる。
+
+実験的な 3 つ目の kind、`--kind agent-sdk` は、素の API 呼び出しの代わりに Claude Agent SDK 経由で pending に答える。専用のガイド: [Agent SDK 変換モード](agent-sdk.md)。

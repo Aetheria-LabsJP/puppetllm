@@ -4,6 +4,7 @@
                     [--on-unmatched pending|default|error] [--seed N]
                     [--config FILE] [--rules FILE]
     puppetllm relay --kind openai ...        (the relay responder, see puppetllm.relay)
+    puppetllm relay --kind agent-sdk ...     (experimental SDK conversion)
     puppetllm wait  [--url http://127.0.0.1:8765] [--timeout 30]
     puppetllm --version
 
@@ -33,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"puppetllm {__version__}")
     sub = parser.add_subparsers(dest="command")
     add_serve_arguments(sub.add_parser("serve", help="run the fake server (default)"))
-    sub.add_parser("relay", help="relay responder: forward pendings to a real API",
+    sub.add_parser("relay", help="relay responder: answer pendings using a real API or Agent SDK",
                    add_help=False)
     wait = sub.add_parser("wait", help="block until a server answers /_control/health")
     wait.add_argument("--url", default="http://127.0.0.1:8765")

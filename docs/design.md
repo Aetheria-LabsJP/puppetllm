@@ -69,6 +69,9 @@ there. It needs `boto3` (in `requirements.txt`); the compose test profile sets
 `PUPPETLLM_REQUIRE_SDK_TESTS=1` so a run that cannot import it fails instead of quietly
 reporting `OK` with every SDK test skipped.
 
+The Agent SDK relay has its own modules (`test_agent_sdk.py`, `test_sdk_*.py`), run in the
+`puppetllm:agent-sdk` image; see [Agent SDK conversion mode](agent-sdk.md).
+
 ## Layout
 
 ```
@@ -87,18 +90,22 @@ puppetllm/
 │   ├── cache_sim.py        # pseudo prompt cache
 │   ├── pricing.py          # approximate tokens + pricing
 │   ├── relay.py            # relay responder (cross-provider bridge to a real API)
+│   ├── agent_sdk.py        # experimental relay kind: answers through the Claude Agent SDK
+│   │                       #   sdk_transport.py, sdk_egress.py, sdk_guard.py, sdk_runtime.py, sdk_state.py
 │   ├── openai_wire.py      # pure OpenAI ↔ canonical conversions shared by the adapter and the relay
 │   ├── providers/          # Bedrock (invoke / converse / batch) + OpenAI adapters, S3, AWS event stream
 │   │                       #   bedrock.py, converse.py, bedrock_batch.py, s3.py, openai.py, eventstream.py
 │   └── tests/              # unit tests
-├── docs/                   # the guides (docs/ja/ in Japanese): quickstart, testing, control API, bedrock, batches, relay, design
+├── docs/                   # the guides (docs/ja/ in Japanese): quickstart, testing, control API, bedrock, batches, relay, agent-sdk, design
 ├── examples/               # tool_loop.py (a scripted tool loop), test_retry.py (the pytest fixture)
 ├── responder/              # instruction docs for the responder (the agent that "plays the LLM")
 │   ├── CLAUDE.md           #   for Claude Code
 │   └── AGENTS.md           #   for Codex CLI and other agents following the AGENTS.md convention
 ├── LICENSE
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml      # `proxy`, the `test` profile and the opt-in `agent-sdk` profile
+├── start-agent-sdk.sh      # builds and starts the server, the Agent SDK relay and its watchdog
+├── .env.example            # the Agent SDK relay's settings (copy to .env)
 ├── pyproject.toml          # `pip install .` → `puppetllm` command + pytest plugin
 └── requirements.txt
 ```

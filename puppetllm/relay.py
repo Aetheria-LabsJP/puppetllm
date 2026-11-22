@@ -21,8 +21,11 @@ Usage:
   python -m puppetllm.relay --target https://api.x.ai/v1 \\
       --api-key-env XAI_API_KEY --model grok-3
   python -m puppetllm.relay --kind anthropic --model claude-sonnet-4-5
+  python -m puppetllm.relay --kind agent-sdk --model sonnet
 
 Notes:
+- agent-sdk is an experimental semantic adapter, not an API pass-through:
+  it generates the caller's next message using isolated SDK structured output.
 - The upstream call is non-streaming; the app still receives SSE (the server
   pseudo-streams the injected blocks), but first-token latency equals the full
   upstream response time.
@@ -39,9 +42,12 @@ import asyncio
 import copy
 import fnmatch
 import json
+import math
 import os
+import signal
 import sys
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -49,6 +55,10 @@ import httpx
 
 from . import openai_wire as _oai
 from . import pricing
+from .agent_sdk import (AgentSDKBackend, SDKGateBypassError, SDKOutputError, SDKRunError,
+                        UnsupportedSDKRequest, await_cleanup)
+from .sdk_guard import SDKGuard, GuardError, Blocked
+from .sdk_runtime import RuntimeSnapshot, StateLock, StateBusyError
 from .cache_sim import thinking_default_for as _thinking_default_for
 
 # Upper bound on the quarantine set (see Relay.quarantined). Far above any realistic
@@ -129,7 +139,7 @@ def looks_foreign(model: str, kind: str) -> bool:
     m = (model or "").lower()
     if not m:
         return False
-    if kind == "anthropic":
+    if kind in ("anthropic", "agent-sdk"):
         return any(m.startswith(h) for h in _OPENAI_HINTS)
     return any(m.startswith(h) for h in _ANTHROPIC_HINTS)
 
@@ -726,12 +736,39 @@ class Relay:
         self._warned_fallback_price = False
         self._warned_foreign = False
         self._tasks: set[asyncio.Task] = set()  # strong refs (create_task is weakly held)
+        self._pending_tasks: dict[str, asyncio.Task] = {}
+        self._cancel_requested: set[asyncio.Task] = set()
         self.handled = 0
+        self.agent_sdk = AgentSDKBackend(cfg) if cfg.kind == "agent-sdk" else None
+        self.sdk_guard = self.sdk_runtime = self._state_lock = None
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+        self._sdk_leases: dict[str, Any] = {}
+        self._sdk_delivered: set[str] = set()
+        self._heartbeat_task = None
+        if self.agent_sdk is not None:
+            try:
+                cfg.sdk_state_dir = str(Path(cfg.sdk_state_dir).expanduser().resolve())
+                # One worker per state directory; maintenance takes the same lock.
+                self._state_lock = StateLock(cfg.sdk_state_dir)
+                self.sdk_guard = SDKGuard(Path(cfg.sdk_state_dir) / "guard.sqlite3")
+                self.sdk_runtime = RuntimeSnapshot(cfg.sdk_state_dir, log=_log,
+                                                   idle_warning=cfg.sdk_idle_warning)
+                self.sdk_runtime.write(self.sdk_guard.status())
+            except (GuardError, StateBusyError, OSError):
+                if self.sdk_guard is not None:
+                    self.sdk_guard.close()
+                if self._state_lock is not None:
+                    self._state_lock.close()
+                raise ValueError("Agent SDK persistent state is unavailable; execution disabled") from None
         api_key = os.environ.get(cfg.api_key_env, "")
-        if not api_key:
+        if not api_key and self.agent_sdk is None:
             _log(f"WARNING: env {cfg.api_key_env} is empty — upstream calls will "
                  f"likely fail with 401")
-        if cfg.kind == "anthropic":
+        if self.agent_sdk is not None:
+            headers = {}
+            self.upstream_url = f"agent-sdk ({cfg.target})"
+        elif cfg.kind == "anthropic":
             headers = {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION}
             self.upstream_url = cfg.target.rstrip("/") + "/v1/messages"
         else:
@@ -742,8 +779,91 @@ class Relay:
                                      base_url=cfg.puppet)
 
     async def close(self) -> None:
-        await self.http.aclose()
-        await self.ctl.aclose()
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self.sdk_guard is not None:
+                self.sdk_runtime.ready = False
+                self.sdk_runtime.reason = "stopping"
+            if self._heartbeat_task is not None:
+                self._cancel_task(self._heartbeat_task)
+                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+                self._heartbeat_task = None
+            try:
+                tasks = list(self._tasks)
+                for task in tasks:
+                    self._cancel_task(task)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                try:
+                    await self.http.aclose()
+                    await self.ctl.aclose()
+                finally:
+                    if self.sdk_guard is not None:
+                        try:
+                            try:
+                                self.sdk_runtime.write(self.sdk_guard.status())
+                            except (OSError, GuardError):
+                                _log("Agent SDK shutdown status unavailable")
+                        finally:
+                            try:
+                                self.sdk_guard.close()
+                            finally:
+                                self._state_lock.close()
+                                self.sdk_guard = None
+                    self._closed = True
+
+    async def _heartbeat(self) -> None:
+        while True:
+            try:
+                self.sdk_runtime.write(self.sdk_guard.status())
+            except (OSError, GuardError):
+                self.sdk_runtime.ready = False
+                self.sdk_runtime.reason = "state_error"
+                _log("Agent SDK state heartbeat failed; new executions disabled")
+            await asyncio.sleep(5)
+
+    def _sdk_finish(self, pid: str, reason: str, *, release: bool = False) -> None:
+        """Record the outcome once: `release` leaves no block, otherwise `reason` blocks the input."""
+        lease = self._sdk_leases.pop(pid, None)
+        if lease is not None:
+            try:
+                if release:
+                    self.sdk_guard.succeed(lease)
+                else:
+                    self.sdk_guard.fail(lease, reason)
+            except GuardError:
+                self.sdk_runtime.ready = False
+                self.sdk_runtime.reason = "state_error"
+                _log("Agent SDK outcome could not be recorded; new executions disabled")
+            self.sdk_runtime.finish(pid, reason)
+
+    def _sdk_fail(self, pid: str, reason: str) -> None:
+        self._sdk_finish(pid, reason)
+
+    def _cancel_task(self, task: asyncio.Task) -> bool:
+        """Request cancellation once, including on Python 3.10 during cleanup."""
+        if task.done() or task in self._cancel_requested:
+            return False
+        self._cancel_requested.add(task)
+        task.add_done_callback(self._cancel_requested.discard)
+        task.cancel()
+        return True
+
+    async def _generate_sdk(self, body: dict[str, Any], pid: str) -> dict[str, Any]:
+        task = asyncio.create_task(self.agent_sdk.generate(body, progress=self.sdk_runtime.for_request(pid)))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self.cfg.timeout)
+            if not done:
+                self._cancel_task(task)
+                await await_cleanup(asyncio.gather(task, return_exceptions=True))
+                raise asyncio.TimeoutError()
+            return task.result()
+        except asyncio.CancelledError:
+            self._cancel_task(task)
+            await await_cleanup(asyncio.gather(task, return_exceptions=True))
+            raise
 
     def _quarantine(self, pid: str) -> None:
         """Mark a pid as un-reclaimable, evicting the oldest entry past the cap."""
@@ -781,10 +901,13 @@ class Relay:
         r = await self._post_ctl(path, {"pending_id": pid, **payload})
         if r is not None:
             if r.status_code == 200:
+                if path == "/_control/respond" and pid in self._sdk_leases:
+                    self._sdk_delivered.add(pid)
                 return True
             if r.status_code == 409 or (r.status_code == 400 and "no pending" in r.text):
                 return True  # already resolved / gone — nothing more to do
-            _log(f"{pid}: inject {path} rejected {r.status_code} {r.text[:120]} — "
+            detail = "" if self.agent_sdk is not None else r.text[:120]
+            _log(f"{pid}: inject {path} rejected {r.status_code} {detail} — "
                  f"quarantining + falling back to 502")
         else:
             _log(f"{pid}: inject {path} undeliverable (control plane unreachable) — "
@@ -875,7 +998,9 @@ class Relay:
                      f"endpoint — it names a different vendor and will likely be rejected; "
                      f"pass --model or --model-map to route it")
             dropped: list[str] = []
-            if self.cfg.kind == "anthropic":
+            if self.agent_sdk is not None:
+                body = self.agent_sdk.prepare(req, model, dropped)
+            elif self.cfg.kind == "anthropic":
                 body = to_anthropic_request(req, model, self.cfg, dropped)
             else:
                 body = to_openai_request(req, model, self.cfg, dropped)
@@ -899,6 +1024,40 @@ class Relay:
                     "status": 400, "type": "invalid_request_error",
                     "message": "relay --dry-run: the upstream request was translated and logged, "
                                "not sent", "provenance": provenance})
+                return
+            if self.agent_sdk is not None:
+                if not self.sdk_runtime.ready:
+                    raise GuardError("Agent SDK state is unavailable; execution disabled")
+                settings = self.agent_sdk.generation_settings(body)
+                key = self.sdk_guard.fingerprint(body, generation_settings=settings)
+                self.sdk_runtime.start(pid, key, model, generation_settings=settings)
+                admission = self.sdk_guard.begin(key)
+                if isinstance(admission, Blocked):
+                    self.sdk_runtime.finish(pid, "blocked")
+                    await self._inject(pid, "/_control/error", {
+                        "status": 503, "type": "api_error",
+                        "message": f"Agent SDK execution blocked ({admission.reason}); key={key}. "
+                                   "Stop workers and explicitly clear the block before retrying.",
+                        "headers": {"x-should-retry": "false"}, **self._prov(provenance)})
+                    return
+                self._sdk_leases[pid] = admission
+                self.sdk_runtime.stage(pid, "starting_sdk")
+                started = asyncio.get_running_loop().time()
+                payload = await self._generate_sdk(body, pid)
+                elapsed = asyncio.get_running_loop().time() - started
+                payload["provenance"] = {
+                    **provenance, "usage_source": "upstream" if payload.get("usage") else "estimate"}
+                usage = payload.get("usage") or {}
+                _log(f"{pid}: {req.get('provider')}:{req.get('model')} -> "
+                     f"agent-sdk:{model} ok (stop={payload['stop_reason']}, elapsed={elapsed:.1f}s, "
+                     f"cache_read={usage.get('cache_read_input_tokens', '?')}, "
+                     f"cache_write={usage.get('cache_creation_input_tokens', '?')})")
+                self.sdk_runtime.stage(pid, "injecting")
+                # Delivery removes the pending: it must not look like a disconnect.
+                self._pending_tasks.pop(pid, None)
+                await self._inject(pid, "/_control/respond", payload)
+                delivered = pid in self._sdk_delivered
+                self._sdk_finish(pid, "completed" if delivered else "delivery_error", release=delivered)
                 return
             r = await self.http.post(self.upstream_url, json=body,
                                      headers=self._request_headers(req))
@@ -937,6 +1096,46 @@ class Relay:
                  f"{self.cfg.kind}:{model} ok (stop={payload['stop_reason']}, "
                  f"tools={n_tools}, out_tokens={out_tokens})")
             await self._inject(pid, "/_control/respond", payload)
+        except SDKOutputError as e:
+            self._sdk_fail(pid, "invalid_output")
+            _log(f"{pid}: {e}")
+            await self._inject(pid, "/_control/error", {
+                "status": 502, "type": "api_error", "message": str(e),
+                "headers": {"x-should-retry": "false"}, **self._prov(provenance)})
+        except SDKGateBypassError as e:
+            self.sdk_runtime.ready = False
+            self.sdk_runtime.reason = "state_error"
+            _log(f"{pid}: {e}")
+            await self._inject(pid, "/_control/error", {
+                "status": 503, "type": "api_error", "message": str(e),
+                "headers": {"x-should-retry": "false"}, **self._prov(provenance)})
+        except SDKRunError as e:
+            self._sdk_finish(pid, "upstream_error", release=e.repeatable)  # nothing ran: no block
+            _log(f"{pid}: {e}")
+            await self._inject(pid, "/_control/error", {
+                "status": e.status, "type": e.error_type, "message": str(e),
+                "headers": {"x-should-retry": "false"},
+                **self._prov(provenance)})
+        except UnsupportedSDKRequest as e:
+            await self._inject(pid, "/_control/error", {
+                "status": 400, "type": "invalid_request_error", "message": str(e),
+                **self._prov(provenance)})
+        except asyncio.TimeoutError:
+            self._sdk_fail(pid, "timeout")
+            await self._inject(pid, "/_control/error", {
+                "status": 504, "type": "api_error", "message": "relay: Agent SDK timed out",
+                "headers": {"x-should-retry": "false"},
+                **self._prov(provenance)})
+        except GuardError:
+            self.sdk_runtime.ready = False
+            self.sdk_runtime.reason = "state_error"
+            self.sdk_runtime.finish(pid, "failed")
+            await self._inject(pid, "/_control/error", {
+                "status": 503, "type": "api_error", "message": "Agent SDK persistent state unavailable; execution disabled",
+                "headers": {"x-should-retry": "false"}, **self._prov(provenance)})
+        except asyncio.CancelledError:
+            self._sdk_fail(pid, "cancelled")
+            raise
         except httpx.HTTPError as e:
             # Network-level failure to reach the upstream: surface as a 502 to the app.
             _log(f"{pid}: upstream unreachable: {e!r}")
@@ -946,20 +1145,30 @@ class Relay:
         except Exception as e:
             # Any other failure (unexpected shape, mapping error, ...) must still resolve the
             # pending — otherwise the app's request hangs forever. Surface as a 502.
-            _log(f"{pid}: relay error: {e!r}")
+            # SDK/schema exceptions can contain the entire conversation, generated
+            # arguments, or child-process stderr. Keep those out of logs and errors.
+            detail = type(e).__name__ if self.agent_sdk is not None else repr(e)
+            _log(f"{pid}: relay error: {detail}")
             try:
                 await self._inject(pid, "/_control/error", {
                     "status": 502, "type": "api_error",
-                    "message": f"relay: internal error: {e!r}"[:400], **self._prov(provenance)})
+                    "message": f"relay: internal error: {detail}"[:400],
+                    **({"headers": {"x-should-retry": "false"}} if self.agent_sdk is not None else {}),
+                    **self._prov(provenance)})
             except Exception:
                 pass
         finally:
+            self._sdk_fail(pid, "error")
+            self._sdk_delivered.discard(pid)
             self.inflight.discard(pid)
+            self._pending_tasks.pop(pid, None)
             self.handled += 1
 
     async def run(self) -> None:
         _log(f"puppet={self.cfg.puppet} -> {self.cfg.kind} upstream={self.upstream_url} "
              f"model={self.cfg.model or '(map/passthrough)'}")
+        if self.sdk_guard is not None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat())
         try:
             while not self.cfg.max_requests or self.handled < self.cfg.max_requests:
                 try:
@@ -967,14 +1176,37 @@ class Relay:
                         # Idle: long-poll for the next arrival.
                         await self.ctl.get("/_control/wait_for_pending",
                                            params={"timeout": self.cfg.poll_timeout})
-                    r = await self.ctl.get("/_control/pending")
+                    r = await self.ctl.get("/_control/pending", params=(
+                        {"fields": "model,received_at"} if self.agent_sdk is not None else None))
+                    r.raise_for_status()
                     pendings = r.json().get("pending") or []
+                    if not isinstance(pendings, list):
+                        raise ValueError("control plane returned an invalid pending list")
+                    if self.agent_sdk is not None and any(
+                            item.get("pending_id") not in self.inflight | self.quarantined.keys()
+                            and self._claims(item) for item in pendings) and (
+                            not self.max_concurrency or len(self.inflight) < self.max_concurrency):
+                        full = await self.ctl.get("/_control/pending")
+                        full.raise_for_status()
+                        by_id = {item["pending_id"]: item for item in full.json().get("pending", [])}
+                        # Reuse the full entry only for a new candidate. Existing
+                        # SDK calls need IDs for disconnect detection, not copies
+                        # of the complete conversation every 150 milliseconds.
+                        pendings = [by_id.get(item["pending_id"], item) if item["pending_id"] not in self.inflight
+                                    else item for item in pendings]
                 except (httpx.HTTPError, ValueError) as e:
                     # A transient control-plane blip must not crash the relay (which would
                     # strand every in-flight upstream call). Back off and retry.
                     _log(f"control plane error: {e!r}; retrying in 2s")
                     await asyncio.sleep(2)
                     continue
+                # A disconnected frontend drops its pending immediately. Cancel
+                # abandoned upstream queries too, releasing their concurrency slot
+                # instead of waiting for the full SDK timeout behind a dead client.
+                active = {item.get("pending_id") for item in pendings}
+                for pid, task in list(self._pending_tasks.items()):
+                    if pid not in active and self._cancel_task(task):
+                        _log(f"{pid}: pending ended; cancelling upstream query")
                 claimed = 0
                 skipped = 0  # visible pendings this pass we deliberately did not claim
                 for item in pendings:
@@ -995,10 +1227,13 @@ class Relay:
                         # Left for another responder (human / AI agent). Not an error.
                         skipped += 1
                         continue
+                    if self.agent_sdk is not None and "messages" not in (item.get("request") or {}):
+                        continue  # disappeared between the summary and full reads
                     self.inflight.add(pid)
                     claimed += 1
                     t = asyncio.create_task(self.handle(pid, item))
                     self._tasks.add(t)
+                    self._pending_tasks[pid] = t
                     t.add_done_callback(self._tasks.discard)
                 if self.inflight or skipped or (pendings and not claimed):
                     # Either in-flight upstream calls keep entries pending (short-poll for
@@ -1014,6 +1249,18 @@ class Relay:
             await self.close()
 
 
+def _sdk_output_limit(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be auto or a positive integer") from None
+    if limit <= 0:
+        raise argparse.ArgumentTypeError("must be auto or a positive integer")
+    return limit
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m puppetllm.relay",
@@ -1023,9 +1270,10 @@ def build_parser() -> argparse.ArgumentParser:
                    "http://127.0.0.1:8765"),
                    help="puppetllm control-plane URL (default: $PUPPET_URL or "
                         "http://127.0.0.1:8765)")
-    p.add_argument("--kind", choices=("openai", "anthropic"), default="openai",
+    p.add_argument("--kind", choices=("openai", "anthropic", "agent-sdk"), default="openai",
                    help="upstream API style: any OpenAI-compatible endpoint "
-                        "(OpenAI/Grok/Groq/Ollama/...) or the native Anthropic API")
+                        "(OpenAI/Grok/Groq/Ollama/...), native Anthropic API, or "
+                        "experimental Agent SDK response generation")
     p.add_argument("--target", default=None,
                    help="upstream base URL (default: official endpoint of --kind; "
                         "e.g. https://api.x.ai/v1 for Grok)")
@@ -1047,6 +1295,29 @@ def build_parser() -> argparse.ArgumentParser:
                         "OpenAI-compatible backends)")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="upstream request timeout in seconds (default 120)")
+    p.add_argument("--sdk-max-turns", type=int, default=1,
+                   help="agent-sdk internal turn limit per request, including structured "
+                        "output generation (default 1; caller still executes all tools)")
+    p.add_argument("--sdk-max-buffer-bytes", type=int, default=4 * 1024 * 1024,
+                   help="Agent SDK stdout JSON message size limit (default 4194304)")
+    p.add_argument("--sdk-cache-ttl", choices=("5m", "1h"), default="5m",
+                   help="Agent SDK prompt cache lifetime (default 5m; 1h costs more to write, "
+                        "less when requests are more than five minutes apart)")
+    p.add_argument("--sdk-effort", choices=("auto", "low", "medium", "high", "xhigh", "max"), default="high",
+                   help="Agent SDK reasoning effort, and the ceiling for a request's own "
+                        "output_config.effort (default high; auto: no ceiling, SDK/model default)")
+    p.add_argument("--sdk-max-output-tokens", type=_sdk_output_limit, default=None,
+                   help="Agent SDK total output cap, including thinking and JSON envelope (default SDK limit)")
+    p.add_argument("--sdk-state-dir", default=os.environ.get("PUPPETLLM_SDK_STATE_DIR") or str(Path.home() / ".local/state/puppetllm/agent-sdk"),
+                   help="persistent SDK failure guard and progress directory")
+    p.add_argument("--sdk-api-retries", type=int, default=0,
+                   help="inner CLI HTTP retry limit (default 0; fallback also disabled)")
+    p.add_argument("--sdk-max-api-requests", type=int, default=1,
+                   help="hard upstream Messages HTTP request limit per SDK query (default 1)")
+    p.add_argument("--sdk-structured-retries", type=int, default=1,
+                   help="inner CLI structured-output setting (default 1, preserves native handoff; max-turns bounds calls)")
+    p.add_argument("--sdk-idle-warning", type=float, default=120,
+                   help="warn after this many seconds without an observed generation event; does not cancel")
     p.add_argument("--poll-timeout", type=float, default=55.0,
                    help="control-plane long-poll timeout in seconds (default 55)")
     p.add_argument("--max-requests", type=int, default=0,
@@ -1073,17 +1344,58 @@ def build_parser() -> argparse.ArgumentParser:
 
 def resolve_defaults(cfg: argparse.Namespace) -> argparse.Namespace:
     if cfg.target is None:
-        cfg.target = ANTHROPIC_DEFAULT_URL if cfg.kind == "anthropic" else OPENAI_DEFAULT_URL
+        cfg.target = (ANTHROPIC_DEFAULT_URL if cfg.kind in ("anthropic", "agent-sdk")
+                      else OPENAI_DEFAULT_URL)
     if cfg.api_key_env is None:
-        cfg.api_key_env = ("ANTHROPIC_API_KEY" if cfg.kind == "anthropic"
+        cfg.api_key_env = ("ANTHROPIC_API_KEY" if cfg.kind in ("anthropic", "agent-sdk")
                            else "OPENAI_API_KEY")
     return cfg
 
 
-def main(argv: list[str] | None = None) -> int:
-    cfg = resolve_defaults(build_parser().parse_args(argv))
+async def _run_service(cfg: argparse.Namespace) -> None:
+    relay = Relay(cfg)
+    if cfg.kind != "agent-sdk":
+        await relay.run()
+        return
+    loop = asyncio.get_running_loop()
+    stopping = asyncio.Event()
+    installed = False
     try:
-        asyncio.run(Relay(cfg).run())
+        for number in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(number, stopping.set)
+        installed = True
+    except (NotImplementedError, RuntimeError):
+        pass
+    worker = asyncio.create_task(relay.run())
+    stopped = asyncio.create_task(stopping.wait())
+    try:
+        await asyncio.wait({worker, stopped}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        relay._cancel_task(worker)
+        results = await await_cleanup(asyncio.gather(worker, return_exceptions=True))
+        stopped.cancel()
+        await asyncio.gather(stopped, return_exceptions=True)
+        await await_cleanup(relay.close())
+        if installed:
+            for number in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(number)
+    if isinstance(results[0], BaseException) and not (
+            isinstance(results[0], asyncio.CancelledError) and stopping.is_set()):
+        raise results[0]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    cfg = resolve_defaults(parser.parse_args(argv))
+    if cfg.kind == "agent-sdk" and (cfg.sdk_max_turns < 1 or not math.isfinite(cfg.timeout) or cfg.timeout <= 0 or cfg.sdk_max_buffer_bytes <= 0
+                                   or cfg.sdk_api_retries < 0 or cfg.sdk_structured_retries < 0
+                                   or cfg.sdk_max_api_requests < 1
+                                   or not math.isfinite(cfg.sdk_idle_warning) or cfg.sdk_idle_warning <= 0):
+        parser.error("agent-sdk: an --sdk-* limit or --timeout is out of range")
+    try:
+        asyncio.run(_run_service(cfg))
+    except ValueError as e:
+        parser.error(str(e))
     except KeyboardInterrupt:
         _log("interrupted")
     return 0

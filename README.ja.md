@@ -61,6 +61,7 @@ with serve() as puppet:                      # 空きポートでプロセス内
 | [Bedrock](docs/ja/bedrock.md) | InvokeModel、Converse、guardrail とプロンプト管理のフィクスチャ、S3 エミュレーション同梱のバッチ推論 |
 | [Message Batches API](docs/ja/batches.md) | Anthropic バッチのライフサイクルと操作 |
 | [relay モード](docs/ja/relay.md) | SDK をまたいで pending を実 Anthropic / OpenAI 互換の上流へ転送する |
+| [Agent SDK 変換モード](docs/ja/agent-sdk.md) | 実験的: Claude Agent SDK 経由で pending に答える relay。Docker サービス、状態監視、安全装置 |
 | [設計ノート](docs/ja/design.md) | アーキテクチャ、互換性マトリクス、テスト、レイアウト |
 
 responder（モデル役を演じる Claude Code / Codex）向けの指示は [`responder/`](responder/) にある。

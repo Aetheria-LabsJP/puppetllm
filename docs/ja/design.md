@@ -67,6 +67,8 @@ python3 -m unittest puppetllm.tests.test_fake_server puppetllm.tests.test_proxy_
 `PUPPETLLM_REQUIRE_SDK_TESTS=1` を立てるので、import できない状態で走らせると
 SDK テストを全部スキップしたまま `OK` と黙って報告せず失敗する。
 
+Agent SDK relay には専用のモジュール（`test_agent_sdk.py`、`test_sdk_*.py`）があり、`puppetllm:agent-sdk` イメージで実行する。[Agent SDK 変換モード](agent-sdk.md) を参照。
+
 ## レイアウト
 
 ```
@@ -85,18 +87,22 @@ puppetllm/
 │   ├── cache_sim.py        # 擬似プロンプトキャッシュ
 │   ├── pricing.py          # 概算トークン + 料金
 │   ├── relay.py            # relay responder (実 API へのクロスプロバイダ・ブリッジ)
+│   ├── agent_sdk.py        # 実験的な relay kind: Claude Agent SDK 経由で答える
+│   │                       #   sdk_transport.py, sdk_egress.py, sdk_guard.py, sdk_runtime.py, sdk_state.py
 │   ├── openai_wire.py      # OpenAI ↔ canonical の純粋変換（アダプタと relay が共用）
 │   ├── providers/          # Bedrock（invoke / converse / batch）/ OpenAI アダプタ、S3、AWS event stream
 │   │                       #   bedrock.py, converse.py, bedrock_batch.py, s3.py, openai.py, eventstream.py
 │   └── tests/              # 単体テスト
-├── docs/                   # ガイド（docs/ja/ が日本語）: quickstart、testing、control-api、bedrock、batches、relay、design
+├── docs/                   # ガイド（docs/ja/ が日本語）: quickstart、testing、control-api、bedrock、batches、relay、agent-sdk、design
 ├── examples/               # tool_loop.py（台本付きツールループ）、test_retry.py（pytest フィクスチャ）
 ├── responder/              # responder (LLM のフリをするエージェント) 向け指示書
 │   ├── CLAUDE.md           #   Claude Code 用
 │   └── AGENTS.md           #   Codex CLI など AGENTS.md 規約の agent 用
 ├── LICENSE
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml      # `proxy`、`test` プロファイル、任意の `agent-sdk` プロファイル
+├── start-agent-sdk.sh      # サーバ・Agent SDK relay・監視をビルドして起動
+├── .env.example            # Agent SDK relay の設定（.env にコピーして使う）
 ├── pyproject.toml          # `pip install .` → `puppetllm` コマンド + pytest プラグイン
 └── requirements.txt
 ```

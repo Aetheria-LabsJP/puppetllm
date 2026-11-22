@@ -5,3 +5,6 @@ __pycache__/
 venv/
 *.egg-info/
 .ruff_cache/
+.env
+.env.*
+!.env.example
